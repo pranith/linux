@@ -197,18 +197,18 @@ static int rcu_gp_in_progress(struct rcu_state *rsp)
  * one since the start of the grace period, this just sets a flag.
  * The caller must have disabled preemption.
  */
-void rcu_sched_qs(int cpu)
+void rcu_sched_qs(void)
 {
-	struct rcu_data *rdp = &per_cpu(rcu_sched_data, cpu);
+	struct rcu_data *rdp = __this_cpu_ptr(&rcu_sched_data);
 
 	if (rdp->passed_quiesce == 0)
 		trace_rcu_grace_period(TPS("rcu_sched"), rdp->gpnum, TPS("cpuqs"));
 	rdp->passed_quiesce = 1;
 }
 
-void rcu_bh_qs(int cpu)
+void rcu_bh_qs(void)
 {
-	struct rcu_data *rdp = &per_cpu(rcu_bh_data, cpu);
+	struct rcu_data *rdp = __this_cpu_ptr(&rcu_sched_data);
 
 	if (rdp->passed_quiesce == 0)
 		trace_rcu_grace_period(TPS("rcu_bh"), rdp->gpnum, TPS("cpuqs"));
@@ -287,7 +287,7 @@ static void rcu_momentary_dyntick_idle(void)
 void rcu_note_context_switch(int cpu)
 {
 	trace_rcu_utilization(TPS("Start context switch"));
-	rcu_sched_qs(cpu);
+	rcu_sched_qs();
 	rcu_preempt_note_context_switch(cpu);
 	if (unlikely(raw_cpu_read(rcu_sched_qs_mask)))
 		rcu_momentary_dyntick_idle();
@@ -323,7 +323,7 @@ static void force_qs_rnp(struct rcu_state *rsp,
 				  unsigned long *maxj),
 			 bool *isidle, unsigned long *maxj);
 static void force_quiescent_state(struct rcu_state *rsp);
-static int rcu_pending(int cpu);
+static int rcu_pending(void);
 
 /*
  * Return the number of RCU-sched batches processed thus far for debug & stats.
@@ -2383,7 +2383,7 @@ static void rcu_do_batch(struct rcu_state *rsp, struct rcu_data *rdp)
  * invoked from the scheduling-clock interrupt.  If rcu_pending returns
  * false, there is no point in invoking rcu_check_callbacks().
  */
-void rcu_check_callbacks(int cpu, int user)
+void rcu_check_callbacks(int user)
 {
 	trace_rcu_utilization(TPS("Start scheduler-tick"));
 	increment_cpu_stall_ticks();
@@ -2401,8 +2401,8 @@ void rcu_check_callbacks(int cpu, int user)
 		 * at least not while the corresponding CPU is online.
 		 */
 
-		rcu_sched_qs(cpu);
-		rcu_bh_qs(cpu);
+		rcu_sched_qs();
+		rcu_bh_qs();
 
 	} else if (!in_softirq()) {
 
@@ -2413,10 +2413,10 @@ void rcu_check_callbacks(int cpu, int user)
 		 * critical section, so note it.
 		 */
 
-		rcu_bh_qs(cpu);
+		rcu_bh_qs();
 	}
-	rcu_preempt_check_callbacks(cpu);
-	if (rcu_pending(cpu))
+	rcu_preempt_check_callbacks(smp_processor_id());
+	if (rcu_pending())
 		invoke_rcu_core();
 	trace_rcu_utilization(TPS("End scheduler-tick"));
 }
@@ -3132,12 +3132,12 @@ static int __rcu_pending(struct rcu_state *rsp, struct rcu_data *rdp)
  * by the current CPU, returning 1 if so.  This function is part of the
  * RCU implementation; it is -not- an exported member of the RCU API.
  */
-static int rcu_pending(int cpu)
+static int rcu_pending(void)
 {
 	struct rcu_state *rsp;
 
 	for_each_rcu_flavor(rsp)
-		if (__rcu_pending(rsp, per_cpu_ptr(rsp->rda, cpu)))
+		if (__rcu_pending(rsp, __this_cpu_ptr(rsp->rda)))
 			return 1;
 	return 0;
 }

@@ -132,9 +132,9 @@ EXPORT_SYMBOL_GPL(rcu_batches_completed);
  * must disable irqs in order to protect the assignment to
  * ->rcu_read_unlock_special.
  */
-static void rcu_preempt_qs(int cpu)
+static void rcu_preempt_qs(void)
 {
-	struct rcu_data *rdp = &per_cpu(rcu_preempt_data, cpu);
+	struct rcu_data *rdp = __this_cpu_ptr(&rcu_preempt_data);
 
 	if (rdp->passed_quiesce == 0)
 		trace_rcu_grace_period(TPS("rcu_preempt"), rdp->gpnum, TPS("cpuqs"));
@@ -231,7 +231,7 @@ static void rcu_preempt_note_context_switch(int cpu)
 	 * means that we continue to block the current grace period.
 	 */
 	local_irq_save(flags);
-	rcu_preempt_qs(cpu);
+	rcu_preempt_qs();
 	local_irq_restore(flags);
 }
 
@@ -327,7 +327,7 @@ void rcu_read_unlock_special(struct task_struct *t)
 	 */
 	special = t->rcu_read_unlock_special;
 	if (special & RCU_READ_UNLOCK_NEED_QS) {
-		rcu_preempt_qs(smp_processor_id());
+		rcu_preempt_qs();
 		if (!t->rcu_read_unlock_special) {
 			local_irq_restore(flags);
 			return;
@@ -626,11 +626,11 @@ static void rcu_preempt_check_callbacks(int cpu)
 	struct task_struct *t = current;
 
 	if (t->rcu_read_lock_nesting == 0) {
-		rcu_preempt_qs(cpu);
+		rcu_preempt_qs();
 		return;
 	}
 	if (t->rcu_read_lock_nesting > 0 &&
-	    per_cpu(rcu_preempt_data, cpu).qs_pending)
+	    this_cpu_read(rcu_preempt_data.qs_pending))
 		t->rcu_read_unlock_special |= RCU_READ_UNLOCK_NEED_QS;
 }
 
