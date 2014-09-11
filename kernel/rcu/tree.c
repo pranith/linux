@@ -3718,6 +3718,69 @@ static void __init rcu_init_geometry(void)
 	rcu_num_nodes -= n;
 }
 
+#ifdef CONFIG_PROVE_RCU
+
+/*
+ * Early boot self test parameters, one for each flavor
+ */
+static bool rcu_self_test;
+static bool rcu_self_test_bh;
+static bool rcu_self_test_sched;
+static bool rcu_self_test_srcu;
+
+module_param(rcu_self_test, bool, 0444);
+module_param(rcu_self_test_bh, bool, 0444);
+module_param(rcu_self_test_sched, bool, 0444);
+module_param(rcu_self_test_srcu, bool, 0444);
+
+static int rcu_self_test_counter;
+static struct rcu_head head;
+
+static void empty_callback(struct rcu_head *r) 
+{
+    rcu_self_test_counter++;
+}
+
+static void early_boot_test_call_rcu(void)
+{
+	call_rcu(&head, empty_callback);
+}
+
+static void early_boot_test_call_rcu_bh(void)
+{
+	call_rcu_bh(&head, empty_callback);
+}
+
+static void early_boot_test_call_rcu_sched(void)
+{
+	call_rcu_sched(&head, empty_callback);
+}
+
+static void early_boot_test_call_srcu(void)
+{
+	DEFINE_STATIC_SRCU(srcu_struct);
+
+	call_srcu(&srcu_struct, &head, empty_callback);
+}
+
+static void rcu_early_boot_tests(void)
+{
+    pr_info("Running RCU self tests\n");
+	if (rcu_self_test)
+		early_boot_test_call_rcu();
+	if (rcu_self_test_bh)
+		early_boot_test_call_rcu_bh();
+	if (rcu_self_test_sched)
+		early_boot_test_call_rcu_sched();
+	if (rcu_self_test_srcu)
+		early_boot_test_call_srcu();
+}
+#else
+
+static void rcu_early_boot_tests(void) {}
+
+#endif /* CONFIG_PROVE_RCU */
+
 void __init rcu_init(void)
 {
 	int cpu;
@@ -3738,6 +3801,11 @@ void __init rcu_init(void)
 	pm_notifier(rcu_pm_notify, 0);
 	for_each_online_cpu(cpu)
 		rcu_cpu_notify(NULL, CPU_UP_PREPARE, (void *)(long)cpu);
+
+	/*
+	 * Self tests
+	 */
+    rcu_early_boot_tests();
 }
 
 #include "tree_plugin.h"
