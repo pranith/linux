@@ -2881,6 +2881,18 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
 			Lazy RCU callbacks are those which RCU can
 			prove do nothing more than free memory.
 
+    rcutree.rcu_self_test= [KNL]
+            Run RCU early boot self tests
+
+    rcutree.rcu_self_test_bh= [KNL]
+            Run RCU bh early boot self tests
+
+    rcutree.rcu_self_test_sched= [KNL]
+            Run RCU sched early boot self tests
+
+    rcutree.rcu_self_test_srcu= [KNL]
+            Run SRCU early boot self tests
+
 	rcutorture.fqs_duration= [KNL]
 			Set duration of force_quiescent_state bursts.
 
