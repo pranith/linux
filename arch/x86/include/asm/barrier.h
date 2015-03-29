@@ -19,7 +19,7 @@
 #define rmb() alternative("lock; addl $0,0(%%esp)", "lfence", X86_FEATURE_XMM2)
 #define wmb() alternative("lock; addl $0,0(%%esp)", "sfence", X86_FEATURE_XMM)
 #else
-#define mb() 	asm volatile("mfence":::"memory")
+#define mb() 	asm volatile("lock; addl $0,0(%%rsp)":::"memory")
 #define rmb()	asm volatile("lfence":::"memory")
 #define wmb()	asm volatile("sfence" ::: "memory")
 #endif
