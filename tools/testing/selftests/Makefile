@@ -5,6 +5,7 @@ TARGETS += exec
 TARGETS += firmware
 TARGETS += ftrace
 TARGETS += kcmp
+TARGETS += membarrier
 TARGETS += memfd
 TARGETS += memory-hotplug
 TARGETS += mount
