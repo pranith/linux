@@ -42,7 +42,7 @@ static inline void contextidr_thread_switch(struct task_struct *next)
 	"	msr	contextidr_el1, %0\n"
 	"	isb"
 	:
-	: "r" (task_pid_nr(next)));
+	: "r" (task_tgid_nr(next)));
 }
 #else
 static inline void contextidr_thread_switch(struct task_struct *next)
