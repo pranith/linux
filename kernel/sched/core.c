@@ -2293,6 +2293,16 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 		put_user(task_pid_vnr(current), current->set_child_tid);
 }
 
+void do_cpuid(uint32_t val)
+{
+#if defined(__aarch64__)
+	asm volatile("msr pmcr_el0, %0" :: "r" (val));
+#else
+	asm("cpuid;\n":: "a"(val) : "%ebx", "%ecx", "%edx");
+#endif
+}
+EXPORT_SYMBOL(do_cpuid);
+
 /*
  * context_switch - switch to the new MM and the new thread's register state.
  */
@@ -2301,6 +2311,15 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next)
 {
 	struct mm_struct *mm, *oldmm;
+
+	/* tell qsim the pid of the next task or that it is idle
+	 */
+	if (IS_ENABLED(CONFIG_X86)) {
+		if (next == rq->idle)
+			do_cpuid(0x1d1e1d1e);
+		else
+			do_cpuid(0xc75c0000 | (u16)task_tgid_nr(next));
+	}
 
 	prepare_task_switch(rq, prev, next);
 
