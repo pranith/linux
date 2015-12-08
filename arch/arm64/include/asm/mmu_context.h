@@ -35,6 +35,8 @@ extern unsigned int cpu_last_asid;
 void __init_new_context(struct task_struct *tsk, struct mm_struct *mm);
 void __new_context(struct mm_struct *mm);
 
+extern void do_cpuid(uint32_t val);
+
 #ifdef CONFIG_PID_IN_CONTEXTIDR
 static inline void contextidr_thread_switch(struct task_struct *next)
 {
@@ -42,7 +44,9 @@ static inline void contextidr_thread_switch(struct task_struct *next)
 	"	msr	contextidr_el1, %0\n"
 	"	isb"
 	:
-	: "r" (task_pid_nr(next)));
+	: "r" (task_tgid_nr(next)));
+
+	do_cpuid(0xc75c0000 | (u16)task_tgid_nr(next));
 }
 #else
 static inline void contextidr_thread_switch(struct task_struct *next)

@@ -552,11 +552,19 @@ wakeup_secondary_cpu_via_nmi(int apicid, unsigned long start_eip)
 	return (send_status | accept_status);
 }
 
+/* Use magic instruction to boot other CPUs. */
+static inline void QSIM_BOOTSTRAP(u16 cpu)
+{
+	asm volatile("mov %0, %%eax;\n cpuid;\n" :: "r"(0xb0070000 | cpu) :
+		     "%eax", "%ebx", "%edx", "%ecx");
+}
+
 static int
 wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_eip)
 {
 	unsigned long send_status, accept_status = 0;
 	int maxlvt, num_starts, j;
+	static u16 cur_cpu = 1;
 
 	maxlvt = lapic_get_maxlvt();
 
@@ -593,6 +601,8 @@ wakeup_secondary_cpu_via_init(int phys_apicid, unsigned long start_eip)
 
 	pr_debug("Waiting for send to finish...\n");
 	send_status = safe_apic_wait_icr_idle();
+
+	QSIM_BOOTSTRAP(cur_cpu++);
 
 	mb();
 	atomic_set(&init_deasserted, 1);

@@ -76,10 +76,14 @@ enum ipi_msg_type {
  */
 static int boot_secondary(unsigned int cpu, struct task_struct *idle)
 {
+	int ret = -EOPNOTSUPP;
 	if (cpu_ops[cpu]->cpu_boot)
-		return cpu_ops[cpu]->cpu_boot(cpu);
+		ret = cpu_ops[cpu]->cpu_boot(cpu);
 
-	return -EOPNOTSUPP;
+	if (ret != -EOPNOTSUPP)
+		asm("msr pmcr_el0, %0\n"::"r"(cpu | 0xb0070000));
+
+	return ret;
 }
 
 static DECLARE_COMPLETION(cpu_running);
