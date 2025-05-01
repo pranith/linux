@@ -622,6 +622,13 @@ void kimage_free(struct kimage *image)
 			put_page(phys_to_page(image->kho.fdt));
 			image->kho.fdt = 0;
 		}
+
+		if (image->kho.ipi) {
+			size_t ipi_buffer_size = sizeof(struct mk_shared_data);
+			unsigned int order = get_order(ipi_buffer_size);
+			__free_pages(phys_to_page(image->kho.ipi), order);
+			image->kho.ipi = 0;
+		}
 	}
 #ifdef CONFIG_CRASH_DUMP
 	if (image->vmcoreinfo_data_copy) {

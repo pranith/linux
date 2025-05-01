@@ -350,6 +350,26 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 			goto out_free_image;
 		}
 		image->kho.fdt = page_to_phys(fdt_page);
+
+		{
+			struct page *ipi_page;
+			unsigned int order;
+			size_t ipi_buffer_size;
+
+			ipi_buffer_size = sizeof(struct mk_shared_data);
+			order = get_order(ipi_buffer_size);
+			ipi_page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+			if (!ipi_page) {
+				pr_err("Failed to allocate %zu bytes (order %u) for IPI buffer\n",
+				       ipi_buffer_size, order);
+				ret = -ENOMEM;
+				goto out_free_fdt;
+			}
+			image->kho.ipi = page_to_phys(ipi_page);
+
+			pr_info("Allocated IPI ring buffer: phys=0x%llx, size=%zu bytes (order %u)\n",
+				(unsigned long long)image->kho.ipi, ipi_buffer_size, order);
+		}
 	}
 
 	ret = kimage_file_prepare_segments(image, kernel_fd, initrd_fd,
@@ -383,6 +403,23 @@ out_free_control_pages:
 	kimage_free_page_list(&image->control_pages);
 out_free_post_load_bufs:
 	kimage_file_post_load_cleanup(image);
+out_free_fdt:
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		if (image->kho.ipi) {
+			unsigned int order = get_order(sizeof(struct mk_shared_data));
+			__free_pages(phys_to_page(image->kho.ipi), order);
+			image->kho.ipi = 0;
+		}
+		if (image->kho.fdt) {
+			put_page(phys_to_page(image->kho.fdt));
+			image->kho.fdt = 0;
+		}
+		if (image->mk_instance) {
+			image->mk_instance->kimage = NULL;
+			mk_instance_put(image->mk_instance);
+			image->mk_instance = NULL;
+		}
+	}
 out_free_image:
 	kfree(image);
 	return ret;
