@@ -44,6 +44,7 @@
 #include <linux/objtool.h>
 #include <linux/kmsg_dump.h>
 #include <linux/multikernel.h>
+#include <linux/kexec_handover.h>
 #include <linux/dma-map-ops.h>
 #include <linux/sysfs.h>
 #include <linux/memblock.h>
@@ -616,8 +617,12 @@ void kimage_free(struct kimage *image)
 			mk_instance_put(image->mk_instance);
 			image->mk_instance = NULL;
 		}
-	}
 
+		if (image->kho.fdt) {
+			put_page(phys_to_page(image->kho.fdt));
+			image->kho.fdt = 0;
+		}
+	}
 #ifdef CONFIG_CRASH_DUMP
 	if (image->vmcoreinfo_data_copy) {
 		crash_update_vmcoreinfo_safecopy(NULL);
@@ -1698,12 +1703,24 @@ int multikernel_kexec_by_id(int mk_id)
 		goto unlock;
 	}
 
+	rc = mk_kexec_finalize(mk_image);
+	if (rc)
+		pr_warn("KHO finalization failed: %d\n", rc);
+	else
+		pr_info("KHO finalized for multikernel instance\n");
+
 	pr_info("Using multikernel image with ID %d (entry point: 0x%lx) on CPU %d\n",
 		mk_image->mk_id, mk_image->start, cpu);
 
 	cpus_read_lock();
 	rc = multikernel_kick_ap(cpu, mk_image->start);
 	cpus_read_unlock();
+
+	if (rc == 0) {
+		rc = mk_instance_set_kexec_active(mk_image->mk_id);
+		if (rc)
+			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+	}
 
 unlock:
 	kexec_unlock();

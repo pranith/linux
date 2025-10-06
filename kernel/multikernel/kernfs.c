@@ -27,6 +27,7 @@
 #include <linux/multikernel.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
+#include "internal.h"
 
 #define MULTIKERNEL_MAGIC	0x6d6b6673	/* "mkfs" */
 
@@ -38,9 +39,6 @@ LIST_HEAD(mk_instance_list);                      /* List of all instances */
 DEFINE_MUTEX(mk_instance_mutex);                  /* Protects instance list */
 DEFINE_IDR(mk_instance_idr);               /* ID allocator for instances */
 
-/* Host kernel device tree configuration */
-static void *mk_host_dtb_data;                    /* Stored host kernel DTB */
-static size_t mk_host_dtb_size;                   /* Size of stored host kernel DTB */
 static DEFINE_MUTEX(mk_host_dtb_mutex);           /* Protects host DTB access */
 
 /* Filesystem context structure */
@@ -130,12 +128,12 @@ static int status_seq_show(struct seq_file *sf, void *v)
 	return 0;
 }
 
-/* Root-level device_tree attribute - shows stored host kernel DTB */
+/* Root-level device_tree attribute - shows binary DTB */
 static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 {
 	mutex_lock(&mk_host_dtb_mutex);
-	if (mk_host_dtb_data)
-		seq_write(sf, mk_host_dtb_data, mk_host_dtb_size);
+	if (root_instance->dtb_data)
+		seq_write(sf, root_instance->dtb_data, root_instance->dtb_size);
 	mutex_unlock(&mk_host_dtb_mutex);
 	return 0;
 }
@@ -174,9 +172,9 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 	memcpy(new_dtb, buf, count);
 
 	mutex_lock(&mk_host_dtb_mutex);
-	kfree(mk_host_dtb_data);
-	mk_host_dtb_data = new_dtb;
-	mk_host_dtb_size = count;
+	kfree(root_instance->dtb_data);
+	root_instance->dtb_data = new_dtb;
+	root_instance->dtb_size = count;
 	mutex_unlock(&mk_host_dtb_mutex);
 
 	pr_info("Successfully stored host kernel device tree configuration\n");
@@ -555,9 +553,9 @@ void mk_kernfs_cleanup(void)
 
 	/* Free host kernel DTB */
 	mutex_lock(&mk_host_dtb_mutex);
-	kfree(mk_host_dtb_data);
-	mk_host_dtb_data = NULL;
-	mk_host_dtb_size = 0;
+	kfree(root_instance->dtb_data);
+	root_instance->dtb_data = NULL;
+	root_instance->dtb_size = 0;
 	mutex_unlock(&mk_host_dtb_mutex);
 
 	/* Remove sysfs mount point */

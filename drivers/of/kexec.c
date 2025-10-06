@@ -271,13 +271,21 @@ static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node
 	if (ret && ret != -FDT_ERR_NOTFOUND)
 		return ret;
 
-	if (!image->kho.fdt || !image->kho.scratch)
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		if (!image->kho.fdt)
+			return 0;
+	} else if (!image->kho.fdt || !image->kho.scratch)
 		return 0;
 
 	fdt_mem = image->kho.fdt;
 	fdt_len = PAGE_SIZE;
-	scratch_mem = image->kho.scratch->mem;
-	scratch_len = image->kho.scratch->bufsz;
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		scratch_mem = 0;
+		scratch_len = 0;
+	} else {
+		scratch_mem = image->kho.scratch->mem;
+		scratch_len = image->kho.scratch->bufsz;
+	}
 
 	pr_debug("Adding kho metadata to DT");
 
@@ -285,8 +293,10 @@ static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node
 				       fdt_mem, fdt_len);
 	if (ret)
 		return ret;
-	ret = fdt_appendprop_addrrange(fdt, 0, chosen_node, "linux,kho-scratch",
-				       scratch_mem, scratch_len);
+
+	if (scratch_mem && scratch_len)
+		ret = fdt_appendprop_addrrange(fdt, 0, chosen_node, "linux,kho-scratch",
+					       scratch_mem, scratch_len);
 
 #endif /* CONFIG_KEXEC_HANDOVER */
 	return ret;
