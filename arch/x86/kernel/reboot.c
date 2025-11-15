@@ -869,6 +869,21 @@ static int crash_nmi_callback(unsigned int val, struct pt_regs *regs)
 	 */
 	if (cpu == crashing_cpu)
 		return NMI_HANDLED;
+
+	/*
+	 * For multikernel: Check if ANY CPU in this kernel instance initiated
+	 * a crash. If crashing_cpu is -1, no local CPU called nmi_shootdown_cpus(),
+	 * so this NMI must be from another kernel instance. We also verify the
+	 * crashing CPU is actually online in this instance to catch spurious values.
+	 */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		if (crashing_cpu == -1 || !cpu_online(crashing_cpu)) {
+			pr_emerg("CPU %d: Ignoring crash NMI from other kernel instance (crashing_cpu=%d)\n",
+				 cpu, crashing_cpu);
+			return NMI_HANDLED;
+		}
+	}
+
 	local_irq_disable();
 
 	if (shootdown_callback)

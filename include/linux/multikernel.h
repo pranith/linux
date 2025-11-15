@@ -625,6 +625,15 @@ struct mk_instance *mk_instance_find(int mk_id);
  */
 int mk_instance_set_kexec_active(int mk_id);
 
+#ifdef CONFIG_MULTIKERNEL
+bool multikernel_allow_emergency_restart(void);
+#else
+static inline bool multikernel_allow_emergency_restart(void)
+{
+	return true;
+}
+#endif
+
 /**
  * Version and Compatibility
  */

@@ -35,6 +35,7 @@
 #include <asm/trace/irq_vectors.h>
 #include <asm/kexec.h>
 #include <asm/reboot.h>
+#include <linux/multikernel.h>
 
 /*
  *	Some notes on x86 processor bugs affecting SMP operation:
@@ -120,9 +121,26 @@ static bool smp_no_nmi_ipi = false;
 
 static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 {
+	int cpu = raw_smp_processor_id();
+	int stopping = atomic_read(&stopping_cpu);
+
 	/* We are registered on stopping cpu too, avoid spurious NMI */
-	if (raw_smp_processor_id() == atomic_read(&stopping_cpu))
+	if (cpu == stopping)
 		return NMI_HANDLED;
+
+	/*
+	 * For multikernel: Check if ANY CPU in this kernel instance initiated
+	 * a stop. If stopping_cpu is -1, no local CPU called native_stop_other_cpus(),
+	 * so this NMI must be from another kernel instance. We also verify the
+	 * stopping CPU is actually online in this instance to catch spurious values.
+	 */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		if (stopping == -1 || !cpu_online(stopping)) {
+			pr_emerg("CPU %d: Ignoring stop NMI from other kernel instance (stopping_cpu=%d)\n",
+				 cpu, stopping);
+			return NMI_HANDLED;
+		}
+	}
 
 	cpu_emergency_disable_virtualization();
 	stop_this_cpu(NULL);
@@ -135,7 +153,24 @@ static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
  */
 DEFINE_IDTENTRY_SYSVEC(sysvec_reboot)
 {
+	int stopping = atomic_read(&stopping_cpu);
+
 	apic_eoi();
+
+	/*
+	 * For multikernel: Check if ANY CPU in this kernel instance initiated
+	 * a stop. If stopping_cpu is -1, no local CPU called native_stop_other_cpus(),
+	 * so this IPI must be from another kernel instance. We also verify the
+	 * stopping CPU is actually online in this instance to catch spurious values.
+	 */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		if (stopping == -1 || !cpu_online(stopping)) {
+			pr_emerg("CPU %d: Ignoring REBOOT_VECTOR from other kernel instance (stopping_cpu=%d)\n",
+				 raw_smp_processor_id(), stopping);
+			return;
+		}
+	}
+
 	cpu_emergency_disable_virtualization();
 	stop_this_cpu(NULL);
 }

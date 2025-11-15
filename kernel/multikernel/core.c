@@ -127,6 +127,36 @@ int mk_instance_set_kexec_active(int mk_id)
 	return 0;
 }
 
+bool multikernel_allow_emergency_restart(void)
+{
+	struct mk_instance *instance;
+	bool has_active_spawn = false;
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		/* Skip root/host instance (ID 0) */
+		if (instance->id == 0)
+			continue;
+
+		if (instance->state == MK_STATE_ACTIVE ||
+		    instance->state == MK_STATE_LOADED) {
+			pr_emerg("Found active spawn instance %d (%s) in state %d\n",
+				 instance->id, instance->name, instance->state);
+			has_active_spawn = true;
+			break;
+		}
+	}
+	mutex_unlock(&mk_instance_mutex);
+
+	if (has_active_spawn) {
+		pr_emerg("emergency_restart() BLOCKED: spawn kernel instance(s) active\n");
+	} else {
+		pr_emerg("emergency_restart() ALLOWED: no active spawn instances\n");
+	}
+
+	return !has_active_spawn;
+}
+
 /**
  * CPU management functions for instances
  */

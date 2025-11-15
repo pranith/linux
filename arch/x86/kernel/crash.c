@@ -42,6 +42,7 @@
 #include <asm/crash.h>
 #include <asm/cmdline.h>
 #include <asm/sev.h>
+#include <linux/multikernel.h>
 
 /* Used while preparing memory map entries for second kernel */
 struct crash_memmap_data {
@@ -118,16 +119,20 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
 	 */
 	cpu_emergency_stop_pt();
 
+	if (multikernel_allow_emergency_restart()) {
 #ifdef CONFIG_X86_IO_APIC
-	/* Prevent crash_kexec() from deadlocking on ioapic_lock. */
-	ioapic_zap_locks();
-	clear_IO_APIC();
+		/* Prevent crash_kexec() from deadlocking on ioapic_lock. */
+		ioapic_zap_locks();
+		clear_IO_APIC();
 #endif
-	lapic_shutdown();
-	restore_boot_irq_mode();
+		lapic_shutdown();
+		restore_boot_irq_mode();
 #ifdef CONFIG_HPET_TIMER
-	hpet_disable();
+		hpet_disable();
 #endif
+	} else {
+		pr_emerg("Skipping global hardware shutdown (IOAPIC/HPET/LAPIC) to preserve spawn kernels\n");
+	}
 
 	/*
 	 * Non-crash kexec calls enc_kexec_begin() while scheduling is still
