@@ -24,6 +24,9 @@
 #include <linux/pm_runtime.h>
 #include <linux/bitfield.h>
 #include <trace/events/pci.h>
+#ifdef CONFIG_MULTIKERNEL
+#include <linux/multikernel.h>
+#endif
 #include "pci.h"
 
 static struct resource busn_resource = {
@@ -2602,6 +2605,18 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 
 	if (!pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
 		return NULL;
+
+	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		u16 vendor = l & 0xffff;
+		u16 device = (l >> 16) & 0xffff;
+
+		if (!mk_pci_device_allowed(bus, devfn, vendor, device)) {
+			pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x not allowed\n",
+				 vendor, device, pci_domain_nr(bus), bus->number,
+				 PCI_SLOT(devfn), PCI_FUNC(devfn));
+			return NULL;
+		}
+	}
 
 	dev = pci_alloc_dev(bus);
 	if (!dev)
