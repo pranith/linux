@@ -2603,20 +2603,16 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	struct pci_dev *dev;
 	u32 l;
 
-	if (!pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
+	/*
+	 * For multikernel spawns, check if we should even probe this location
+	 * BEFORE any config space access. This prevents hardware conflicts
+	 * when the host kernel is also using PCI devices.
+	 */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL) && !mk_pci_should_probe(bus, devfn))
 		return NULL;
 
-	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
-		u16 vendor = l & 0xffff;
-		u16 device = (l >> 16) & 0xffff;
-
-		if (!mk_pci_device_allowed(bus, devfn, vendor, device)) {
-			pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x not allowed\n",
-				 vendor, device, pci_domain_nr(bus), bus->number,
-				 PCI_SLOT(devfn), PCI_FUNC(devfn));
-			return NULL;
-		}
-	}
+	if (!pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
+		return NULL;
 
 	dev = pci_alloc_dev(bus);
 	if (!dev)
