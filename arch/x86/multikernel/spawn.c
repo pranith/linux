@@ -324,9 +324,10 @@ static void mk_init_trampoline(struct mk_spawn_context *ctx)
 
 /*
  * Build identity page table for secondary CPU trampoline execution.
- * Maps the trampoline at both its virtual address and identity-mapped.
+ * Maps the trampoline at its virtual address(es) and identity-mapped.
  */
 static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
+				       unsigned long host_trampoline_va,
 				       unsigned long trampoline_phys,
 				       unsigned long *cr3_out)
 {
@@ -339,6 +340,18 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
 
 	/* Map trampoline at its virtual address (initial execution) */
 	ret = mk_add_2mb_mapping(pgd, trampoline_va, trampoline_phys);
+	if (ret)
+		return ret;
+
+	/*
+	 * The pool CPU enters the trampoline through the HOST kernel's
+	 * direct map. With CONFIG_RANDOMIZE_MEMORY the host's
+	 * page_offset_base differs from ours, so its VA of the trampoline
+	 * is not covered by the mapping above. Map it too: the CPU keeps
+	 * fetching from that VA right after the first CR3 switch, and an
+	 * unmapped fetch there triple-faults the whole machine.
+	 */
+	ret = mk_add_2mb_mapping(pgd, host_trampoline_va, trampoline_phys);
 	if (ret)
 		return ret;
 
@@ -375,8 +388,8 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	trampoline_va = (unsigned long)spawn_trampoline_va;
 
 	/* Build identity page table for two-stage CR3 switch */
-	ret = mk_build_trampoline_pgtable(trampoline_va, trampoline_phys,
-					  &identity_cr3);
+	ret = mk_build_trampoline_pgtable(trampoline_va, ctx->trampoline_virt,
+					  trampoline_phys, &identity_cr3);
 	if (ret)
 		return ret;
 
