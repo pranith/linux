@@ -164,12 +164,22 @@ void mk_check_spawn(void)
 	} else {
 		/*
 		 * Initial spawn boot - use full trampoline with identity mapping.
+		 *
+		 * Translate the trampoline address through our own direct map
+		 * instead of using ctx->trampoline_virt: that field holds the
+		 * HOST kernel's address, which is not valid here when this CPU
+		 * is parked in a previously shut down spawn kernel and the
+		 * host's direct map base is randomized (CONFIG_RANDOMIZE_MEMORY).
+		 *
 		 * Mark trampoline page executable in current page tables.
 		 * On re-spawn, the direct map has NX set and set_memory_x()
 		 * was only called in the HOST kernel's page tables.
 		 */
-		set_memory_x(ctx->trampoline_virt & PAGE_MASK, 1);
-		trampoline = (mk_trampoline_fn)ctx->trampoline_virt;
+		unsigned long trampoline_virt =
+			(unsigned long)__va(ctx->trampoline_phys);
+
+		set_memory_x(trampoline_virt & PAGE_MASK, 1);
+		trampoline = (mk_trampoline_fn)trampoline_virt;
 		trampoline(ctx->identity_cr3, virt_to_phys(&ctx->bp),
 			   ctx->kernel_entry, ctx->trampoline_phys);
 	}
@@ -651,6 +661,18 @@ static size_t mk_get_trampoline_size(void)
 	return multikernel_relocate_kernel_end - multikernel_relocate_kernel_start;
 }
 
+/*
+ * Direct map base used by kernels that do not randomize memory layout.
+ * Spawn kernels never receive KASLR_FLAG (the vmlinux boot path does not
+ * set it), so this is where their direct map always sits, regardless of
+ * their CONFIG_RANDOMIZE_MEMORY setting.
+ */
+static unsigned long mk_default_page_offset(void)
+{
+	return pgtable_l5_enabled() ? __PAGE_OFFSET_BASE_L5 :
+				      __PAGE_OFFSET_BASE_L4;
+}
+
 static void *mk_get_trampoline_code(void)
 {
 	return multikernel_relocate_kernel_start;
@@ -679,6 +701,21 @@ void *mk_setup_trampoline(struct mk_instance *instance,
 	}
 
 	rc = mk_add_trampoline_mapping(pgt, (unsigned long)trampoline_va,
+				       trampoline_phys);
+	if (rc) {
+		mk_instance_free(instance, trampoline_va, PAGE_SIZE);
+		return ERR_PTR(rc);
+	}
+
+	/*
+	 * On re-spawn, the CPU entering this trampoline is parked in the
+	 * previously shut down spawn kernel and fetches through that kernel's
+	 * direct map, which sits at the default base while ours may be
+	 * randomized (CONFIG_RANDOMIZE_MEMORY). Map the default-base address
+	 * too so those fetches survive the CR3 switch to this page table.
+	 */
+	rc = mk_add_trampoline_mapping(pgt,
+				       mk_default_page_offset() + trampoline_phys,
 				       trampoline_phys);
 	if (rc) {
 		mk_instance_free(instance, trampoline_va, PAGE_SIZE);
