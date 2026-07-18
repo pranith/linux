@@ -171,7 +171,6 @@ void mk_check_spawn(void)
 		 * then jumps to identity-mapped physical address after CR3 switch.
 		 */
 		secondary_trampoline_phys = ctx->secondary_trampoline_phys;
-		set_memory_x((unsigned long)__va(secondary_trampoline_phys) & PAGE_MASK, 1);
 		secondary_trampoline = (mk_secondary_trampoline_fn)
 			__va(secondary_trampoline_phys);
 		secondary_trampoline(ctx->identity_cr3, ctx->kernel_entry,
@@ -187,14 +186,17 @@ void mk_check_spawn(void)
 		 * is parked in a previously shut down spawn kernel and the
 		 * host's direct map base is randomized (CONFIG_RANDOMIZE_MEMORY).
 		 *
-		 * Mark trampoline page executable in current page tables.
-		 * On re-spawn, the direct map has NX set and set_memory_x()
-		 * was only called in the HOST kernel's page tables.
+		 * The page is already executable in the parked kernel's page
+		 * tables: the host marks it in mk_setup_trampoline() and every
+		 * spawn kernel marks its own in mk_mark_trampoline_exec().
+		 * Page attributes must not be changed from here - this runs on
+		 * an offline CPU, in the forcible-shutdown case straight from
+		 * the NMI stop handler, where CPA locking, allocation and TLB
+		 * shootdowns are all unsafe.
 		 */
 		unsigned long trampoline_virt =
 			(unsigned long)__va(ctx->trampoline_phys);
 
-		set_memory_x(trampoline_virt & PAGE_MASK, 1);
 		trampoline = (mk_trampoline_fn)trampoline_virt;
 		trampoline(ctx->identity_cr3, virt_to_phys(&ctx->bp),
 			   ctx->kernel_entry, ctx->trampoline_phys);
@@ -297,6 +299,31 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 	 */
 	mk_boot_context = __va(ctx_phys);
 }
+
+/*
+ * Make this kernel's trampoline page executable while the kernel is fully
+ * alive. After shutdown, CPUs parked in this kernel enter the trampoline
+ * from mk_check_spawn(), which runs on an offline CPU (in the forcible
+ * case straight from the NMI stop handler) where changing page attributes
+ * is unsafe: CPA takes sleeping locks, can allocate to split a large page,
+ * and issues TLB shootdown IPIs.
+ *
+ * One physical page serves every wake path of this instance: the host
+ * allocates it once in mk_setup_trampoline() and reuses it across
+ * re-spawns, and mk_init_trampoline() places our own trampoline copy
+ * (including the secondary entry) in the same page.
+ */
+static int __init mk_mark_trampoline_exec(void)
+{
+	unsigned long virt;
+
+	if (!mk_boot_context)
+		return 0;
+
+	virt = (unsigned long)__va(mk_boot_context->trampoline_phys);
+	return set_memory_x(virt & PAGE_MASK, 1);
+}
+core_initcall(mk_mark_trampoline_exec);
 
 /*
  * Add a 2MB executable mapping to a page table.
