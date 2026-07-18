@@ -20,6 +20,7 @@
 
 #include <linux/kernel.h>
 #include <linux/compiler.h>
+#include <linux/iopoll.h>
 #include <linux/smp.h>
 #include <linux/cpu.h>
 #include <linux/mm.h>
@@ -107,36 +108,50 @@ typedef void (*mk_secondary_trampoline_fn)(unsigned long identity_cr3, unsigned 
  */
 void mk_check_spawn(void)
 {
+	struct mk_spawn_context *candidates[] = {
+		READ_ONCE(mk_active_spawn),
+		mk_boot_context,
+	};
 	struct mk_spawn_context *ctx;
 	mk_trampoline_fn trampoline;
 	mk_secondary_trampoline_fn secondary_trampoline;
 	unsigned long secondary_trampoline_phys;
-	u32 apic_id;
+	u32 apic_id = read_apic_id();
 	bool is_secondary_wakeup;
-
-	/* Check host's active spawn first, then spawn kernel's boot context */
-	ctx = READ_ONCE(mk_active_spawn);
-	if (!ctx)
-		ctx = mk_boot_context;
-	if (!ctx)
-		return;
-
-	if (!READ_ONCE(ctx->ready))
-		return;
+	int i;
 
 	/*
-	 * Pair with smp_wmb() in multikernel_wakeup_secondary_cpu_64().
-	 * Ensures we see all ctx fields written before ready was set.
+	 * Check every candidate, host's active spawn first. A leftover
+	 * mk_active_spawn from spawning a child instance must not shadow
+	 * our own boot context, or this kernel's CPUs could never be
+	 * re-spawned after shutdown.
 	 */
-	smp_rmb();
+	for (i = 0; i < ARRAY_SIZE(candidates); i++) {
+		ctx = candidates[i];
+		if (!ctx)
+			continue;
 
-	apic_id = read_apic_id();
-	if (apic_id != ctx->target_apic_id)
+		if (!READ_ONCE(ctx->ready))
+			continue;
+
+		/*
+		 * Pair with smp_wmb() in the waker. Ensures we see all ctx
+		 * fields written before ready was set.
+		 */
+		smp_rmb();
+
+		if (apic_id != ctx->target_apic_id)
+			continue;
+
+		/*
+		 * Claim the spawn. cmpxchg settles the race against a waker
+		 * revoking a timed-out spawn: exactly one side wins.
+		 */
+		if (cmpxchg(&ctx->ready, 1, 0) == 1)
+			break;
+	}
+	if (i == ARRAY_SIZE(candidates))
 		return;
-
-	/* Clear ready flag */
-	WRITE_ONCE(ctx->ready, 0);
-	smp_wmb();
 
 	/* Check if this is secondary CPU joining existing kernel */
 	is_secondary_wakeup = (ctx->flags & MK_SPAWN_F_SECONDARY);
@@ -225,6 +240,8 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 int mk_spawn_cpu(int cpu, struct mk_spawn_context *ctx)
 {
 	u32 apic_id = per_cpu(x86_cpu_to_apicid, cpu);
+	u32 ready;
+	int ret;
 
 	ctx->target_apic_id = apic_id;
 	/* Set active spawn pointer so pool CPUs can find it */
@@ -236,7 +253,31 @@ int mk_spawn_cpu(int cpu, struct mk_spawn_context *ctx)
 
 	/* Send IPI to wake CPU from halt */
 	apic->send_IPI(cpu, RESCHEDULE_VECTOR);
-	return 0;
+
+	/*
+	 * Wait for the target CPU to claim the context. Returning with the
+	 * spawn unconsumed would let the next spawn overwrite mk_active_spawn
+	 * and silently lose this wakeup, and would let callers free ctx while
+	 * a parked CPU can still dereference it.
+	 */
+	ret = read_poll_timeout(READ_ONCE, ready, !ready, 100, USEC_PER_SEC,
+				false, ctx->ready);
+	if (ret) {
+		/* Revoke: if the CPU claims concurrently, the spawn proceeds */
+		if (cmpxchg(&ctx->ready, 1, 0) == 1)
+			pr_err("mk_spawn: CPU %d (APIC %u) did not claim spawn context\n",
+			       cpu, apic_id);
+		else
+			ret = 0;
+	}
+
+	/*
+	 * The context has been claimed or revoked, so drop the pointer:
+	 * it must not outlive ctx, which the caller may free on error or
+	 * on instance teardown.
+	 */
+	WRITE_ONCE(mk_active_spawn, NULL);
+	return ret;
 }
 
 /*
@@ -414,6 +455,14 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	ret = mk_add_2mb_mapping(init_mm.pgd, trampoline_phys, trampoline_phys);
 	if (ret)
 		return ret;
+
+	/*
+	 * Revoke any unconsumed wakeup left over from a failed earlier
+	 * bringup, so a parked CPU cannot wake mid-rewrite and read a mix
+	 * of old and new fields. A CPU that already claimed the context
+	 * still sees the old, consistent snapshot.
+	 */
+	cmpxchg(&ctx->ready, 1, 0);
 
 	/* Set up spawn context for secondary CPU */
 	ctx->identity_cr3 = identity_cr3;
