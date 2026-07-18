@@ -23,6 +23,7 @@
 #include <linux/smp.h>
 #include <linux/cpu.h>
 #include <linux/mm.h>
+#include <linux/mem_encrypt.h>
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/memblock.h>
@@ -384,7 +385,6 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	struct mk_spawn_context *ctx = mk_boot_context;
 	unsigned long trampoline_phys, trampoline_va;
 	unsigned long identity_cr3;
-	pgd_t *spawn_pgd;
 	int ret;
 
 	if (!ctx) {
@@ -403,9 +403,15 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	if (ret)
 		return ret;
 
-	/* Add identity mapping to spawn kernel's page tables */
-	spawn_pgd = (pgd_t *)__va(__read_cr3() & PTE_PFN_MASK);
-	ret = mk_add_2mb_mapping(spawn_pgd, trampoline_phys, trampoline_phys);
+	/*
+	 * Add the identity mapping to init_mm, not the current CR3: this runs
+	 * in the cpuhp kthread, which may be borrowing a user mm (lazy TLB).
+	 * Writing into a user PGD corrupts that process, and the new CPU
+	 * would come up on page tables that are freed when the process exits.
+	 * swapper_pg_dir maps everything the secondary needs, including the
+	 * vmalloc'ed idle stack.
+	 */
+	ret = mk_add_2mb_mapping(init_mm.pgd, trampoline_phys, trampoline_phys);
 	if (ret)
 		return ret;
 
@@ -417,7 +423,7 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	ctx->kernel_entry = (unsigned long)multikernel_secondary_startup;
 	ctx->gs_base = per_cpu_offset(cpu);
 	ctx->stack = (unsigned long)idle_task(cpu)->thread.sp;
-	ctx->spawn_cr3 = __read_cr3();
+	ctx->spawn_cr3 = __sme_pa(init_mm.pgd);
 	ctx->target_apic_id = apicid;
 	ctx->flags = MK_SPAWN_F_SECONDARY;
 
