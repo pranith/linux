@@ -30,5 +30,8 @@ int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);
 int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
 
+/* mem.c */
+int multikernel_add_pool_memory(phys_addr_t start, size_t size);
+
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);

@@ -280,11 +280,12 @@ static int __init mk_dma_heap_init(void)
 {
 	struct dma_heap_export_info exp_info;
 
-	if (!multikernel_pool_available()) {
-		pr_info("multikernel heap: pool not available, skipping\n");
-		return 0;
-	}
-
+	/*
+	 * Register unconditionally: the pool is populated at runtime when
+	 * the baseline device tree is applied, long after initcalls run.
+	 * Allocations before that fail with -ENOMEM (multikernel_alloc()
+	 * returns 0 while the pool is empty).
+	 */
 	exp_info.name = "multikernel";
 	exp_info.ops = &mk_heap_ops;
 	exp_info.priv = NULL;

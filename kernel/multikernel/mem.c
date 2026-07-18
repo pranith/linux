@@ -2,18 +2,18 @@
 /*
  * Multikernel memory management
  *
- * Memory pool management for multikernel spawn kernels using gen_pool
- * with mkkernel_pool= command line parameter
+ * Memory pool management for multikernel spawn kernels using gen_pool.
+ * Memory is donated at runtime via multikernel_add_pool_memory().
  */
 
-#include <linux/memblock.h>
 #include <linux/ioport.h>
 #include <linux/kexec.h>
 #include <linux/mutex.h>
 #include <linux/genalloc.h>
 #include <linux/io.h>
-#include <asm/e820/api.h>
 #include <linux/multikernel.h>
+
+#include "internal.h"
 
 /* Global multikernel memory pool resource */
 struct resource multikernel_res = {
@@ -80,16 +80,6 @@ struct resource *multikernel_get_pool_resource(void)
 }
 
 /**
- * multikernel_pool_available() - Check if multikernel pool is available
- *
- * Returns true if multikernel pool is configured and available
- */
-bool multikernel_pool_available(void)
-{
-	return multikernel_pool != NULL;
-}
-
-/**
  * Per-instance memory pool management
  *
  * Each kernel instance gets its own gen_pool for fine-grained allocations
@@ -115,7 +105,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 	phys_addr_t chunk_base;
 	int chunks_added = 0;
 
-	if (!multikernel_pool_available()) {
+	if (!multikernel_pool) {
 		pr_err("Multikernel main pool not available for instance %d\n", instance_id);
 		return NULL;
 	}
@@ -397,100 +387,82 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
 	return 0;
 }
 
-static int __init mkkernel_pool_setup(char *str)
+/**
+ * multikernel_add_pool_memory() - Add memory to the multikernel pool at runtime
+ * @start: physical start address, page aligned
+ * @size: size in bytes, page aligned
+ *
+ * Adds a physically contiguous RAM range to the multikernel pool. Ownership
+ * transfers to the pool: the range must stay allocated (never returned to
+ * the buddy allocator) for the lifetime of the system, since spawn kernels
+ * run out of it. Called when the baseline device tree is applied: userspace
+ * allocates the memory at runtime (e.g. via lazy_cma) and describes it in
+ * the baseline, and writing /sys/fs/multikernel/device_tree hands it over.
+ *
+ * The pool is modeled as a single contiguous region because instance memory
+ * resources are inserted as children of multikernel_res, so a range must
+ * either create the pool or extend it contiguously upward.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int multikernel_add_pool_memory(phys_addr_t start, size_t size)
 {
-	char *cur = str;
-	unsigned long long size, start;
+	bool created_pool = false;
+	bool created_res = false;
+	int ret;
 
-	if (!str)
+	if (!start || !size || !PAGE_ALIGNED(start) || !PAGE_ALIGNED(size))
 		return -EINVAL;
 
-	size = memparse(cur, &cur);
-	if (size == 0) {
-		pr_err("mkkernel_pool: invalid size\n");
-		return -EINVAL;
-	}
+	mutex_lock(&multikernel_mem_mutex);
 
-	/* Expect '@' separator, or end of string for dynamic allocation */
-	if (*cur == '@') {
-		cur++;
-		/* Parse start address */
-		start = memparse(cur, &cur);
-		if (start == 0) {
-			pr_err("mkkernel_pool: invalid start address\n");
-			return -EINVAL;
-		}
-	} else if (*cur == '\0') {
-		/* No address specified, use dynamic allocation */
-		start = 0;
-	} else {
-		pr_err("mkkernel_pool: expected '@' or end of string after size\n");
-		return -EINVAL;
-	}
-
-	/* Reserve the memory using the proper memblock reservation approach */
-	phys_addr_t reserved_addr;
-	if (start != 0) {
-		/* Reserve at the user-specified address */
-		pr_info("mkkernel_pool: trying to reserve at specific address %llx\n", start);
-		if (memblock_reserve(start, size)) {
-			pr_err("mkkernel_pool: failed to reserve at specified address %llx\n", start);
-			return -ENOMEM;
-		}
-		reserved_addr = start;
-		pr_info("mkkernel_pool: successfully reserved at requested address %llx\n", start);
-	} else {
-		/* Dynamic allocation */
-		pr_info("mkkernel_pool: trying dynamic allocation\n");
-		reserved_addr = memblock_phys_alloc(size, PAGE_SIZE);
-		if (!reserved_addr) {
-			pr_err("mkkernel_pool: failed to allocate %llu bytes\n", size);
-			return -ENOMEM;
-		}
-		pr_info("mkkernel_pool: dynamic allocation succeeded at %pa\n", &reserved_addr);
-	}
-
-	multikernel_res.start = reserved_addr;
-	multikernel_res.end = reserved_addr + size - 1;
-
-	pr_info("Multikernel pool: %pa-%pa (%lluMB) allocated\n",
-		    &multikernel_res.start, &multikernel_res.end, (unsigned long long)size >> 20);
-
-	return 0;
-}
-early_param("mkkernel_pool", mkkernel_pool_setup);
-
-static int __init multikernel_mem_init(void)
-{
-	if (multikernel_res.start) {
-		/* Create the generic pool */
+	if (!multikernel_pool) {
 		multikernel_pool = gen_pool_create(PAGE_SHIFT, -1);
 		if (!multikernel_pool) {
-			pr_err("Failed to create multikernel memory pool\n");
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out;
 		}
-
-		/* Add the reserved memory to the pool */
-		if (gen_pool_add(multikernel_pool, multikernel_res.start,
-				 multikernel_res.end - multikernel_res.start + 1, -1)) {
-			pr_err("Failed to add memory to multikernel pool\n");
-			gen_pool_destroy(multikernel_pool);
-			multikernel_pool = NULL;
-			return -ENOMEM;
-		}
-
-		if (insert_resource(&iomem_resource, &multikernel_res)) {
-			pr_warn("mkkernel_pool: failed to register in /proc/iomem\n");
-		} else {
-			pr_info("mkkernel_pool: successfully registered in /proc/iomem\n");
-		}
-
-		pr_info("Multikernel memory pool initialized: %pa-%pa\n",
-			&multikernel_res.start, &multikernel_res.end);
-	} else {
-		pr_info("No multikernel pool found - multikernel support disabled\n");
+		created_pool = true;
 	}
 
-	return 0;
+	if (!multikernel_res.start) {
+		multikernel_res.start = start;
+		multikernel_res.end = start + size - 1;
+		if (insert_resource(&iomem_resource, &multikernel_res))
+			pr_warn("Multikernel pool: failed to register in /proc/iomem\n");
+		created_res = true;
+	} else if (start == multikernel_res.end + 1) {
+		ret = adjust_resource(&multikernel_res, multikernel_res.start,
+				      resource_size(&multikernel_res) + size);
+		if (ret)
+			goto out;
+	} else {
+		pr_err("Multikernel pool: range %pa+%zx is not contiguous with pool ending at %pa\n",
+		       &start, size, &multikernel_res.end);
+		ret = -EBUSY;
+		goto out;
+	}
+
+	ret = gen_pool_add(multikernel_pool, start, size, -1);
+	if (ret) {
+		if (created_res) {
+			remove_resource(&multikernel_res);
+			multikernel_res.start = 0;
+			multikernel_res.end = 0;
+		} else {
+			adjust_resource(&multikernel_res, multikernel_res.start,
+					resource_size(&multikernel_res) - size);
+		}
+		goto out;
+	}
+
+	pr_info("Multikernel pool: added %pa-%pa (%zu MB)\n",
+		&start, &multikernel_res.end, size >> 20);
+out:
+	if (ret && created_pool) {
+		gen_pool_destroy(multikernel_pool);
+		multikernel_pool = NULL;
+	}
+	mutex_unlock(&multikernel_mem_mutex);
+	return ret;
 }
-core_initcall(multikernel_mem_init);

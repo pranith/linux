@@ -305,7 +305,6 @@ struct resource;
 extern phys_addr_t multikernel_alloc(size_t size);
 extern void multikernel_free(phys_addr_t addr, size_t size);
 extern struct resource *multikernel_get_pool_resource(void);
-extern bool multikernel_pool_available(void);
 
 /* Per-instance memory pool management */
 extern void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int min_alloc_order);
