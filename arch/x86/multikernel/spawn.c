@@ -44,6 +44,7 @@
 #include <asm/processor.h>
 #include <asm/apic.h>
 #include <asm/bootparam.h>
+#include <asm/reboot.h>
 #include <asm/multikernel.h>
 #include <asm/realmode.h>
 #include <asm/cpu_entry_area.h>
@@ -871,3 +872,34 @@ int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
 	return smp_call_function_single(cpu, mk_restore_handler, &params, 0);
 }
 EXPORT_SYMBOL_GPL(multikernel_restore_ap);
+
+/*
+ * halt/poweroff/reboot in a spawn kernel must not go through the native
+ * machine ops: native_machine_halt() disables the local APICs, which
+ * makes the CPUs unreachable for re-spawn, and native_machine_restart()
+ * pokes the platform reset hardware, which would reset the entire
+ * machine including the host. Park every CPU in the pool wait loop
+ * instead, returning them to the multikernel pool.
+ */
+static void __noreturn mk_machine_halt(void)
+{
+	mk_halt_to_pool();
+}
+
+static void __noreturn mk_machine_restart(char *cmd)
+{
+	mk_machine_halt();
+}
+
+static int __init mk_spawn_reboot_init(void)
+{
+	if (!mk_boot_context)
+		return 0;
+
+	machine_ops.halt = mk_machine_halt;
+	machine_ops.power_off = mk_machine_halt;
+	machine_ops.restart = mk_machine_restart;
+	machine_ops.emergency_restart = mk_machine_halt;
+	return 0;
+}
+core_initcall(mk_spawn_reboot_init);

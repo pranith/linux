@@ -1055,25 +1055,24 @@ struct mk_shutdown_work {
 };
 
 
-static void mk_shutdown_work_fn(struct work_struct *work)
+/*
+ * Send the shutdown ACK to @target_id while messaging still works, then
+ * park every CPU in the pool wait loop. Common tail of host-requested
+ * shutdown and self-initiated halt: the host treats the ACK as "this
+ * instance's CPUs are back in the pool" and marks it re-spawnable.
+ */
+static void __noreturn mk_shutdown_ack_and_park(int target_id)
 {
-	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
 	struct mk_resource_ack ack;
 
-	/*
-	 * Send ACK first while we can still send messages.
-	 * After this point, CPUs enter pool state and stop processing.
-	 */
 	ack.operation = MK_SYS_SHUTDOWN;
 	ack.result = 0;
 	ack.resource_id = root_instance->id;
 
-	mk_send_message(sw->sender_instance_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN_ACK,
+	mk_send_message(target_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN_ACK,
 			&ack, sizeof(ack));
 
-	pr_info("Multikernel instance %d shutting down (graceful)\n", root_instance->id);
-
-	kfree(sw);
+	pr_info("Multikernel instance %d shutting down\n", root_instance->id);
 
 	/*
 	 * Enter pool state: CPUs wait in HLT with APIC enabled, checking
@@ -1083,6 +1082,53 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	 */
 	smp_call_function(mk_enter_pool_state, NULL, 0);
 	mk_enter_pool_state(NULL);
+}
+
+/**
+ * mk_halt_to_pool - Halt this spawn kernel, returning its CPUs to the pool
+ *
+ * Called from the spawn kernel's machine halt path. Notifies the host
+ * (instance 0) with the same shutdown ACK used for host-requested
+ * shutdown, so the host marks the instance re-spawnable, then parks
+ * every CPU in the pool wait loop.
+ */
+void __noreturn mk_halt_to_pool(void)
+{
+	mk_shutdown_ack_and_park(0);
+}
+
+static void mk_shutdown_work_fn(struct work_struct *work)
+{
+	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
+	int sender_instance_id = sw->sender_instance_id;
+
+	kfree(sw);
+	mk_shutdown_ack_and_park(sender_instance_id);
+}
+
+struct mk_shutdown_ack_work {
+	struct work_struct work;
+	int instance_id;
+};
+
+static void mk_shutdown_ack_work_fn(struct work_struct *work)
+{
+	struct mk_shutdown_ack_work *aw =
+		container_of(work, struct mk_shutdown_ack_work, work);
+	struct mk_instance *instance;
+
+	instance = mk_instance_find(aw->instance_id);
+	if (instance) {
+		pr_info("Instance %d (%s) halted, CPUs returned to pool\n",
+			instance->id, instance->name);
+		mk_instance_set_state(instance, MK_STATE_LOADED);
+		mk_instance_put(instance);
+	} else {
+		pr_warn("Shutdown ACK from unknown instance %d\n",
+			aw->instance_id);
+	}
+
+	kfree(aw);
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype,
@@ -1113,11 +1159,30 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 	}
 	case MK_SYS_SHUTDOWN_ACK: {
 		struct mk_resource_ack *ack = payload;
+		struct mk_shutdown_ack_work *aw;
 
 		if (payload_len < sizeof(*ack))
 			return;
 		mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
 					ack->resource_id, ack->result);
+
+		/*
+		 * A successful ACK means the instance's CPUs are parked in
+		 * the pool, whether we requested the shutdown or the
+		 * instance halted itself. Mark it re-spawnable; deferred to
+		 * a workqueue because instance lookup takes a mutex and we
+		 * are in IPI context here.
+		 */
+		if (ack->result != 0)
+			break;
+
+		aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
+		if (!aw)
+			break;
+
+		INIT_WORK(&aw->work, mk_shutdown_ack_work_fn);
+		aw->instance_id = ack->resource_id;
+		schedule_work(&aw->work);
 		break;
 	}
 	default:

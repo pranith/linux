@@ -324,7 +324,7 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
  * on bare metal). Keep the APIC itself enabled for IPI delivery so that
  * re-spawn wakeup works. Then loop in HLT waiting for spawn signals.
  */
-void mk_enter_pool_state(void *info)
+void __noreturn mk_enter_pool_state(void *info)
 {
 	apic_write(APIC_LVTT, APIC_LVT_MASKED);
 	apic_write(APIC_LVTTHMR, APIC_LVT_MASKED);

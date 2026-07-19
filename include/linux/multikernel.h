@@ -616,6 +616,14 @@ void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
 
 /**
+ * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
+ *
+ * Notifies the host and parks every CPU in the pool wait loop, keeping
+ * the instance re-spawnable. Never returns.
+ */
+void __noreturn mk_halt_to_pool(void);
+
+/**
  * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
  * @instance: Instance to reserve resources for
  * @config: Device tree configuration with memory size and CPU assignment
