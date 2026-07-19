@@ -104,6 +104,11 @@ typedef void (*mk_secondary_trampoline_fn)(unsigned long identity_cr3, unsigned 
 					   unsigned long gs_base, unsigned long stack,
 					   unsigned long trampoline_phys, unsigned long spawn_cr3);
 
+/* Pool park loop: park_cr3, ctx_phys, apic_id, park_phys, mwait_usable */
+typedef void (*mk_pool_park_fn)(unsigned long park_cr3, unsigned long ctx_phys,
+				unsigned long apic_id, unsigned long park_phys,
+				unsigned long mwait_usable);
+
 /*
  * Called by multikernel_play_dead() after each halt to check for spawn signal.
  */
@@ -228,12 +233,20 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long identity_cr3,
 			  unsigned long kernel_entry,
 			  unsigned long trampoline_virt,
-			  unsigned long trampoline_phys)
+			  unsigned long trampoline_phys,
+			  unsigned long park_phys)
 {
 	ctx->identity_cr3 = identity_cr3;
 	ctx->kernel_entry = kernel_entry;
 	ctx->trampoline_virt = trampoline_virt;
 	ctx->trampoline_phys = trampoline_phys;
+	/*
+	 * Where the instance's CPUs wait after it shuts down. Both the park
+	 * page and the identity page table survive re-loads of this
+	 * instance, unlike the kernel image the CPUs came from.
+	 */
+	ctx->park_phys = park_phys;
+	ctx->park_cr3 = identity_cr3;
 	ctx->gs_base = 0;
 	ctx->stack = 0;
 	ctx->flags = 0;
@@ -317,12 +330,23 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 static int __init mk_mark_trampoline_exec(void)
 {
 	unsigned long virt;
+	int ret;
 
 	if (!mk_boot_context)
 		return 0;
 
 	virt = (unsigned long)__va(mk_boot_context->trampoline_phys);
-	return set_memory_x(virt & PAGE_MASK, 1);
+	ret = set_memory_x(virt & PAGE_MASK, 1);
+	if (ret)
+		return ret;
+
+	/* The pool park page is entered the same way when this kernel dies */
+	if (mk_boot_context->park_phys) {
+		virt = (unsigned long)__va(mk_boot_context->park_phys);
+		ret = set_memory_x(virt & PAGE_MASK, 1);
+	}
+
+	return ret;
 }
 core_initcall(mk_mark_trampoline_exec);
 
@@ -807,6 +831,82 @@ void *mk_setup_trampoline(struct mk_instance *instance,
 
 	*phys_out = trampoline_phys;
 	return trampoline_va;
+}
+
+/**
+ * mk_setup_park_page() - Set up the per-instance pool park page
+ * @instance: Instance to allocate the page for
+ * @pgt: Identity page table parked CPUs will run on
+ * @phys_out: Physical address of the park page
+ *
+ * Copies the pool park loop into a page the host owns for the lifetime
+ * of the instance. Unlike the trampoline page, which each spawn kernel
+ * overwrites with its own copy, this page is written exactly once by the
+ * host and never touched again: CPUs may execute from it while a new
+ * kernel image is loaded and booted, so its contents must never change.
+ * The spawn context field offsets it reads are a cross-kernel ABI.
+ */
+void *mk_setup_park_page(struct mk_instance *instance,
+			 struct mk_ident_pgtable *pgt,
+			 unsigned long *phys_out)
+{
+	void *park_va;
+	unsigned long park_phys;
+	size_t size = mk_pool_park_end - mk_pool_park_start;
+	int rc;
+
+	park_va = mk_instance_alloc(instance, PAGE_SIZE, PAGE_SIZE);
+	if (!park_va)
+		return ERR_PTR(-ENOMEM);
+
+	park_phys = virt_to_phys(park_va);
+
+	memcpy(park_va, mk_pool_park_start, size);
+
+	rc = set_memory_x((unsigned long)park_va, 1);
+	if (rc) {
+		mk_instance_free(instance, park_va, PAGE_SIZE);
+		return ERR_PTR(rc);
+	}
+
+	/*
+	 * A dying spawn kernel enters the park page through its own direct
+	 * map at the default base; the first instructions run at that VA
+	 * until the CR3 switch, so it must be mapped in the park page table
+	 * too. The identity mapping is covered by the pool-range build.
+	 */
+	rc = mk_add_trampoline_mapping(pgt,
+				       mk_default_page_offset() + park_phys,
+				       park_phys);
+	if (rc) {
+		mk_instance_free(instance, park_va, PAGE_SIZE);
+		return ERR_PTR(rc);
+	}
+
+	*phys_out = park_phys;
+	return park_va;
+}
+
+/*
+ * Park this CPU in the instance's pool park page. Called on the way into
+ * pool state by a dying spawn kernel; the park page and its page table
+ * are host-owned and survive re-loads of this instance, unlike the
+ * kernel image this code is running from.
+ */
+void mk_park_cpu(void)
+{
+	struct mk_spawn_context *ctx = mk_boot_context;
+	mk_pool_park_fn park;
+
+	if (!ctx)
+		return;
+
+	if (!ctx->park_phys || !ctx->park_cr3)
+		return;
+
+	park = (mk_pool_park_fn)__va(ctx->park_phys);
+	park(ctx->park_cr3, virt_to_phys(ctx), read_apic_id(),
+	     ctx->park_phys, boot_cpu_has(X86_FEATURE_MWAIT));
 }
 
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt)

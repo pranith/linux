@@ -461,6 +461,7 @@ struct mk_instance {
 	phys_addr_t spawn_ctx_phys;
 	struct mk_ident_pgtable *ident_pgt;
 	void *trampoline_va;
+	void *park_va;			/* Pool park page, written once by the host */
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
@@ -857,7 +858,8 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long identity_cr3,
 			  unsigned long kernel_entry,
 			  unsigned long trampoline_virt,
-			  unsigned long trampoline_phys);
+			  unsigned long trampoline_phys,
+			  unsigned long park_phys);
 
 /* Trigger spawn on a pool CPU */
 int mk_spawn_cpu(int cpu, struct mk_spawn_context *ctx);
@@ -874,6 +876,9 @@ unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
 void *mk_setup_trampoline(struct mk_instance *instance,
 			  struct mk_ident_pgtable *pgt,
 			  unsigned long *phys_out);
+void *mk_setup_park_page(struct mk_instance *instance,
+			 struct mk_ident_pgtable *pgt,
+			 unsigned long *phys_out);
 
 /* Secondary CPU wakeup for spawn kernels (reuses boot context) */
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,

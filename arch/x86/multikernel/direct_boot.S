@@ -11,6 +11,8 @@
 
 #include <linux/linkage.h>
 #include <linux/annotate.h>
+#include <asm/asm-offsets.h>
+#include <asm/multikernel.h>
 #include <asm/page_types.h>
 #include <asm/processor-flags.h>
 #include <asm/msr.h>
@@ -190,6 +192,135 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_secondary_identity)
 	ANNOTATE_RETPOLINE_SAFE
 	jmp	*%r13
 SYM_CODE_END(mk_secondary_identity)
+
+/*
+ * mk_pool_park - Pool wait loop for CPUs leaving a dead instance
+ *
+ * Copied by the HOST into a per-instance park page that no kernel image
+ * load ever overwrites, and entered on the instance's preserved identity
+ * page table, so a parked CPU survives re-loads of the instance it came
+ * from. Runs with interrupts disabled and needs no stack, no IDT and no
+ * kernel text; it waits for a wakeup published in the shared spawn
+ * context and dispatches to the trampolines with arguments read from it.
+ * struct mk_spawn_context offsets are a cross-kernel ABI, so this code
+ * works no matter which kernel binary parked the CPU.
+ *
+ * A stray NMI or MCE while parked still goes through the dead kernel's
+ * IDT and can bring the machine down; local LVT sources are masked
+ * before entry, and a park-local IDT/GDT is a possible follow-up.
+ *
+ * Args: %rdi=park_cr3, %rsi=ctx_phys, %rdx=apic_id, %rcx=park_phys,
+ *       %r8=mwait_usable
+ */
+	.globl mk_pool_park_start
+mk_pool_park_start:
+SYM_CODE_START_NOALIGN(mk_pool_park)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+
+	cli
+
+	movq	%rsi, %r12		/* spawn context physical address */
+	movq	%rdx, %r13		/* our APIC ID */
+	movq	%rcx, %r14		/* park page physical address */
+	movq	%r8, %r15		/* MWAIT usable */
+
+	/* Disable PGE for clean TLB invalidation */
+	movq	%cr4, %rax
+	andq	$~X86_CR4_PGE, %rax
+	movq	%rax, %cr4
+
+	/* Switch to the preserved park page table */
+	movq	%rdi, %cr3
+	movq	%cr3, %rax
+	movq	%rax, %cr3
+
+	/* Continue at the identity-mapped park page */
+	addq	$mk_park_identity - mk_pool_park, %r14
+	ANNOTATE_RETPOLINE_SAFE
+	jmp	*%r14
+SYM_CODE_END(mk_pool_park)
+
+/*
+ * Registers: R12=ctx_phys (now also its identity VA), R13=apic_id,
+ *            R15=mwait_usable
+ */
+SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+
+.Lpark_wait:
+	movl	MK_CTX_ready(%r12), %eax
+	cmpl	$1, %eax
+	je	.Lpark_pending
+
+	testq	%r15, %r15
+	jz	.Lpark_relax
+
+	/* Arm the monitor on the ready word, re-check, then sleep */
+	leaq	MK_CTX_ready(%r12), %rax
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	monitor
+	movl	MK_CTX_ready(%r12), %eax
+	cmpl	$1, %eax
+	je	.Lpark_pending
+	xorl	%eax, %eax
+	xorl	%ecx, %ecx
+	mwait
+	jmp	.Lpark_wait
+
+.Lpark_relax:
+	pause
+	jmp	.Lpark_wait
+
+.Lpark_pending:
+	/* Wakeup published; is it for us? */
+	movl	MK_CTX_target_apic_id(%r12), %eax
+	cmpl	%r13d, %eax
+	jne	.Lpark_relax
+
+	/* Claim it: exactly one of waker-revoke and us wins */
+	movl	$1, %eax
+	xorl	%ecx, %ecx
+	lock cmpxchgl %ecx, MK_CTX_ready(%r12)
+	jnz	.Lpark_wait
+
+	testl	$MK_SPAWN_F_SECONDARY, MK_CTX_flags(%r12)
+	jnz	.Lpark_secondary
+
+	/*
+	 * Initial spawn boot:
+	 * multikernel_relocate_kernel(identity_cr3, boot_params, entry,
+	 *                             trampoline_phys)
+	 */
+	movq	MK_CTX_identity_cr3(%r12), %rdi
+	leaq	MK_CTX_bp(%r12), %rsi
+	movq	MK_CTX_kernel_entry(%r12), %rdx
+	movq	MK_CTX_trampoline_phys(%r12), %rcx
+	movq	%rcx, %rax
+	ANNOTATE_RETPOLINE_SAFE
+	jmp	*%rax
+
+.Lpark_secondary:
+	/*
+	 * Secondary CPU joining a running instance:
+	 * mk_secondary_trampoline(identity_cr3, entry, gs_base, stack,
+	 *                         trampoline_phys, spawn_cr3)
+	 */
+	movq	MK_CTX_identity_cr3(%r12), %rdi
+	movq	MK_CTX_kernel_entry(%r12), %rsi
+	movq	MK_CTX_gs_base(%r12), %rdx
+	movq	MK_CTX_stack(%r12), %rcx
+	movq	MK_CTX_secondary_trampoline_phys(%r12), %r8
+	movq	MK_CTX_spawn_cr3(%r12), %r9
+	movq	%r8, %rax
+	ANNOTATE_RETPOLINE_SAFE
+	jmp	*%rax
+SYM_CODE_END(mk_park_identity)
+
+	.globl mk_pool_park_end
+mk_pool_park_end:
 
 	.section .data..multikernel_relocate, "a"
 	.balign 16

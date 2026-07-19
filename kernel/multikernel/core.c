@@ -854,6 +854,10 @@ void mk_instance_free_memory(struct mk_instance *instance)
 			mk_instance_free(instance, instance->trampoline_va, PAGE_SIZE);
 			instance->trampoline_va = NULL;
 		}
+		if (instance->park_va) {
+			mk_instance_free(instance, instance->park_va, PAGE_SIZE);
+			instance->park_va = NULL;
+		}
 		if (instance->ident_pgt) {
 			mk_free_identity_pgtable(instance->ident_pgt);
 			instance->ident_pgt = NULL;
@@ -1119,7 +1123,7 @@ static void mk_shutdown_ack_work_fn(struct work_struct *work)
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		pr_info("Instance %d (%s) halted, CPUs returned to pool\n",
+		pr_info("Instance %d (%s) halted, CPUs parked in pool\n",
 			instance->id, instance->name);
 		mk_instance_set_state(instance, MK_STATE_LOADED);
 		mk_instance_put(instance);
