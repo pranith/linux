@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
+#include <linux/sizes.h>
 
 /**
  * Multikernel IPI interface
@@ -463,6 +464,18 @@ struct mk_instance {
 	void *trampoline_va;
 	void *park_va;			/* Pool park page, written once by the host */
 
+	/*
+	 * Control block: host-owned structures the spawn kernel must never
+	 * allocate over (spawn context, trampoline, park page, identity
+	 * page tables). Carved from one contiguous range so it can be
+	 * reserved in the spawn kernel's e820 with a single entry.
+	 */
+	void *ctrl_va;
+	phys_addr_t ctrl_phys;
+	size_t ctrl_used;
+
+	bool cpus_on_instance_slot;	/* CPUs watch the instance context, not the host slot */
+
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
 
@@ -862,7 +875,26 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long park_phys);
 
 /* Trigger spawn on a pool CPU */
-int mk_spawn_cpu(int cpu, struct mk_spawn_context *ctx);
+int mk_spawn_cpu(struct mk_instance *instance, int cpu,
+		 struct mk_spawn_context *ctx);
+
+/* Host pool park area, set up when the baseline is applied */
+int mk_setup_host_park(void);
+
+
+/*
+ * Control block: spawn context, trampoline page, park page and identity
+ * page tables, plus slack for alignment. Sized once so the whole thing is
+ * one contiguous range the spawn kernel can reserve with a single call.
+ */
+#define MK_CTRL_PGTABLE_PAGES	64
+#define MK_CTRL_BLOCK_SIZE	(SZ_16K + (3 + MK_CTRL_PGTABLE_PAGES) * PAGE_SIZE)
+
+void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
+			     size_t align);
+
+/* Return an instance's parked CPUs to the host slot before teardown */
+int mk_repark_instance_to_host(struct mk_instance *instance);
 
 /* Initialize boot context tracking in spawn kernel */
 void mk_init_boot_context(phys_addr_t ctx_phys);
@@ -876,9 +908,7 @@ unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
 void *mk_setup_trampoline(struct mk_instance *instance,
 			  struct mk_ident_pgtable *pgt,
 			  unsigned long *phys_out);
-void *mk_setup_park_page(struct mk_instance *instance,
-			 struct mk_ident_pgtable *pgt,
-			 unsigned long *phys_out);
+void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out);
 
 /* Secondary CPU wakeup for spawn kernels (reuses boot context) */
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,

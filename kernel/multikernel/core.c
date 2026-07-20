@@ -12,6 +12,7 @@
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/vmalloc.h>
 #include <asm/multikernel.h>
 #include <asm/cpu.h>
 #include <asm/irq_vectors.h>
@@ -849,24 +850,32 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		pr_info("Returning 0x%llx bytes from instance %d (%s) back to multikernel pool\n",
 			total_freed, instance->id, instance->name);
 
-		/* Free all tracked pool allocations before destroying the pool */
-		if (instance->trampoline_va) {
-			mk_instance_free(instance, instance->trampoline_va, PAGE_SIZE);
-			instance->trampoline_va = NULL;
-		}
-		if (instance->park_va) {
-			mk_instance_free(instance, instance->park_va, PAGE_SIZE);
-			instance->park_va = NULL;
-		}
-		if (instance->ident_pgt) {
-			mk_free_identity_pgtable(instance->ident_pgt);
-			instance->ident_pgt = NULL;
-		}
-		if (instance->spawn_ctx) {
-			mk_instance_free(instance, instance->spawn_ctx,
-					 sizeof(struct mk_spawn_context));
-			instance->spawn_ctx = NULL;
-			instance->spawn_ctx_phys = 0;
+		/*
+		 * CPUs still parked on this instance's context would be
+		 * destroyed with it; move them back to the host slot first.
+		 */
+		mk_repark_instance_to_host(instance);
+
+		/*
+		 * The spawn context, trampoline, park page and identity page
+		 * tables are all carved from the control block, so they are
+		 * returned to the pool as one allocation rather than
+		 * individually. Freeing them piecemeal would punch holes in
+		 * the block's bitmap and leave the rest of it allocated.
+		 */
+		mk_free_identity_pgtable(instance->ident_pgt);
+		instance->ident_pgt = NULL;
+		instance->trampoline_va = NULL;
+		instance->park_va = NULL;
+		instance->spawn_ctx = NULL;
+		instance->spawn_ctx_phys = 0;
+
+		if (instance->ctrl_va) {
+			mk_instance_free(instance, instance->ctrl_va,
+					 MK_CTRL_BLOCK_SIZE);
+			instance->ctrl_va = NULL;
+			instance->ctrl_phys = 0;
+			instance->ctrl_used = 0;
 		}
 
 		multikernel_destroy_instance_pool(instance->instance_pool);
@@ -953,6 +962,57 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  * The returned address is a direct-mapped kernel virtual address,
  * which can be converted back to physical using virt_to_phys().
  */
+/**
+ * mk_instance_ctrl_alloc() - Allocate from the instance control block
+ * @instance: Instance to allocate from
+ * @size: Allocation size
+ * @align: Required alignment
+ *
+ * Control structures (spawn context, trampoline, park page, identity page
+ * tables) live in instance memory, which the spawn kernel sees as RAM. They
+ * are carved from one contiguous block so it can be reserved in the spawn
+ * kernel's e820; otherwise the spawn kernel's page allocator recycles them
+ * while it runs, and the CPUs have nothing valid left to park on when it
+ * shuts down.
+ *
+ * The block lives as long as the instance; individual allocations are never
+ * freed, since all of them are reused across re-spawns anyway.
+ */
+void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
+			     size_t align)
+{
+	size_t off;
+
+	if (!instance)
+		return NULL;
+
+	if (!instance->ctrl_va) {
+		void *va = mk_instance_alloc(instance, MK_CTRL_BLOCK_SIZE,
+					     PAGE_SIZE);
+
+		if (!va) {
+			pr_err("Failed to allocate control block for instance %d\n",
+			       instance->id);
+			return NULL;
+		}
+
+		memset(va, 0, MK_CTRL_BLOCK_SIZE);
+		instance->ctrl_va = va;
+		instance->ctrl_phys = virt_to_phys(va);
+		instance->ctrl_used = 0;
+	}
+
+	off = ALIGN(instance->ctrl_used, align);
+	if (off + size > MK_CTRL_BLOCK_SIZE) {
+		pr_err("Instance %d control block exhausted (%zu used, %zu requested)\n",
+		       instance->id, instance->ctrl_used, size);
+		return NULL;
+	}
+
+	instance->ctrl_used = off + size;
+	return instance->ctrl_va + off;
+}
+
 void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align)
 {
 	phys_addr_t phys_addr;

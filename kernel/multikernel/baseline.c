@@ -609,6 +609,12 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return ret;
 	}
 
+	ret = mk_setup_host_park();
+	if (ret) {
+		pr_err("Baseline host park setup failed: %d\n", ret);
+		return ret;
+	}
+
 	ret = mk_baseline_validate_memory(root_instance);
 	if (ret) {
 		pr_err("Baseline memory validation failed: %d\n", ret);

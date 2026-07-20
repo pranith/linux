@@ -611,8 +611,12 @@ void kimage_free(struct kimage *image)
 
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);
+
 			mk_kimage_free(image, virt_addr, image->segment[i].memsz);
 		}
+
+		/* Load-time buffers were kept as the source for each spawn */
+		kimage_file_post_load_cleanup(image);
 
 		if (image->mk_instance) {
 			image->mk_instance->kimage = NULL;
@@ -1683,7 +1687,7 @@ int multikernel_kexec_by_id(int mk_id)
 	void *park_va = NULL;
 	unsigned long park_phys = 0;
 	int cpu = -1;
-	int rc;
+	int i, rc;
 
 	if (!kexec_trylock())
 		return -EBUSY;
@@ -1711,6 +1715,28 @@ int multikernel_kexec_by_id(int mk_id)
 		       mk_id);
 		rc = -EINVAL;
 		goto unlock;
+	}
+
+	/*
+	 * Booting consumes the image: the spawn kernel writes its .data and
+	 * patches its own text, so the copy in instance memory is spent once
+	 * it has run. Re-copy it from the source buffers kept at load time,
+	 * so every spawn starts from a pristine kernel.
+	 */
+	for (i = 0; i < mk_image->nr_segments; i++) {
+		if (WARN_ON_ONCE(!mk_image->segment[i].kbuf)) {
+			pr_err("Instance %d segment %d lost its source buffer\n",
+			       mk_id, i);
+			rc = -EINVAL;
+			goto unlock;
+		}
+
+		rc = kimage_load_segment(mk_image, i);
+		if (rc) {
+			pr_err("Failed to reload segment %d of instance %d: %d\n",
+			       i, mk_id, rc);
+			goto unlock;
+		}
 	}
 
 	rc = mk_kexec_finalize(mk_image);
@@ -1751,7 +1777,7 @@ int multikernel_kexec_by_id(int mk_id)
 		park_va = instance->park_va;
 		park_phys = virt_to_phys(park_va);
 	} else {
-		park_va = mk_setup_park_page(instance, ident_pgt, &park_phys);
+		park_va = mk_setup_park_page(instance, &park_phys);
 		if (IS_ERR(park_va)) {
 			pr_err("Failed to set up pool park page: %ld\n", PTR_ERR(park_va));
 			rc = PTR_ERR(park_va);
@@ -1797,7 +1823,7 @@ int multikernel_kexec_by_id(int mk_id)
 			     trampoline_phys,
 			     park_phys);
 
-	rc = mk_spawn_cpu(cpu, spawn_ctx);
+	rc = mk_spawn_cpu(instance, cpu, spawn_ctx);
 	if (rc == 0) {
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
 		if (rc)

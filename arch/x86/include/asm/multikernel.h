@@ -6,6 +6,7 @@
 
 /* Spawn context flags */
 #define MK_SPAWN_F_SECONDARY	BIT(0)	/* Secondary CPU joining existing kernel */
+#define MK_SPAWN_F_REPARK	BIT(1)	/* Move the CPU to another park slot */
 
 #ifndef __ASSEMBLY__
 
@@ -40,6 +41,8 @@ struct mk_spawn_context {
 	unsigned long spawn_cr3;	/* Spawn kernel's CR3 (for secondary CPU final switch) */
 	unsigned long park_phys;	/* Pool park code page (host owned, never reloaded) */
 	unsigned long park_cr3;		/* Page table parked CPUs run on (host owned) */
+	unsigned long ctrl_phys;	/* Host control area: this context, trampoline, */
+	unsigned long ctrl_size;	/* park page, page tables. Spawn must not reuse it */
 	u32 target_apic_id;		/* Target CPU's APIC ID */
 	u32 flags;			/* MK_SPAWN_F_* flags */
 	u32 ready;			/* Signal flag */
@@ -58,6 +61,9 @@ extern char mk_pool_park_end[];
  * must fall back to an in-kernel wait loop.
  */
 void mk_park_cpu(void);
+
+/* Park an offlined pool CPU (host park area, or instance context) */
+void mk_pool_park_cpu(void);
 
 #endif /* __ASSEMBLY__ */
 

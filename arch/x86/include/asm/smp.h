@@ -140,7 +140,6 @@ void __noreturn mwait_play_dead(unsigned int eax_hint);
 #ifdef CONFIG_MULTIKERNEL
 void mk_set_pool_cpu(int cpu, bool is_pool);
 void __noreturn multikernel_play_dead(void);
-void mk_check_spawn(void);
 int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
 			   unsigned long gs_base, unsigned long stack,
 			   unsigned long entry);

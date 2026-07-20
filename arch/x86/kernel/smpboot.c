@@ -64,6 +64,7 @@
 #include <linux/multikernel.h>
 
 #include <asm/acpi.h>
+#include <asm/multikernel.h>
 #include <asm/cacheinfo.h>
 #include <asm/cpuid/api.h>
 #include <asm/desc.h>
@@ -1525,14 +1526,13 @@ void __noreturn hlt_play_dead(void)
 
 #ifdef CONFIG_MULTIKERNEL
 /*
- * multikernel_play_dead - IPI-capable wait loop for multikernel pool CPUs
+ * multikernel_play_dead - Park a multikernel pool CPU
  *
- * Unlike native_play_dead(), this keeps the APIC enabled so the CPU can
- * receive IPIs. When a spawn is triggered via mk_spawn_cpu(), the IPI
- * handler executes and jumps to the trampoline.
- *
- * This function never returns - either the spawn handler takes over,
- * or the CPU waits indefinitely.
+ * The CPU waits in the pool park area (host park area on the host,
+ * instance context on a spawn kernel returning a CPU), where a spawn
+ * publication dispatches it to the trampolines. This function never
+ * returns; a CPU with no park area available halts dead, still
+ * revivable via INIT.
  */
 void __noreturn multikernel_play_dead(void)
 {
@@ -1541,12 +1541,12 @@ void __noreturn multikernel_play_dead(void)
 
 	play_dead_common();
 
-	local_irq_enable();
+	mk_pool_park_cpu();
 
-	while (1) {
-		native_safe_halt();
-		mk_check_spawn();
-	}
+	pr_emerg("CPU %d: no pool park area, halting permanently\n",
+		 smp_processor_id());
+	while (1)
+		native_halt();
 }
 #endif
 

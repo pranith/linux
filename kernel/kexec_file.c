@@ -571,7 +571,13 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	 * Free up any temporary buffers allocated which are not needed
 	 * after image has been loaded
 	 */
-	kimage_file_post_load_cleanup(image);
+	/*
+	 * A multikernel instance is booted more than once and re-copies its
+	 * segments from these buffers on every spawn, so they have to live as
+	 * long as the image does. kimage_free() cleans up instead.
+	 */
+	if (image->type != KEXEC_TYPE_MULTIKERNEL)
+		kimage_file_post_load_cleanup(image);
 
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
@@ -897,23 +903,17 @@ static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
 		return -EBUSY;
 	}
 
+	/*
+	 * Only pick the destination here. The caller's buffer stays the
+	 * source, and kimage_load_segment() copies it in, exactly like
+	 * ordinary kexec. Keeping the two apart is what lets an instance be
+	 * booted more than once: booting consumes the destination copy, so
+	 * every spawn re-runs the copy from the pristine source.
+	 */
 	kbuf->mem = phys_addr;
 
-	/*
-	 * If kbuf->buffer was already set (e.g., boot_params allocated via
-	 * kvzalloc), copy the data to the pool allocation. Otherwise, the
-	 * caller will populate the buffer later (e.g., ELF segments).
-	 */
-	if (kbuf->buffer && kbuf->bufsz > 0) {
-		memcpy(virt_addr, kbuf->buffer, kbuf->bufsz);
-		pr_info("kexec_alloc_multikernel: copied %zu bytes from %px to %px\n",
-			kbuf->bufsz, kbuf->buffer, virt_addr);
-	}
-
-	kbuf->buffer = virt_addr;
-
-	pr_info("Allocated %lu bytes from multikernel pool at 0x%llx (virt=%px)\n",
-		 kbuf->memsz, (unsigned long long)phys_addr, virt_addr);
+	pr_info("Allocated %lu bytes from multikernel pool at 0x%llx\n",
+		 kbuf->memsz, (unsigned long long)phys_addr);
 
 	return 0;
 }

@@ -44,8 +44,6 @@
 struct vmlinux_data {
 	void *bootparams_buf;
 	void *kernel_buf;
-	bool kernel_buf_from_pool;      /* True if kernel_buf is from multikernel pool */
-	bool bootparams_buf_from_pool;  /* True if bootparams_buf is from multikernel pool */
 };
 
 /*
@@ -223,21 +221,17 @@ static int kexec_load_elf_segments(struct kimage *image, const void *kernel_buf,
 	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
 
 	/*
-	 * For multikernel, kexec_add_buffer() will automatically allocate from
-	 * the instance pool via kexec_alloc_multikernel() -> mk_kimage_alloc().
-	 *
-	 * For regular kexec, we need to allocate the buffer ourselves first.
+	 * Assemble the image in a buffer of our own; kexec_add_buffer() only
+	 * picks where it will be copied to. Multikernel keeps this buffer
+	 * after load so each spawn can re-copy the pristine image.
 	 */
-	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
-		kbuf.buffer = kvzalloc(kbuf.bufsz, GFP_KERNEL);
-		if (!kbuf.buffer)
-			return -ENOMEM;
-	}
+	kbuf.buffer = kvzalloc(kbuf.bufsz, GFP_KERNEL);
+	if (!kbuf.buffer)
+		return -ENOMEM;
 
 	ret = kexec_add_buffer(&kbuf);
 	if (ret) {
-		if (image->type != KEXEC_TYPE_MULTIKERNEL)
-			kvfree(kbuf.buffer);
+		kvfree(kbuf.buffer);
 		return ret;
 	}
 
@@ -378,7 +372,6 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 				  .top_down = true };
 	struct kexec_buf pbuf = { .image = image, .buf_min = MIN_PURGATORY_ADDR,
 				  .buf_max = ULONG_MAX, .top_down = true };
-	bool params_from_pool = false;  /* Track if params switched to pool */
 	int ret;
 
 	pr_info("Loading ELF vmlinux (type=%d)\n", image->type);
@@ -454,22 +447,6 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 		goto out_free_params;
 	bootparam_load_addr = kbuf.mem;
 
-	/*
-	 * For multikernel, kexec_add_buffer() allocates from the instance pool
-	 * and copies the original params data there, then replaces kbuf.buffer
-	 * with the pool allocation. We must use the pool buffer for all further
-	 * modifications (like e820 setup), not the original kvzalloc buffer.
-	 * Free the original buffer since it's no longer needed.
-	 */
-	if (image->type == KEXEC_TYPE_MULTIKERNEL && kbuf.buffer != params) {
-		void *orig_params = params;
-		params = kbuf.buffer;
-		params_from_pool = true;
-		kvfree(orig_params);
-		pr_info("Multikernel: switched params from %px to pool buffer %px\n",
-			orig_params, params);
-	}
-
 	kexec_dprintk("Loaded boot_param at 0x%lx\n", bootparam_load_addr);
 
 	/* Allocate loader specific data early so we can track allocated buffers */
@@ -487,9 +464,6 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 		kfree(ldata);
 		goto out_free_params;
 	}
-
-	/* For multikernel, kernel_buf points to __va() of pool memory, not kvmalloc */
-	ldata->kernel_buf_from_pool = (image->type == KEXEC_TYPE_MULTIKERNEL);
 
 	pr_info("ELF kernel loaded: kernel_load_addr=0x%lx buf=%px\n",
 		kernel_load_addr, ldata->kernel_buf);
@@ -627,14 +601,11 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 	}
 
 	ldata->bootparams_buf = params;
-	ldata->bootparams_buf_from_pool = params_from_pool;
 
 	return ldata;
 
 out_free_params:
-	/* Only free params if it's not from multikernel pool */
-	if (!params_from_pool)
-		kvfree(params);
+	kvfree(params);
 	return ERR_PTR(ret);
 }
 
@@ -648,16 +619,10 @@ static int vmlinux_cleanup(void *loader_data)
 	if (!ldata)
 		return 0;
 
-	/* Only free bootparams_buf if it's not from multikernel pool */
-	if (ldata->bootparams_buf && !ldata->bootparams_buf_from_pool) {
-		kvfree(ldata->bootparams_buf);
-	}
+	kvfree(ldata->bootparams_buf);
 	ldata->bootparams_buf = NULL;
 
-	/* Only free kernel_buf if it's not from multikernel pool */
-	if (ldata->kernel_buf && !ldata->kernel_buf_from_pool) {
-		kvfree(ldata->kernel_buf);
-	}
+	kvfree(ldata->kernel_buf);
 	ldata->kernel_buf = NULL;
 
 	/* Note: ldata itself is freed by kimage_file_post_load_cleanup */

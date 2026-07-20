@@ -23,6 +23,7 @@
 .section .text..multikernel_relocate,"ax"
 .code64
 
+
 .globl multikernel_relocate_kernel_start
 
 multikernel_relocate_kernel_start:
@@ -236,18 +237,63 @@ SYM_CODE_START_NOALIGN(mk_pool_park)
 	movq	%rax, %cr3
 
 	/* Continue at the identity-mapped park page */
-	addq	$mk_park_identity - mk_pool_park, %r14
+	movq	%r14, %rbx		/* keep the park page base */
+	leaq	mk_park_identity - mk_pool_park(%r14), %rax
 	ANNOTATE_RETPOLINE_SAFE
-	jmp	*%r14
+	jmp	*%rax
 SYM_CODE_END(mk_pool_park)
 
 /*
  * Registers: R12=ctx_phys (now also its identity VA), R13=apic_id,
- *            R15=mwait_usable
+ *            R15=mwait_usable, RBX=park page physical address
  */
 SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	UNWIND_HINT_END_OF_STACK
 	ENDBR
+
+	/*
+	 * Take over descriptor tables. We are running on the pool page
+	 * table, where the GDT and IDT of the kernel that parked us are
+	 * not mapped - and that kernel may be overwritten anyway. Any
+	 * exception would fail to deliver and triple fault the machine,
+	 * taking the host down with it. Point GDTR/IDTR at tables inside
+	 * this page so a stray fault stops this CPU and nothing else.
+	 *
+	 * Concurrently parking CPUs write identical values here, and the
+	 * fault stack is shared: a CPU that faults is halting regardless.
+	 */
+	leaq	PAGE_SIZE - 64(%rbx), %rsp
+
+	leaq	mk_park_gdt_entries - mk_pool_park(%rbx), %rax
+	leaq	mk_park_gdt - mk_pool_park(%rbx), %rdx
+	movq	%rax, 2(%rdx)
+	lgdt	(%rdx)
+
+	/*
+	 * CS keeps its cached descriptor; the GDT above only has to
+	 * resolve __KERNEL_CS when an exception loads it from a gate.
+	 */
+	leaq	mk_park_fault - mk_pool_park(%rbx), %rax
+	leaq	mk_park_idt_entries - mk_pool_park(%rbx), %rdi
+	movl	$32, %ecx
+1:	movw	%ax, (%rdi)		/* offset 15:0 */
+	movw	$__KERNEL_CS, 2(%rdi)
+	movb	$0, 4(%rdi)		/* no IST */
+	movb	$0x8e, 5(%rdi)		/* present, DPL0, interrupt gate */
+	movq	%rax, %rdx
+	shrq	$16, %rdx
+	movw	%dx, 6(%rdi)		/* offset 31:16 */
+	shrq	$16, %rdx
+	movl	%edx, 8(%rdi)		/* offset 63:32 */
+	movl	$0, 12(%rdi)
+	addq	$16, %rdi
+	decl	%ecx
+	jnz	1b
+
+	leaq	mk_park_idt_entries - mk_pool_park(%rbx), %rax
+	leaq	mk_park_idt - mk_pool_park(%rbx), %rdx
+	movq	%rax, 2(%rdx)
+	lidt	(%rdx)
 
 .Lpark_wait:
 	movl	MK_CTX_ready(%r12), %eax
@@ -280,27 +326,37 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	cmpl	%r13d, %eax
 	jne	.Lpark_relax
 
-	/* Claim it: exactly one of waker-revoke and us wins */
-	movl	$1, %eax
-	xorl	%ecx, %ecx
-	lock cmpxchgl %ecx, MK_CTX_ready(%r12)
-	jnz	.Lpark_wait
-
-	testl	$MK_SPAWN_F_SECONDARY, MK_CTX_flags(%r12)
+	/*
+	 * Copy the publication into registers BEFORE claiming: once the
+	 * claim clears ready, the publisher may reuse the slot for the
+	 * next CPU. The claim (lock cmpxchg) makes exactly one of
+	 * waker-revoke and us win; on loss the staged values are dropped.
+	 */
+	movl	MK_CTX_flags(%r12), %r11d
+	testl	$MK_SPAWN_F_REPARK, %r11d
+	jnz	.Lpark_repark
+	testl	$MK_SPAWN_F_SECONDARY, %r11d
 	jnz	.Lpark_secondary
 
 	/*
 	 * Initial spawn boot:
 	 * multikernel_relocate_kernel(identity_cr3, boot_params, entry,
 	 *                             trampoline_phys)
+	 * boot_params lives in the instance context, which the slot points
+	 * at via self_phys (a slot watches itself when it is the context).
 	 */
 	movq	MK_CTX_identity_cr3(%r12), %rdi
-	leaq	MK_CTX_bp(%r12), %rsi
+	movq	MK_CTX_self_phys(%r12), %rsi
+	addq	$MK_CTX_bp, %rsi
 	movq	MK_CTX_kernel_entry(%r12), %rdx
-	movq	MK_CTX_trampoline_phys(%r12), %rcx
-	movq	%rcx, %rax
+	movq	MK_CTX_trampoline_phys(%r12), %r8
+	movl	$1, %eax
+	xorl	%ebp, %ebp
+	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
+	jnz	.Lpark_wait
+	movq	%r8, %rcx
 	ANNOTATE_RETPOLINE_SAFE
-	jmp	*%rax
+	jmp	*%r8
 
 .Lpark_secondary:
 	/*
@@ -314,13 +370,64 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	movq	MK_CTX_stack(%r12), %rcx
 	movq	MK_CTX_secondary_trampoline_phys(%r12), %r8
 	movq	MK_CTX_spawn_cr3(%r12), %r9
-	movq	%r8, %rax
+	movl	$1, %eax
+	xorl	%ebp, %ebp
+	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
+	jnz	.Lpark_wait
 	ANNOTATE_RETPOLINE_SAFE
-	jmp	*%rax
+	jmp	*%r8
+
+.Lpark_repark:
+	/*
+	 * Move to another park slot: reload the watch address, page table
+	 * and park page from the publication and start over. Our APIC ID
+	 * and MWAIT capability stay in R13/R15; interrupts stay off.
+	 */
+	movq	MK_CTX_park_cr3(%r12), %r14
+	movq	MK_CTX_park_phys(%r12), %rcx
+	movq	MK_CTX_self_phys(%r12), %r10
+	movl	$1, %eax
+	xorl	%ebp, %ebp
+	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
+	jnz	.Lpark_wait
+	movq	%r10, %r12
+	movq	%r14, %cr3
+	movq	%cr3, %rax
+	movq	%rax, %cr3
+	addq	$mk_park_identity - mk_pool_park, %rcx
+	ANNOTATE_RETPOLINE_SAFE
+	jmp	*%rcx
 SYM_CODE_END(mk_park_identity)
 
-	.globl mk_pool_park_end
-mk_pool_park_end:
+/*
+ * A stray fault while parked stops this CPU; the machine keeps running.
+ * Nothing else can report it: no console, no kernel, and the kernel that
+ * parked us may be gone, so put a marker straight on COM1.
+ */
+SYM_CODE_START_LOCAL_NOALIGN(mk_park_fault)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+	cli
+
+	leaq	mk_park_fault_msg - mk_pool_park(%rbx), %rsi
+1:	lodsb
+	testb	%al, %al
+	jz	3f
+	movb	%al, %ah
+	movw	$0x3fd, %dx		/* COM1 line status */
+2:	inb	%dx, %al
+	testb	$0x20, %al		/* transmit holding register empty */
+	jz	2b
+	movw	$0x3f8, %dx
+	movb	%ah, %al
+	outb	%al, %dx
+	jmp	1b
+
+3:	hlt
+	jmp	3b
+SYM_CODE_END(mk_park_fault)
+
+
 
 	.section .data..multikernel_relocate, "a"
 	.balign 16
@@ -336,6 +443,38 @@ mk_gdt_entries:
 	.quad	0x00af9a000000ffff
 	.quad	0x00cf92000000ffff
 mk_gdt_entries_end:
+
+/*
+ * Park page descriptor tables. They live in the data section like the
+ * trampoline GDT above; the linker places it right after the code, and
+ * the park page copy spans from mk_pool_park_start to the end of this
+ * blob, so the code reaches them at the same relative offsets.
+ */
+mk_park_fault_msg:
+	.asciz	"\r\nmultikernel: fault while parked, CPU halted\r\n"
+
+	.balign 16
+mk_park_gdt:
+	.word	mk_park_gdt_end - mk_park_gdt_entries - 1
+	.quad	0			/* base, filled in at park time */
+	.balign 16
+mk_park_gdt_entries:
+	.quad	0x0000000000000000
+	.quad	0x0000000000000000
+	.quad	0x00af9a000000ffff	/* __KERNEL_CS */
+	.quad	0x00cf92000000ffff	/* __KERNEL_DS */
+mk_park_gdt_end:
+
+	.balign 16
+mk_park_idt:
+	.word	32 * 16 - 1
+	.quad	0			/* base, filled in at park time */
+	.balign 16
+mk_park_idt_entries:
+	.fill	32 * 16, 1, 0
+
+	.globl mk_pool_park_end
+mk_pool_park_end:
 
 	.globl multikernel_relocate_kernel_end
 multikernel_relocate_kernel_end:
