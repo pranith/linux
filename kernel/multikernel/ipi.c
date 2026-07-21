@@ -8,7 +8,6 @@
 #include <linux/smp.h>
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
-#include <linux/irq_work.h>
 #include <linux/multikernel.h>
 #include <linux/kexec.h>
 #include <linux/io.h>
@@ -20,9 +19,7 @@
 static struct mk_ipi_handler *mk_handlers;
 static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lock);
 
-/* Deferred message processing via irq_work */
-static void mk_ipi_process_work(struct irq_work *work);
-static DEFINE_IRQ_WORK(mk_ipi_work, mk_ipi_process_work);
+static void mk_ipi_drain_ring(void);
 
 /**
  * multikernel_register_handler - Register a callback for multikernel IPI
@@ -174,7 +171,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	return 0;
 }
 
-static void mk_ipi_process_work(struct irq_work *work)
+static void mk_ipi_drain_ring(void)
 {
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
@@ -244,25 +241,22 @@ advance_tail:
  * multikernel_interrupt_handler - Handle the multikernel IPI
  *
  * This function is called when a multikernel IPI is received.
- * Messages are deferred to irq_work for processing.
+ * Messages are drained here, in interrupt context.
  */
 static void multikernel_interrupt_handler(void)
 {
-	bool need_work = false;
-
-	if (!root_instance->ipi_data)
+	if (!root_instance || !root_instance->ipi_data)
 		return;
 
 	/*
-	 * Anything queued is handled by the worker, which also decides
-	 * whether the slot at the tail has been published yet.
+	 * Drain here rather than from irq_work. We are already in interrupt
+	 * context and every handler is safe to call from it, and irq_work
+	 * brings a failure mode with it: the work is a single static
+	 * instance, so if it is ever left pending - its self-IPI lost while
+	 * the CPU was bringing its APIC up, say - every later queue attempt
+	 * is a no-op and the ring never drains again.
 	 */
-	if (atomic_read(&root_instance->ipi_data->ring.tail) !=
-	    atomic_read(&root_instance->ipi_data->ring.head))
-		need_work = true;
-
-	if (need_work)
-		irq_work_queue(&mk_ipi_work);
+	mk_ipi_drain_ring();
 }
 
 /**
