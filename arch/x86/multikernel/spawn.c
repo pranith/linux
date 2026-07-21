@@ -361,38 +361,60 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
  *
  * One physical page serves every wake path of this instance: the host
  * allocates it once in mk_setup_trampoline() and reuses it across
- * re-spawns, and mk_init_trampoline() places our own trampoline copy
+ * re-spawns, and mk_prepare_trampoline() places our own trampoline copy
  * (including the secondary entry) in the same page.
  */
-static int __init mk_mark_trampoline_exec(void)
+static int __init mk_prepare_trampoline(void)
 {
+	struct mk_spawn_context *ctx = mk_boot_context;
 	unsigned long virt;
 	int ret;
 
-	if (!mk_boot_context)
+	if (!ctx)
 		return 0;
 
-	virt = (unsigned long)__va(mk_boot_context->trampoline_phys);
-	ret = set_memory_x(virt & PAGE_MASK, 1);
+	/*
+	 * Put our own copy of the trampoline in the page the host set
+	 * aside, while the kernel is fully alive: after shutdown this page
+	 * is entered from an offline CPU, where changing page attributes
+	 * is not allowed.
+	 */
+	spawn_trampoline_phys = ctx->trampoline_phys;
+	spawn_trampoline_va = __va(spawn_trampoline_phys);
+	memcpy(spawn_trampoline_va, multikernel_relocate_kernel_start,
+	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
+
+	/*
+	 * Both pages are executed from the direct map, which is writable,
+	 * so drop write before adding execute. Leaving them writable and
+	 * executable trips the kernel's own W^X check.
+	 */
+	virt = (unsigned long)spawn_trampoline_va & PAGE_MASK;
+	ret = set_memory_ro(virt, 1);
+	if (!ret)
+		ret = set_memory_x(virt, 1);
 	if (ret)
 		return ret;
 
 	/* The pool park page is entered the same way when this kernel dies */
-	if (mk_boot_context->park_phys) {
-		virt = (unsigned long)__va(mk_boot_context->park_phys);
-		ret = set_memory_x(virt & PAGE_MASK, 1);
+	if (ctx->park_phys) {
+		virt = (unsigned long)__va(ctx->park_phys) & PAGE_MASK;
+		ret = set_memory_ro(virt, 1);
+		if (!ret)
+			ret = set_memory_x(virt, 1);
 	}
 
 	return ret;
 }
-core_initcall(mk_mark_trampoline_exec);
+core_initcall(mk_prepare_trampoline);
 
 /*
  * Add a 2MB executable mapping to a page table.
  * Allocates P4D/PUD/PMD levels as needed, reusing existing entries if present.
  * Handles both 4-level and 5-level paging.
  */
-static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys)
+static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys,
+			      pteval_t prot)
 {
 	int pgd_idx = pgd_index(virt);
 	int p4d_idx = p4d_index(virt);
@@ -441,7 +463,7 @@ static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys
 		pmd = (pmd_t *)__va(pud_val(pud[pud_idx]) & PTE_PFN_MASK);
 	}
 
-	pmd[pmd_idx] = __pmd((phys & PMD_MASK) | __PAGE_KERNEL_LARGE_EXEC);
+	pmd[pmd_idx] = __pmd((phys & PMD_MASK) | prot);
 	return 0;
 }
 
@@ -450,18 +472,6 @@ static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys
  * Copies spawn kernel's trampoline code to the pool memory page
  * that was allocated by the host kernel during initial spawn boot.
  */
-static void mk_init_trampoline(struct mk_spawn_context *ctx)
-{
-	size_t size;
-
-	if (spawn_trampoline_phys)
-		return;
-
-	size = multikernel_relocate_kernel_end - multikernel_relocate_kernel_start;
-	spawn_trampoline_phys = ctx->trampoline_phys;
-	spawn_trampoline_va = __va(spawn_trampoline_phys);
-	memcpy(spawn_trampoline_va, multikernel_relocate_kernel_start, size);
-}
 
 /*
  * Build identity page table for secondary CPU trampoline execution.
@@ -480,7 +490,8 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
 		return -ENOMEM;
 
 	/* Map trampoline at its virtual address (initial execution) */
-	ret = mk_add_2mb_mapping(pgd, trampoline_va, trampoline_phys);
+	ret = mk_add_2mb_mapping(pgd, trampoline_va, trampoline_phys,
+				 __PAGE_KERNEL_LARGE_EXEC);
 	if (ret)
 		return ret;
 
@@ -492,12 +503,14 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
 	 * fetching from that VA right after the first CR3 switch, and an
 	 * unmapped fetch there triple-faults the whole machine.
 	 */
-	ret = mk_add_2mb_mapping(pgd, host_trampoline_va, trampoline_phys);
+	ret = mk_add_2mb_mapping(pgd, host_trampoline_va, trampoline_phys,
+				 __PAGE_KERNEL_LARGE_EXEC);
 	if (ret)
 		return ret;
 
 	/* Map trampoline identity (virt=phys, for after CR3 switch) */
-	ret = mk_add_2mb_mapping(pgd, trampoline_phys, trampoline_phys);
+	ret = mk_add_2mb_mapping(pgd, trampoline_phys, trampoline_phys,
+				 __PAGE_KERNEL_LARGE_EXEC);
 	if (ret)
 		return ret;
 
@@ -522,8 +535,10 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 		return -ENODEV;
 	}
 
-	/* Initialize spawn kernel's trampoline (first call only) */
-	mk_init_trampoline(ctx);
+	if (!spawn_trampoline_phys) {
+		pr_err("mk_spawn: trampoline not prepared\n");
+		return -ENODEV;
+	}
 	trampoline_phys = spawn_trampoline_phys;
 	trampoline_va = (unsigned long)spawn_trampoline_va;
 
@@ -541,7 +556,14 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	 * swapper_pg_dir maps everything the secondary needs, including the
 	 * vmalloc'ed idle stack.
 	 */
-	ret = mk_add_2mb_mapping(init_mm.pgd, trampoline_phys, trampoline_phys);
+	/*
+	 * This one lands in the running kernel's page tables and stays
+	 * there, so it must not be writable and executable at once. The
+	 * secondary trampoline only executes from it; it uses the idle
+	 * task stack, not this page.
+	 */
+	ret = mk_add_2mb_mapping(init_mm.pgd, trampoline_phys, trampoline_phys,
+				 __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_RW);
 	if (ret)
 		return ret;
 
