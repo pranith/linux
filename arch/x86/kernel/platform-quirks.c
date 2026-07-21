@@ -165,6 +165,15 @@ void __init x86_early_init_platform_quirks(void)
 #endif
 		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
+		/*
+		 * No legacy timer setup. There is no HPET without ACPI, so
+		 * the default timer_init() would fall back to programming
+		 * the PIT - which belongs to the host - and then request
+		 * legacy IRQ0, which can never reach an instance CPU that
+		 * has neither a PIC nor an IO-APIC. Ticks come from the
+		 * local APIC timer via setup_percpu_clockev() instead.
+		 */
+		x86_init.timers.timer_init = x86_init_noop;
 		x86_init.timers.wallclock_init = x86_init_noop;
 		x86_platform.realmode_reserve = x86_init_noop;
 		x86_platform.realmode_init = x86_init_noop;
