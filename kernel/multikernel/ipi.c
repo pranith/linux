@@ -149,17 +149,19 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	/* We've claimed slot 'head', now fill it */
 	slot = &instance->ipi_data->ring.entries[head];
 
-	/* Set header information */
 	slot->sender_cpu = arch_cpu_physical_id(smp_processor_id());
 	slot->type = type;
-	slot->data_size = data_size;
 
-	/* Copy the actual data into the buffer */
 	if (data && data_size > 0)
 		memcpy(slot->buffer, data, data_size);
 
-	/* Ensure the slot is fully written before sending IPI */
-	smp_wmb();
+	/*
+	 * data_size publishes the slot: the reader treats a zero as "the
+	 * producer has claimed this slot but has not filled it yet" and
+	 * waits. Claiming the slot advanced head, so a reader can already
+	 * be looking at it; everything above must be visible first.
+	 */
+	smp_store_release(&slot->data_size, data_size);
 
 	cpu = find_first_bit(instance->cpus, NR_CPUS);
 
@@ -177,6 +179,7 @@ static void mk_ipi_process_work(struct irq_work *work)
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
 	unsigned int head, tail, next_tail;
+	size_t data_size;
 	int messages_processed = 0;
 
 	if (!root_instance || !root_instance->ipi_data)
@@ -189,11 +192,23 @@ static void mk_ipi_process_work(struct irq_work *work)
 		if (tail == head)
 			break;
 
-		smp_rmb();
-
 		slot = &root_instance->ipi_data->ring.entries[tail];
 
-		if (slot->data_size == 0 || slot->data_size > MK_MAX_DATA_SIZE) {
+		/*
+		 * Pairs with the store_release in multikernel_send_ipi_data().
+		 * Zero means the sender claimed this slot but has not
+		 * finished writing it. Leave it alone: skipping it would
+		 * drop the message it is about to publish. Its own IPI, or
+		 * the next one, brings us back here.
+		 */
+		data_size = smp_load_acquire(&slot->data_size);
+		if (data_size == 0)
+			break;
+
+		if (data_size > MK_MAX_DATA_SIZE) {
+			pr_warn_once("Multikernel IPI slot %u has bad size %zu\n",
+				     tail, data_size);
+			slot->data_size = 0;
 			next_tail = (tail + 1) % MK_IPI_RING_SIZE;
 			atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
 			continue;
@@ -214,6 +229,8 @@ static void mk_ipi_process_work(struct irq_work *work)
 		raw_spin_unlock(&mk_handlers_lock);
 
 advance_tail:
+		/* Mark consumed so the slot reads as unpublished again */
+		slot->data_size = 0;
 		next_tail = (tail + 1) % MK_IPI_RING_SIZE;
 		atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
 		messages_processed++;
@@ -231,35 +248,18 @@ advance_tail:
  */
 static void multikernel_interrupt_handler(void)
 {
-	struct mk_ipi_data *slot;
-	unsigned int head, tail, next_tail;
 	bool need_work = false;
 
 	if (!root_instance->ipi_data)
 		return;
 
-	/* Quick scan: check for pending messages */
-	while (1) {
-		tail = atomic_read(&root_instance->ipi_data->ring.tail);
-		head = atomic_read(&root_instance->ipi_data->ring.head);
-
-		if (tail == head)
-			break;
-
-		smp_rmb();
-
-		slot = &root_instance->ipi_data->ring.entries[tail];
-
-		if (slot->data_size == 0 || slot->data_size > MK_MAX_DATA_SIZE) {
-			next_tail = (tail + 1) % MK_IPI_RING_SIZE;
-			atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
-			continue;
-		}
-
-		/* Defer to irq_work and stop scanning */
+	/*
+	 * Anything queued is handled by the worker, which also decides
+	 * whether the slot at the tail has been published yet.
+	 */
+	if (atomic_read(&root_instance->ipi_data->ring.tail) !=
+	    atomic_read(&root_instance->ipi_data->ring.head))
 		need_work = true;
-		break;
-	}
 
 	if (need_work)
 		irq_work_queue(&mk_ipi_work);
