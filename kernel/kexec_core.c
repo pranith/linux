@@ -1823,6 +1823,17 @@ int multikernel_kexec_by_id(int mk_id)
 			     trampoline_phys,
 			     park_phys);
 
+	/*
+	 * Start the instance with an empty message ring. It lives in host
+	 * memory and outlives the kernel that was using it, so a new
+	 * instance would otherwise inherit that kernel's indices and any
+	 * slot it left half written - which stalls the reader, since an
+	 * unpublished slot means "the sender is still filling this one".
+	 * Anything left in there was addressed to a kernel that is gone.
+	 */
+	if (instance->ipi_data)
+		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+
 	rc = mk_spawn_cpu(instance, cpu, spawn_ctx);
 	if (rc == 0) {
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
