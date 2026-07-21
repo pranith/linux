@@ -79,6 +79,12 @@ static void __init multikernel_pagetable_init(void)
  */
 static void __init multikernel_parse_smp_config(void)
 {
+	/*
+	 * Without ACPI nothing has selected an APIC driver yet. Do it before
+	 * anything in setup_arch() touches the APIC.
+	 */
+	x2apic_install_phys_driver();
+
 	register_lapic_address(APIC_DEFAULT_PHYS_BASE);
 
 	/* Register CPUs from KHO DTB if available */

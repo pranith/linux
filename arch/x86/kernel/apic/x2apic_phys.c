@@ -157,3 +157,24 @@ static struct apic apic_x2apic_phys __ro_after_init = {
 };
 
 apic_driver(apic_x2apic_phys);
+
+/*
+ * Select this driver without ACPI.
+ *
+ * A kernel that parses an MADT gets its APIC driver installed early from
+ * default_acpi_madt_oem_check(). A multikernel spawn kernel has no ACPI,
+ * so it would run through setup_arch() on the default MMIO driver while
+ * the CPU is in x2APIC mode - where the MMIO window is deliberately left
+ * unmapped - and die on the first apic_read(). Physical mode is the one
+ * to install: unlike cluster mode it allocates no per-CPU state, which
+ * is not possible this early, and instances are addressed by physical
+ * APIC ID anyway.
+ */
+void __init x2apic_install_phys_driver(void)
+{
+	if (!x2apic_mode)
+		return;
+
+	x2apic_phys = 1;
+	apic_install_driver(&apic_x2apic_phys);
+}

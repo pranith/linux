@@ -592,6 +592,11 @@ static inline u32 read_apic_id(void)
 typedef int (*wakeup_cpu_handler)(int apicid, unsigned long start_eip);
 extern int default_acpi_madt_oem_check(char *, char *);
 extern void x86_64_probe_apic(void);
+#ifdef CONFIG_X86_X2APIC
+extern void x2apic_install_phys_driver(void);
+#else
+static inline void x2apic_install_phys_driver(void) { }
+#endif
 #else
 static inline int default_acpi_madt_oem_check(char *a, char *b) { return 0; }
 static inline void x86_64_probe_apic(void) { }
