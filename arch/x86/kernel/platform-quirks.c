@@ -163,6 +163,14 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.realmode_reserve = x86_init_noop;
 		x86_platform.realmode_init = x86_init_noop;
 		/*
+		 * The display described in boot_params belongs to the host:
+		 * its VGA window and framebuffer are outside this instance's
+		 * memory and are not mapped here, so registering a console on
+		 * it wedges the boot. Drop it before setup_arch() copies
+		 * screen_info and hands it to vgacon.
+		 */
+		memset(&boot_params.screen_info, 0, sizeof(boot_params.screen_info));
+		/*
 		 * Spawn kernels don't use realmode trampoline - ensure this
 		 * is NULL to prevent do_boot_cpu from accessing it.
 		 */

@@ -587,8 +587,18 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 	 * Set hardware_subarch AFTER setup_boot_parameters() because
 	 * setup_boot_parameters() overwrites it with the host's value.
 	 */
-	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		params->hdr.hardware_subarch = X86_SUBARCH_MULTIKERNEL;
+
+		/*
+		 * The display described here is the host's. Its VGA window
+		 * and framebuffer are outside the instance's memory and are
+		 * not mapped in the spawn kernel, so leaving it set wedges
+		 * the boot when a console is registered on it. The bzImage
+		 * loader does the same.
+		 */
+		memset(&params->screen_info, 0, sizeof(params->screen_info));
+	}
 
 	/* For multikernel, setup custom e820 map */
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
