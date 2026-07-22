@@ -1824,12 +1824,25 @@ int multikernel_kexec_by_id(int mk_id)
 			     park_phys);
 
 	/*
-	 * Start the instance with an empty message ring. It lives in host
-	 * memory and outlives the kernel that was using it, so a new
-	 * instance would otherwise inherit that kernel's indices and any
-	 * slot it left half written - which stalls the reader, since an
-	 * unpublished slot means "the sender is still filling this one".
-	 * Anything left in there was addressed to a kernel that is gone.
+	 * Point at the ring this image actually carries. Every load
+	 * allocates a new one and publishes it through KHO, so the spawn
+	 * kernel maps whatever the image says - while the host would
+	 * otherwise keep using the pointer it cached on its first send,
+	 * which after a re-load belongs to nobody. The two then never see
+	 * each other's messages.
+	 */
+	if (mk_image->kho.ipi) {
+		instance->ipi_phys = mk_image->kho.ipi;
+		instance->ipi_data = phys_to_virt(mk_image->kho.ipi);
+	}
+
+	/*
+	 * Start the instance with an empty ring. It outlives the kernel
+	 * that was using it, so a new instance would otherwise inherit that
+	 * kernel's indices and any slot it left half written - which stalls
+	 * the reader, since an unpublished slot means "the sender is still
+	 * filling this one". Anything left in there was addressed to a
+	 * kernel that is gone.
 	 */
 	if (instance->ipi_data)
 		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
