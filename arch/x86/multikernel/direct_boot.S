@@ -102,6 +102,14 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_identity_mapped)
 	movl	$MSR_FS_BASE, %ecx
 	wrmsr
 
+	/*
+	 * Clearing CR0.WP below is a #GP while CR4.CET is set, and this CPU
+	 * inherits CR4 from whichever kernel parked it.
+	 */
+	movq	%cr4, %rax
+	andq	$~(X86_CR4_CET), %rax
+	movq	%rax, %cr4
+
 	movq	%cr0, %rax
 	andq	$~(X86_CR0_AM | X86_CR0_WP | X86_CR0_TS | X86_CR0_EM), %rax
 	orl	$(X86_CR0_PG | X86_CR0_PE), %eax
