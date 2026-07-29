@@ -406,7 +406,7 @@ static int __init mk_prepare_trampoline(void)
 
 	return ret;
 }
-core_initcall(mk_prepare_trampoline);
+early_initcall(mk_prepare_trampoline);
 
 /*
  * Add a 2MB executable mapping to a page table.
