@@ -215,9 +215,11 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 				 struct mk_spawn_context *ctx, u32 boot_apic_id)
 {
 	struct mk_spawn_context *slot = mk_host_park.slot;
-	int phys_cpu, ret;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+	int ret;
 
-	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
 		if ((u32)phys_cpu == boot_apic_id)
 			continue;
 
@@ -225,7 +227,7 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		slot->park_cr3 = ctx->park_cr3;
 		slot->self_phys = virt_to_phys(ctx);
 		slot->flags = MK_SPAWN_F_REPARK;
-		ret = mk_slot_wake(slot, phys_cpu, "repark to instance");
+		ret = mk_slot_wake(slot, (u32)phys_cpu, "repark to instance");
 		if (ret)
 			return ret;
 	}
@@ -282,17 +284,19 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 int mk_repark_instance_to_host(struct mk_instance *instance)
 {
 	struct mk_spawn_context *ctx = instance->spawn_ctx;
-	int phys_cpu, ret, failed = 0;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+	int ret, failed = 0;
 
 	if (!instance->cpus_on_instance_slot || !ctx || !mk_host_park.slot)
 		return 0;
 
-	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
 		ctx->park_phys = mk_host_park.park_phys;
 		ctx->park_cr3 = mk_host_park.cr3;
 		ctx->self_phys = mk_host_park.slot_phys;
 		ctx->flags = MK_SPAWN_F_REPARK;
-		ret = mk_slot_wake(ctx, phys_cpu, "repark to host");
+		ret = mk_slot_wake(ctx, (u32)phys_cpu, "repark to host");
 		if (ret)
 			failed++;
 	}

@@ -24,8 +24,9 @@
 static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 				  struct mk_instance *instance)
 {
-	const fdt32_t *prop;
+	const fdt64_t *prop;
 	int len, i, cpu_count;
+	char buf[256];
 
 	prop = fdt_getprop(fdt, resources_node, "cpus", &len);
 	if (!prop) {
@@ -33,38 +34,36 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 		return -EINVAL;
 	}
 
-	if (len % 4 != 0) {
-		pr_err("Invalid 'cpus' property length: %d (must be multiple of 4)\n", len);
+	if (len % sizeof(fdt64_t) != 0) {
+		pr_err("Invalid 'cpus' property length: %d (must be an array of 64-bit physical CPU IDs)\n",
+		       len);
 		return -EINVAL;
 	}
 
-	cpu_count = len / 4;
+	cpu_count = len / sizeof(fdt64_t);
 	if (cpu_count == 0) {
 		pr_err("Empty CPU list in baseline\n");
 		return -EINVAL;
 	}
 
 	if (!instance->cpus) {
-		pr_err("Instance CPU bitmap not allocated\n");
+		pr_err("Instance CPU set not allocated\n");
 		return -ENOMEM;
 	}
 
-	bitmap_zero(instance->cpus, NR_CPUS);
+	mk_cpu_set_clear(instance->cpus);
 
 	for (i = 0; i < cpu_count; i++) {
-		u32 cpu_id = fdt32_to_cpu(prop[i]);
+		mk_phys_cpu_t cpu_id = fdt64_to_cpu(prop[i]);
+		int ret = mk_cpu_set_add(instance->cpus, cpu_id);
 
-		if (cpu_id >= NR_CPUS) {
-			pr_err("CPU ID %u exceeds NR_CPUS (%d)\n", cpu_id, NR_CPUS);
-			return -EINVAL;
-		}
-
-		set_bit(cpu_id, instance->cpus);
-		pr_debug("Baseline CPU pool: added physical CPU %u\n", cpu_id);
+		if (ret)
+			return ret;
+		pr_debug("Baseline CPU pool: added physical CPU %llu\n", cpu_id);
 	}
 
-	pr_info("Baseline CPU pool: %d CPUs specified: %*pbl\n",
-		cpu_count, NR_CPUS, instance->cpus);
+	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
+	pr_info("Baseline CPU pool: %d CPUs specified: %s\n", cpu_count, buf);
 
 	return 0;
 }
@@ -169,7 +168,7 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 		return;
 
 	mk_instance_free_memory(instance);
-	bitmap_zero(instance->cpus, NR_CPUS);
+	mk_cpu_set_clear(instance->cpus);
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
 		list_del(&pci_dev->list);
 		kfree(pci_dev);
@@ -187,25 +186,27 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 
 static int mk_baseline_validate_cpus(const struct mk_instance *instance)
 {
-	int phys_cpu_id, logical_cpu;
+	mk_phys_cpu_t phys_cpu_id;
+	unsigned int i;
+	int logical_cpu;
 	int validated = 0;
 
-	for_each_set_bit(phys_cpu_id, instance->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0) {
-			pr_err("Baseline CPU %u not found in system (not present)\n",
+			pr_err("Baseline CPU %llu not found in system (not present)\n",
 			       phys_cpu_id);
 			return -ENODEV;
 		}
 
 		if (!cpu_present(logical_cpu)) {
-			pr_err("Baseline CPU %u (logical %d) is not present\n",
+			pr_err("Baseline CPU %llu (logical %d) is not present\n",
 			       phys_cpu_id, logical_cpu);
 			return -ENODEV;
 		}
 
 		if (logical_cpu == 0 || phys_cpu_id == 0) {
-			pr_warn("Baseline includes boot CPU (phys %u, logical %d) - "
+			pr_warn("Baseline includes boot CPU (phys %llu, logical %d) - "
 				"this may cause system instability\n",
 				phys_cpu_id, logical_cpu);
 		}
@@ -428,19 +429,21 @@ static int mk_baseline_validate_memory(const struct mk_instance *instance)
 
 static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 {
-	int phys_cpu_id, logical_cpu;
+	mk_phys_cpu_t phys_cpu_id;
+	unsigned int i;
+	int logical_cpu;
 	int ret, failed = 0, offlined = 0;
-	int cpu_count = bitmap_weight(instance->cpus, NR_CPUS);
+	unsigned int cpu_count = mk_cpu_set_count(instance->cpus);
 
-	pr_info("Offlining %d CPUs for multikernel pool\n", cpu_count);
+	pr_info("Offlining %u CPUs for multikernel pool\n", cpu_count);
 
-	for_each_set_bit(phys_cpu_id, instance->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0)
 			continue;
 
 		if (!cpu_online(logical_cpu)) {
-			pr_debug("CPU %u (logical %d) already offline\n",
+			pr_debug("CPU %llu (logical %d) already offline\n",
 				 phys_cpu_id, logical_cpu);
 			offlined++;
 			continue;
@@ -456,12 +459,12 @@ static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 
 		ret = remove_cpu(logical_cpu);
 		if (ret) {
-			pr_err("Failed to offline CPU %u (logical %d): %d\n",
+			pr_err("Failed to offline CPU %llu (logical %d): %d\n",
 			       phys_cpu_id, logical_cpu, ret);
 			mk_set_pool_cpu(logical_cpu, false);
 			failed++;
 		} else {
-			pr_info("Offlined CPU %u (logical %d) for multikernel pool\n",
+			pr_info("Offlined CPU %llu (logical %d) for multikernel pool\n",
 				phys_cpu_id, logical_cpu);
 			offlined++;
 		}
@@ -475,7 +478,7 @@ static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 
 	pr_info("Successfully offlined %d CPUs for multikernel pool\n", offlined);
 
-	for_each_set_bit(phys_cpu_id, instance->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu > 0 && !cpu_online(logical_cpu))
 			set_cpu_present(logical_cpu, false);

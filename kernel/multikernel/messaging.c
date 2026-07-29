@@ -16,7 +16,7 @@
 struct mk_pending_msg {
 	u32 msg_type;               /* Message type (e.g., MK_MSG_RESOURCE) */
 	u32 operation;              /* Operation subtype (e.g., MK_RES_CPU_ADD) */
-	u32 resource_id;            /* Resource identifier (CPU ID, PFN, etc.) */
+	u64 resource_id;            /* Resource identifier (physical CPU ID, PFN, etc.) */
 	int result;                 /* Operation result */
 	struct completion done;     /* Completion for waiting */
 	struct list_head list;      /* List linkage */
@@ -82,7 +82,7 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
 	payload = msg->payload_len > 0 ? msg->payload : NULL;
 	payload_len = msg->payload_len;
 
-	pr_debug("Multikernel message received: type=0x%x, subtype=0x%x, len=%u from CPU %d\n",
+	pr_debug("Multikernel message received: type=0x%x, subtype=0x%x, len=%u from CPU %llu\n",
 		 msg_type, msg_subtype, payload_len, data->sender_cpu);
 
 	/* Call the registered handler for this message type */
@@ -101,7 +101,7 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
  *
  * Returns pointer to pending message structure, or NULL on failure
  */
-struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u32 resource_id)
+struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id)
 {
 	struct mk_pending_msg *pending;
 	unsigned long flags;
@@ -132,7 +132,7 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u32 resou
  *
  * Called by response handlers to wake up waiting thread
  */
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u32 resource_id, int result)
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result)
 {
 	struct mk_pending_msg *pending;
 	unsigned long flags;
@@ -164,7 +164,7 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
 	int result;
 
 	if (!wait_for_completion_timeout(&pending->done, timeout)) {
-		pr_err("Timeout waiting for operation 0x%x on resource %u\n",
+		pr_err("Timeout waiting for operation 0x%x on resource %llu\n",
 		       pending->operation, pending->resource_id);
 		result = -ETIMEDOUT;
 	} else {

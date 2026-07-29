@@ -98,13 +98,20 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
 	unsigned int head, next_head, tail;
-	int cpu;
+	mk_phys_cpu_t target;
 
 	if (!instance)
 		return -EINVAL;
 	if (data_size > MK_MAX_DATA_SIZE) {
 		mk_instance_put(instance);
 		return -EINVAL;
+	}
+
+	target = mk_cpu_set_first(instance->cpus);
+	if (target == MK_PHYS_CPU_INVALID) {
+		pr_debug("Instance %d has no CPUs to receive the IPI\n", instance_id);
+		mk_instance_put(instance);
+		return -ENODEV;
 	}
 
 	if (!instance->ipi_data) {
@@ -160,12 +167,9 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	 */
 	smp_store_release(&slot->data_size, data_size);
 
-	cpu = find_first_bit(instance->cpus, NR_CPUS);
-
-	/* Send IPI directly to physical APIC ID
-	 * instance->cpus contains physical CPU IDs, use directly for APIC */
+	/* The target's physical CPU ID is its APIC ID, use it directly */
 	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
-		       cpu);
+		       (u32)target);
 
 	mk_instance_put(instance);
 	return 0;

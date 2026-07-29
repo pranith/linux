@@ -1700,16 +1700,17 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
-	if (instance->cpus && !bitmap_empty(instance->cpus, NR_CPUS)) {
-		int phys_cpu = find_first_bit(instance->cpus, NR_CPUS);
+	if (!mk_cpu_set_empty(instance->cpus)) {
+		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
+
 		cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (cpu < 0) {
-			pr_err("Physical CPU %d not found in logical CPU map\n", phys_cpu);
+			pr_err("Physical CPU %llu not found in logical CPU map\n", phys_cpu);
 			rc = -EINVAL;
 			goto unlock;
 		}
-		pr_info("multikernel kexec: using physical CPU %d (logical %d) from instance bitmap %*pbl\n",
-			phys_cpu, cpu, NR_CPUS, instance->cpus);
+		pr_info("multikernel kexec: using physical CPU %llu (logical %d), %u CPUs assigned\n",
+			phys_cpu, cpu, mk_cpu_set_count(instance->cpus));
 	} else {
 		pr_err("No CPU assignment found for multikernel instance %d - CPU assignment is required\n",
 		       mk_id);

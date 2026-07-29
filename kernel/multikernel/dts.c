@@ -48,9 +48,9 @@ void mk_dt_config_init(struct mk_dt_config *config)
 	config->version = MK_DT_CONFIG_CURRENT;
 	config->memory_size = 0;
 
-	config->cpus = kzalloc(BITS_TO_LONGS(NR_CPUS) * sizeof(unsigned long), GFP_KERNEL);
+	config->cpus = mk_cpu_set_alloc();
 	if (!config->cpus)
-		pr_warn("Failed to allocate CPU bitmap, CPU assignment disabled\n");
+		pr_warn("Failed to allocate CPU set, CPU assignment disabled\n");
 
 	INIT_LIST_HEAD(&config->pci_devices);
 	config->pci_device_count = 0;
@@ -69,7 +69,8 @@ void mk_dt_config_free(struct mk_dt_config *config)
 	if (!config)
 		return;
 
-	kfree(config->cpus);
+	mk_cpu_set_free(config->cpus);
+	config->cpus = NULL;
 
 	/* Free PCI device list */
 	if (config->pci_devices_valid) {
@@ -156,11 +157,12 @@ static int mk_dt_parse_memory(const void *fdt, int chosen_node,
 static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 			    struct mk_dt_config *config)
 {
-	const fdt32_t *prop;
+	const fdt64_t *prop;
 	int len, i, cpu_count;
+	char buf[256];
 
 	if (!config->cpus) {
-		pr_debug("CPU bitmap allocation failed, skipping CPU parsing\n");
+		pr_debug("CPU set allocation failed, skipping CPU parsing\n");
 		return 0;
 	}
 
@@ -171,13 +173,13 @@ static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 		return 0; /* Not an error - property is optional */
 	}
 
-	if (len % 4 != 0) {
-		pr_err("Invalid %s property length: %d (must be multiple of 4)\n",
+	if (len % sizeof(fdt64_t) != 0) {
+		pr_err("Invalid %s property length: %d (must be an array of 64-bit physical CPU IDs)\n",
 		       MK_DT_RESOURCE_CPUS, len);
 		return -EINVAL;
 	}
 
-	cpu_count = len / 4; /* Each CPU is a u32 value */
+	cpu_count = len / sizeof(fdt64_t);
 	if (cpu_count == 0) {
 		pr_err("Empty CPU list in %s\n", MK_DT_RESOURCE_CPUS);
 		return -EINVAL;
@@ -185,23 +187,19 @@ static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 
 	pr_debug("Parsing %d CPUs\n", cpu_count);
 
-	bitmap_zero(config->cpus, NR_CPUS);
+	mk_cpu_set_clear(config->cpus);
 
 	for (i = 0; i < cpu_count; i++) {
-		u32 phys_cpu_id = fdt32_to_cpu(prop[i]);
+		mk_phys_cpu_t phys_cpu_id = fdt64_to_cpu(prop[i]);
+		int ret = mk_cpu_set_add(config->cpus, phys_cpu_id);
 
-		if (phys_cpu_id >= NR_CPUS) {
-			pr_err("Physical CPU ID %u exceeds NR_CPUS (%d) in %s\n",
-			       phys_cpu_id, NR_CPUS, MK_DT_RESOURCE_CPUS);
-			return -EINVAL;
-		}
-
-		set_bit(phys_cpu_id, config->cpus);
-		pr_debug("Added physical CPU ID: %u\n", phys_cpu_id);
+		if (ret)
+			return ret;
+		pr_debug("Added physical CPU ID: %llu\n", phys_cpu_id);
 	}
 
-	pr_info("Successfully parsed %d physical CPUs: %*pbl\n",
-		cpu_count, NR_CPUS, config->cpus);
+	mk_cpu_set_format(buf, sizeof(buf), config->cpus);
+	pr_info("Successfully parsed %d physical CPUs: %s\n", cpu_count, buf);
 	return 0;
 }
 
@@ -567,8 +565,8 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
-	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs, %d PCI devices, and %d platform devices\n",
-		config->memory_size, config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0,
+	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %u CPUs, %d PCI devices, and %d platform devices\n",
+		config->memory_size, mk_cpu_set_count(config->cpus),
 		config->pci_device_count, config->platform_device_count);
 	return 0;
 }
@@ -617,9 +615,9 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 		return ret;
 	}
 
-	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs, %d PCI devices, %d platform devices\n",
+	pr_info("Successfully parsed instance '%s': %zu bytes memory, %u CPUs, %d PCI devices, %d platform devices\n",
 		instance_name, config->memory_size,
-		config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0,
+		mk_cpu_set_count(config->cpus),
 		config->pci_device_count, config->platform_device_count);
 	return 0;
 }
@@ -699,35 +697,37 @@ static int mk_dt_validate_memory(const struct mk_dt_config *config)
  */
 static int mk_dt_validate_cpus(const struct mk_dt_config *config)
 {
-	int phys_cpu_id, logical_cpu;
+	mk_phys_cpu_t phys_cpu_id;
+	unsigned int i;
+	int logical_cpu;
 
 	/* Skip validation if CPU assignment is not available or empty */
-	if (!config->cpus || bitmap_empty(config->cpus, NR_CPUS))
+	if (mk_cpu_set_empty(config->cpus))
 		return 0;
 
-	/* Check that all physical APIC IDs can be found in present CPUs */
-	for_each_set_bit(phys_cpu_id, config->cpus, NR_CPUS) {
+	/* Check that all physical CPU IDs can be found in present CPUs */
+	mk_cpu_set_for_each(i, phys_cpu_id, config->cpus) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0) {
-			pr_err("Physical APIC ID %d not found in present CPUs\n", phys_cpu_id);
+			pr_err("Physical CPU ID %llu not found in present CPUs\n",
+			       phys_cpu_id);
 			return -EINVAL;
 		}
 
 		if (!cpu_online(logical_cpu)) {
-			pr_warn("CPU with physical APIC ID %d (logical CPU %d) is not online, multikernel may fail to start\n",
+			pr_warn("CPU with physical ID %llu (logical CPU %d) is not online, multikernel may fail to start\n",
 				phys_cpu_id, logical_cpu);
 		}
 	}
 
 	/* Check for reasonable CPU count */
-	if (bitmap_weight(config->cpus, NR_CPUS) > num_online_cpus()) {
-		pr_warn("Requested %d CPUs but only %d are online\n",
-			(int)bitmap_weight(config->cpus, NR_CPUS), num_online_cpus());
+	if (mk_cpu_set_count(config->cpus) > num_online_cpus()) {
+		pr_warn("Requested %u CPUs but only %d are online\n",
+			mk_cpu_set_count(config->cpus), num_online_cpus());
 	}
 
-	if (test_bit(0, config->cpus)) {
-		pr_warn("Physical APIC ID 0 (boot CPU) assigned to multikernel instance - this may affect system stability\n");
-	}
+	if (mk_cpu_set_contains(config->cpus, 0))
+		pr_warn("Physical CPU ID 0 (boot CPU) assigned to multikernel instance - this may affect system stability\n");
 
 	return 0;
 }
@@ -759,14 +759,15 @@ bool mk_dt_resources_available(const struct mk_dt_config *config)
 		}
 	}
 
-	/* Check CPU availability - config->cpus contains physical APIC IDs */
-	if (config->cpus && !bitmap_empty(config->cpus, NR_CPUS)) {
-		int phys_cpu_id, logical_cpu;
+	/* Check CPU availability - config->cpus contains physical CPU IDs */
+	if (!mk_cpu_set_empty(config->cpus)) {
+		mk_phys_cpu_t phys_cpu_id;
+		unsigned int i;
 
-		for_each_set_bit(phys_cpu_id, config->cpus, NR_CPUS) {
-			logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
-			if (logical_cpu < 0) {
-				pr_debug("Physical APIC ID %d is not present\n", phys_cpu_id);
+		mk_cpu_set_for_each(i, phys_cpu_id, config->cpus) {
+			if (arch_cpu_from_physical_id(phys_cpu_id) < 0) {
+				pr_debug("Physical CPU ID %llu is not present\n",
+					 phys_cpu_id);
 				return false;
 			}
 		}
@@ -833,11 +834,14 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 	}
 
 	if (config->cpus) {
-		if (bitmap_empty(config->cpus, NR_CPUS)) {
+		if (mk_cpu_set_empty(config->cpus)) {
 			pr_info("  CPU assignment: none specified\n");
 		} else {
-			pr_info("  CPU assignment: %*pbl (%d CPUs)\n",
-				NR_CPUS, config->cpus, (int)bitmap_weight(config->cpus, NR_CPUS));
+			char buf[256];
+
+			mk_cpu_set_format(buf, sizeof(buf), config->cpus);
+			pr_info("  CPU assignment: %s (%u CPUs)\n",
+				buf, mk_cpu_set_count(config->cpus));
 		}
 	} else {
 		pr_info("  CPU assignment: unavailable (allocation failed)\n");
@@ -949,24 +953,23 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 		}
 	}
 
-	/* CPU resources */
-	if (instance->cpus && !bitmap_empty(instance->cpus, NR_CPUS)) {
-		int cpu;
-		u32 *cpu_array;
-		int cpu_count = bitmap_weight(instance->cpus, NR_CPUS);
-		int idx = 0;
+	/* CPU resources, as an array of 64-bit physical CPU IDs */
+	if (!mk_cpu_set_empty(instance->cpus)) {
+		unsigned int idx, cpu_count = mk_cpu_set_count(instance->cpus);
+		mk_phys_cpu_t phys_cpu_id;
+		fdt64_t *cpu_array;
 
-		cpu_array = kmalloc(cpu_count * sizeof(u32), GFP_KERNEL);
+		cpu_array = kmalloc_array(cpu_count, sizeof(*cpu_array), GFP_KERNEL);
 		if (!cpu_array) {
 			ret = -ENOMEM;
 			goto err_free;
 		}
 
-		for_each_set_bit(cpu, instance->cpus, NR_CPUS) {
-			cpu_array[idx++] = cpu_to_fdt32(cpu);
-		}
+		mk_cpu_set_for_each(idx, phys_cpu_id, instance->cpus)
+			cpu_array[idx] = cpu_to_fdt64(phys_cpu_id);
 
-		ret = fdt_property(fdt, "cpus", cpu_array, cpu_count * sizeof(u32));
+		ret = fdt_property(fdt, "cpus", cpu_array,
+				   cpu_count * sizeof(*cpu_array));
 		kfree(cpu_array);
 		if (ret) goto err_free;
 	}

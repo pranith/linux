@@ -408,7 +408,7 @@ EXPORT_SYMBOL_GPL(mk_register_stop_nmi_handler);
  * mk_force_stop_cpu - Send NMI to a specific CPU to force it to stop
  * @phys_cpu: Physical CPU ID to stop
  */
-void mk_force_stop_cpu(int phys_cpu)
+void mk_force_stop_cpu(u64 phys_cpu)
 {
 	int logical_cpu = arch_cpu_from_physical_id(phys_cpu);
 

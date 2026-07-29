@@ -187,7 +187,7 @@ void __init mk_register_cpus_from_kho(void)
 	phys_addr_t fdt_phys;
 	const void *kho_fdt;
 	int mk_node, resources_node;
-	const fdt32_t *cpus_prop;
+	const fdt64_t *cpus_prop;
 	int cpus_len, i;
 	const void *dtb_data;
 	int dtb_len;
@@ -214,17 +214,18 @@ void __init mk_register_cpus_from_kho(void)
 	if (resources_node < 0)
 		goto out;
 
-	/* Get the cpus property from resources node */
+	/* Get the cpus property (64-bit physical IDs) from resources node */
 	cpus_prop = fdt_getprop(dtb_data, resources_node, "cpus", &cpus_len);
-	if (!cpus_prop || cpus_len < sizeof(fdt32_t))
+	if (!cpus_prop || cpus_len < sizeof(fdt64_t) ||
+	    cpus_len % sizeof(fdt64_t))
 		goto out;
 
 	/* Register each CPU from the DTB */
-	for (i = 0; i < cpus_len / sizeof(fdt32_t); i++) {
-		u32 apic_id = fdt32_to_cpu(cpus_prop[i]);
+	for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
+		mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
-		topology_register_apic(apic_id, CPU_ACPIID_INVALID, true);
-		pr_debug("Registered CPU APIC ID %u from KHO DTB\n", apic_id);
+		topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
+		pr_debug("Registered CPU physical ID %llu from KHO DTB\n", phys_id);
 	}
 
 out:
@@ -238,10 +239,11 @@ out:
  */
 static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
 {
-	int phys_cpu_id;
+	mk_phys_cpu_t phys_cpu_id;
+	unsigned int i;
 	cpumask_var_t new_present;
 
-	if (!config->cpus || bitmap_empty(config->cpus, NR_CPUS)) {
+	if (mk_cpu_set_empty(config->cpus)) {
 		pr_debug("No CPU configuration in DTB\n");
 		return 0;
 	}
@@ -256,15 +258,16 @@ static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
 	}
 
 	cpumask_clear(new_present);
-	for_each_set_bit(phys_cpu_id, config->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu_id, config->cpus) {
 		int logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 
 		if (logical_cpu >= 0) {
 			cpumask_set_cpu(logical_cpu, new_present);
-			pr_debug("Instance CPU: physical %d -> logical %d\n",
+			pr_debug("Instance CPU: physical %llu -> logical %d\n",
 				 phys_cpu_id, logical_cpu);
 		} else {
-			pr_warn("Physical CPU %d not found in topology\n", phys_cpu_id);
+			pr_warn("Physical CPU %llu not found in topology\n",
+				phys_cpu_id);
 		}
 	}
 
@@ -309,8 +312,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 			instance->ipi_data, instance->ipi_pages);
 	}
 
-	instance->cpus = kzalloc(BITS_TO_LONGS(NR_CPUS) * sizeof(unsigned long),
-				 GFP_KERNEL);
+	instance->cpus = mk_cpu_set_alloc();
 	if (!instance->cpus)
 		goto err_free_ipi;
 
@@ -338,7 +340,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	return instance;
 
 err_free_cpus:
-	kfree(instance->cpus);
+	mk_cpu_set_free(instance->cpus);
 err_free_ipi:
 	if (alloc_ipi)
 		free_pages((unsigned long)instance->ipi_data,
@@ -512,14 +514,20 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	if (!host_instance)
 		return NULL;
 
-	/* Set CPU 0 as default target for host IPIs (physical ID) */
-	set_bit(0, host_instance->cpus);
+	/* Set physical CPU 0 as default target for host IPIs */
+	if (mk_cpu_set_add(host_instance->cpus, 0)) {
+		kfree(host_instance->name);
+		mk_cpu_set_free(host_instance->cpus);
+		kfree(host_instance);
+		return NULL;
+	}
 
 	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
 	if (!host_instance->ipi_data) {
 		pr_err("Failed to map host IPI buffer at 0x%llx\n",
 		       (unsigned long long)host_ipi_phys);
 		kfree(host_instance->name);
+		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
 		return NULL;
 	}
@@ -547,6 +555,7 @@ int __init mk_kho_restore_dtbs(void)
 	void *dtb_virt;
 	int dtb_len;
 	int ret, cpu;
+	char cpus_buf[256];
 	struct mk_instance *instance, *host_instance;
 	struct mk_dt_config config;
 	int instance_id;
@@ -565,11 +574,14 @@ int __init mk_kho_restore_dtbs(void)
 		}
 		/* Initially, root has all online CPUs (physical IDs) */
 		for_each_online_cpu(cpu) {
-			u32 phys_cpu_id = arch_cpu_physical_id(cpu);
-			set_bit(phys_cpu_id, instance->cpus);
+			if (mk_cpu_set_add(instance->cpus,
+					   arch_cpu_physical_id(cpu)))
+				pr_warn("Failed to add CPU %d to root pool\n",
+					cpu);
 		}
-		pr_info("Root instance initialized with CPUs (physical): %*pbl\n",
-			NR_CPUS, instance->cpus);
+		mk_cpu_set_format(cpus_buf, sizeof(cpus_buf), instance->cpus);
+		pr_info("Root instance initialized with CPUs (physical): %s\n",
+			cpus_buf);
 
 		root_instance = instance;
 
@@ -656,8 +668,10 @@ int __init mk_kho_restore_dtbs(void)
 		goto config_free;
 	}
 
-	if (config.cpus)
-		bitmap_copy(instance->cpus, config.cpus, NR_CPUS);
+	if (config.cpus && mk_cpu_set_copy(instance->cpus, config.cpus)) {
+		ret = -ENOMEM;
+		goto cleanup_instance_name;
+	}
 
 	instance->dtb_data = kmalloc(dtb_len, GFP_KERNEL);
 	if (!instance->dtb_data) {
@@ -715,9 +729,9 @@ cleanup_devices:
 			kfree(plat_dev);
 		}
 	}
-	kfree(instance->dtb_data);
 cleanup_instance_name:
 	kfree(instance->name);
+	mk_cpu_set_free(instance->cpus);
 	kfree(instance->dtb_data);
 	kfree(instance);
 config_free:

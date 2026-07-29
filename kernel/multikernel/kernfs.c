@@ -253,7 +253,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 		goto err_free_instance;
 	}
 
-	instance->cpus = kzalloc(BITS_TO_LONGS(NR_CPUS) * sizeof(unsigned long), GFP_KERNEL);
+	instance->cpus = mk_cpu_set_alloc();
 	if (!instance->cpus) {
 		ret = -ENOMEM;
 		goto err_free_name;
@@ -342,7 +342,7 @@ err_remove_dir:
 err_free_config:
 	mk_dt_config_free(&config);
 err_free_cpumask:
-	kfree(instance->cpus);
+	mk_cpu_set_free(instance->cpus);
 err_free_name:
 	kfree(instance->name);
 err_free_instance:

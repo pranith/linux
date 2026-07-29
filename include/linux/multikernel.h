@@ -16,6 +16,56 @@
 #include <linux/sizes.h>
 
 /**
+ * Physical CPU identifiers
+ *
+ * Instances are described by the physical IDs of their CPUs (APIC ID on
+ * x86, MPIDR on arm64, hartid on riscv). Physical IDs are sparse 64-bit
+ * values, so they cannot be used as bit positions in NR_CPUS-sized
+ * bitmaps; a set is a small array instead. Entries keep insertion order,
+ * so the first CPU of a device tree list stays the instance's boot CPU.
+ */
+typedef u64 mk_phys_cpu_t;
+
+#define MK_PHYS_CPU_INVALID	(~(mk_phys_cpu_t)0)
+
+struct mk_cpu_set {
+	unsigned int nr;	/* Entries in use */
+	unsigned int cap;	/* Allocated capacity */
+	mk_phys_cpu_t *ids;
+};
+
+struct mk_cpu_set *mk_cpu_set_alloc(void);
+void mk_cpu_set_free(struct mk_cpu_set *set);
+void mk_cpu_set_clear(struct mk_cpu_set *set);
+int mk_cpu_set_reserve(struct mk_cpu_set *set, unsigned int extra);
+int mk_cpu_set_add(struct mk_cpu_set *set, mk_phys_cpu_t id);
+bool mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t id);
+bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
+int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
+int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
+
+static inline unsigned int mk_cpu_set_count(const struct mk_cpu_set *set)
+{
+	return set ? set->nr : 0;
+}
+
+static inline bool mk_cpu_set_empty(const struct mk_cpu_set *set)
+{
+	return mk_cpu_set_count(set) == 0;
+}
+
+static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
+{
+	return mk_cpu_set_empty(set) ? MK_PHYS_CPU_INVALID : set->ids[0];
+}
+
+#define mk_cpu_set_for_each(i, id, set)					\
+	for ((i) = 0;							\
+	     (set) && (i) < (set)->nr &&				\
+	     (((id) = (set)->ids[(i)]), true);				\
+	     (i)++)
+
+/**
  * Multikernel IPI interface
  */
 
@@ -27,7 +77,7 @@
 
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
-	int sender_cpu;          /* Which CPU sent this IPI */
+	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
 	unsigned int type;      /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
 	char buffer[MK_MAX_DATA_SIZE]; /* Actual data buffer */
@@ -158,7 +208,7 @@ struct mk_io_irq_payload {
 
 /* CPU resource operations */
 struct mk_cpu_resource_payload {
-	u32 cpu_id;             /* Physical CPU ID */
+	u64 cpu_id;             /* Physical CPU ID */
 	u32 numa_node;          /* NUMA node (optional) */
 	u32 flags;              /* CPU capabilities/attributes */
 	int sender_instance_id; /* Sender instance ID for ACK */
@@ -202,8 +252,7 @@ struct mk_device_resource_payload {
 struct mk_resource_ack {
 	u32 operation;          /* Original operation (MK_RES_CPU_ADD, etc.) */
 	u32 result;             /* Result code: 0 = success, negative = error */
-	u32 resource_id;        /* CPU ID, memory PFN, etc. */
-	u32 reserved;           /* For future use */
+	u64 resource_id;        /* Physical CPU ID, memory PFN, etc. */
 };
 
 /* Shutdown request payload */
@@ -261,8 +310,8 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
 
 /* Pending message tracking for request-response pattern */
-struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u32 resource_id);
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u32 resource_id, int result);
+struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
 
 /**
@@ -284,8 +333,8 @@ static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
 }
 
 /* CPU resource management - these wait for operation to complete */
-int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags);
-int mk_send_cpu_remove(int instance_id, u32 cpu_id);
+int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
+int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id);
 
 /* Memory resource management */
 int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
@@ -394,7 +443,7 @@ struct mk_dt_config {
 	size_t memory_size;              /* Total memory size required */
 
 	/* CPU resources */
-	unsigned long *cpus;             /* Bitmap of physical CPU IDs */
+	struct mk_cpu_set *cpus;         /* Set of physical CPU IDs */
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
@@ -433,7 +482,7 @@ struct mk_instance {
 	size_t pool_size;               /* Size of the instance pool */
 
 	/* CPU resources */
-	unsigned long *cpus;             /* Bitmap of assigned physical CPU IDs */
+	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
@@ -661,9 +710,9 @@ void mk_instance_free_memory(struct mk_instance *instance);
 
 
 int mk_instance_transfer_cpus(struct mk_instance *instance,
-			       const unsigned long *cpus);
+			       const struct mk_cpu_set *cpus);
 int mk_instance_return_cpus(struct mk_instance *instance,
-			     const unsigned long *cpus);
+			     const struct mk_cpu_set *cpus);
 int mk_instance_add_memory_region(struct mk_instance *instance, size_t size);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size);

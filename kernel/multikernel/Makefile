@@ -3,7 +3,7 @@
 # Makefile for multikernel support
 #
 
-obj-y += core.o mem.o kernfs.o dts.o kho.o ipi.o messaging.o overlay.o hotplug.o baseline.o
+obj-y += core.o cpuset.o mem.o kernfs.o dts.o kho.o ipi.o messaging.o overlay.o hotplug.o baseline.o
 
 # DMA-BUF heap for multikernel memory allocation
 obj-$(CONFIG_DMABUF_HEAPS) += dma_heap.o

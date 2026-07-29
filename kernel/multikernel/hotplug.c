@@ -41,7 +41,7 @@ struct mk_hotplug_op {
 
 	union {
 		struct {
-			u32 cpu_id;        /* Physical CPU ID */
+			u64 cpu_id;        /* Physical CPU ID */
 			u32 numa_node;
 		} cpu;
 
@@ -71,7 +71,7 @@ static LIST_HEAD(mk_hotplug_ops);
  */
 struct mk_cpu_hotplug_work {
 	struct work_struct work;
-	u32 cpu_id;
+	mk_phys_cpu_t cpu_id;
 	u32 numa_node;
 	u32 flags;
 	int sender_instance_id;  /* For sending ACK back */
@@ -83,7 +83,7 @@ struct mk_cpu_hotplug_work {
  * physical ID. Using present CPUs is important because topology can change during
  * multikernel operations, and we only care about CPUs that are actually present.
  */
-static int mk_cpu_to_logical(u32 cpu_id)
+static int mk_cpu_to_logical(mk_phys_cpu_t cpu_id)
 {
 	int cpu;
 
@@ -92,31 +92,33 @@ static int mk_cpu_to_logical(u32 cpu_id)
 			return cpu;
 	}
 
-	pr_err("Multikernel hotplug: Physical CPU %u not found in present CPUs\n",
+	pr_err("Multikernel hotplug: Physical CPU %llu not found in present CPUs\n",
 	       cpu_id);
 	return -EINVAL;
 }
 
-static int mk_do_cpu_add(u32 cpu_id, u32 numa_node, u32 flags)
+static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 {
 	int logical_cpu;
 	int ret;
 	struct mk_hotplug_op *op;
 
-	pr_info("Multikernel hotplug: Adding CPU %u (numa=%u, flags=0x%x)\n",
+	pr_info("Multikernel hotplug: Adding CPU %llu (numa=%u, flags=0x%x)\n",
 		cpu_id, numa_node, flags);
 
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
-		pr_err("Multikernel hotplug: CPU %u not found in present CPUs\n", cpu_id);
+		pr_err("Multikernel hotplug: CPU %llu not found in present CPUs\n", cpu_id);
 		return -ENODEV;
 	}
 
 	if (cpu_online(logical_cpu)) {
-		pr_warn("Multikernel hotplug: CPU %d (phys %u) already online\n",
+		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already online\n",
 			logical_cpu, cpu_id);
-		if (root_instance->cpus)
-			set_bit(cpu_id, root_instance->cpus);
+		if (root_instance->cpus &&
+		    mk_cpu_set_add(root_instance->cpus, cpu_id))
+			pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+				cpu_id);
 		return 0;
 	}
 
@@ -133,13 +135,14 @@ static int mk_do_cpu_add(u32 cpu_id, u32 numa_node, u32 flags)
 
 	ret = add_cpu(logical_cpu);
 	if (ret < 0) {
-		pr_err("Multikernel hotplug: Failed to add CPU %d (phys %u): %d\n",
+		pr_err("Multikernel hotplug: Failed to add CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
 		return ret;
 	}
 
-	if (root_instance->cpus)
-		set_bit(cpu_id, root_instance->cpus);
+	if (root_instance->cpus && mk_cpu_set_add(root_instance->cpus, cpu_id))
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+			cpu_id);
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
@@ -153,13 +156,13 @@ static int mk_do_cpu_add(u32 cpu_id, u32 numa_node, u32 flags)
 		mutex_unlock(&mk_hotplug_mutex);
 	}
 
-	pr_info("Multikernel hotplug: Successfully added CPU %d (phys %u)\n",
+	pr_info("Multikernel hotplug: Successfully added CPU %d (phys %llu)\n",
 		logical_cpu, cpu_id);
 
 	return 0;
 }
 
-static int mk_do_cpu_remove(u32 cpu_id)
+static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 {
 	int logical_cpu;
 	int ret;
@@ -167,15 +170,14 @@ static int mk_do_cpu_remove(u32 cpu_id)
 
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
-		pr_err("Multikernel hotplug: Physical CPU %u not found\n", cpu_id);
+		pr_err("Multikernel hotplug: Physical CPU %llu not found\n", cpu_id);
 		return -ENODEV;
 	}
 
 	if (!cpu_online(logical_cpu)) {
-		pr_warn("Multikernel hotplug: CPU %d (phys %u) already offline\n",
+		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already offline\n",
 			logical_cpu, cpu_id);
-		if (root_instance->cpus)
-			clear_bit(cpu_id, root_instance->cpus);
+		mk_cpu_set_del(root_instance->cpus, cpu_id);
 		return 0;
 	}
 
@@ -189,14 +191,13 @@ static int mk_do_cpu_remove(u32 cpu_id)
 
 	ret = remove_cpu(logical_cpu);
 	if (ret < 0) {
-		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %u): %d\n",
+		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
 		mk_set_pool_cpu(logical_cpu, false);
 		return ret;
 	}
 
-	if (root_instance->cpus)
-		clear_bit(cpu_id, root_instance->cpus);
+	mk_cpu_set_del(root_instance->cpus, cpu_id);
 
 	/*
 	 * Clear CPU from present mask to prevent host kernel from trying
@@ -216,7 +217,7 @@ static int mk_do_cpu_remove(u32 cpu_id)
 		mutex_unlock(&mk_hotplug_mutex);
 	}
 
-	pr_info("Multikernel hotplug: Successfully removed CPU %d (phys %u)\n",
+	pr_info("Multikernel hotplug: Successfully removed CPU %d (phys %llu)\n",
 		logical_cpu, cpu_id);
 
 	return 0;
@@ -234,12 +235,11 @@ static void mk_cpu_add_work_fn(struct work_struct *work)
 	ack.operation = hp_work->operation;
 	ack.result = ret;
 	ack.resource_id = hp_work->cpu_id;
-	ack.reserved = 0;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
-		pr_warn("Multikernel hotplug: Failed to send ACK for CPU %u: %d\n",
+		pr_warn("Multikernel hotplug: Failed to send ACK for CPU %llu: %d\n",
 			hp_work->cpu_id, ack_ret);
 	}
 
@@ -258,12 +258,11 @@ static void mk_cpu_remove_work_fn(struct work_struct *work)
 	ack.operation = hp_work->operation;
 	ack.result = ret;
 	ack.resource_id = hp_work->cpu_id;
-	ack.reserved = 0;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
-		pr_warn("Multikernel hotplug: Failed to send ACK for CPU %u: %d\n",
+		pr_warn("Multikernel hotplug: Failed to send ACK for CPU %llu: %d\n",
 			hp_work->cpu_id, ack_ret);
 	}
 
@@ -293,11 +292,8 @@ static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payloa
 	 * We're in IRQ context (IPI handler), so we can't call add_cpu() directly.
 	 */
 	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
-	if (!hp_work) {
-		pr_err("Multikernel hotplug: Failed to allocate work structure for CPU %u\n",
-		       payload->cpu_id);
+	if (!hp_work)
 		return -ENOMEM;
-	}
 
 	INIT_WORK(&hp_work->work, mk_cpu_add_work_fn);
 	hp_work->cpu_id = payload->cpu_id;
@@ -333,11 +329,8 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 	 * We're in IRQ context (IPI handler), so we can't call remove_cpu() directly.
 	 */
 	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
-	if (!hp_work) {
-		pr_err("Multikernel hotplug: Failed to allocate work structure for CPU %u\n",
-		       payload->cpu_id);
+	if (!hp_work)
 		return -ENOMEM;
-	}
 
 	INIT_WORK(&hp_work->work, mk_cpu_remove_work_fn);
 	hp_work->cpu_id = payload->cpu_id;
@@ -515,8 +508,7 @@ static void mk_mem_add_work_fn(struct work_struct *work)
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = (u32)hp_work->start_pfn;
-	ack.reserved = 0;
+	ack.resource_id = hp_work->start_pfn;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
@@ -538,8 +530,7 @@ static void mk_mem_remove_work_fn(struct work_struct *work)
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = (u32)hp_work->start_pfn;
-	ack.reserved = 0;
+	ack.resource_id = hp_work->start_pfn;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
@@ -765,7 +756,6 @@ static void mk_device_add_work_fn(struct work_struct *work)
 	ack.operation = hp_work->operation;
 	ack.result = ret;
 	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
-	ack.reserved = 0;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
@@ -789,7 +779,6 @@ static void mk_device_remove_work_fn(struct work_struct *work)
 	ack.operation = hp_work->operation;
 	ack.result = ret;
 	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
-	ack.reserved = 0;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
@@ -1000,7 +989,7 @@ void mk_hotplug_cleanup(void)
  *
  * Returns: 0 on success, negative error code on failure or timeout
  */
-int mk_send_cpu_remove(int instance_id, u32 cpu_id)
+int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 {
 	struct mk_cpu_resource_payload payload = {
 		.cpu_id = cpu_id,
@@ -1022,11 +1011,9 @@ int mk_send_cpu_remove(int instance_id, u32 cpu_id)
 
 	/* For non-running instances, return CPU to root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {
-		DECLARE_BITMAP(cpu_mask, NR_CPUS);
+		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
-		bitmap_zero(cpu_mask, NR_CPUS);
-		set_bit(cpu_id, cpu_mask);
-		return mk_instance_return_cpus(target_instance, cpu_mask);
+		return mk_instance_return_cpus(target_instance, &cpus);
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, cpu_id);
@@ -1044,8 +1031,10 @@ int mk_send_cpu_remove(int instance_id, u32 cpu_id)
 	if (ret < 0)
 		return ret;
 
-	clear_bit(cpu_id, target_instance->cpus);
-	set_bit(cpu_id, root_instance->cpus);
+	mk_cpu_set_del(target_instance->cpus, cpu_id);
+	if (mk_cpu_set_add(root_instance->cpus, cpu_id))
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+			cpu_id);
 
 	return 0;
 }
@@ -1064,7 +1053,7 @@ int mk_send_cpu_remove(int instance_id, u32 cpu_id)
  *
  * Returns: 0 on success, negative error code on failure or timeout
  */
-int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags)
+int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 {
 	struct mk_cpu_resource_payload payload = {
 		.cpu_id = cpu_id,
@@ -1086,11 +1075,9 @@ int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags)
 
 	/* For non-running instances, transfer CPU from root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {
-		DECLARE_BITMAP(cpu_mask, NR_CPUS);
+		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
-		bitmap_zero(cpu_mask, NR_CPUS);
-		set_bit(cpu_id, cpu_mask);
-		return mk_instance_transfer_cpus(target_instance, cpu_mask);
+		return mk_instance_transfer_cpus(target_instance, &cpus);
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
@@ -1108,8 +1095,10 @@ int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags)
 	if (ret < 0)
 		return ret;
 
-	set_bit(cpu_id, target_instance->cpus);
-	clear_bit(cpu_id, root_instance->cpus);
+	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
+			cpu_id, instance_id);
+	mk_cpu_set_del(root_instance->cpus, cpu_id);
 
 	return 0;
 }
@@ -1159,7 +1148,7 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		return mk_instance_add_memory_region(target_instance, size);
 	}
 
-	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_ADD, (u32)start_pfn);
+	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_ADD, start_pfn);
 	if (!pending)
 		return -ENOMEM;
 
@@ -1221,7 +1210,7 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		return mk_instance_remove_memory_region(target_instance, phys_addr, size);
 	}
 
-	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_REMOVE, (u32)start_pfn);
+	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_REMOVE, start_pfn);
 	if (!pending)
 		return -ENOMEM;
 

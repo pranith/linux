@@ -23,7 +23,7 @@
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
-	if (!instance || !instance->cpus)
+	if (!instance || mk_cpu_set_empty(instance->cpus))
 		return;
 
 	if (instance == root_instance || instance->id == 0)
@@ -151,7 +151,7 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
 
-	kfree(instance->cpus);
+	mk_cpu_set_free(instance->cpus);
 	kfree(instance->dtb_data);
 	kfree(instance->name);
 	kfree(instance);
@@ -280,7 +280,7 @@ bool multikernel_allow_emergency_restart(void)
 /**
  * mk_instance_transfer_cpus() - Transfer CPUs from root to instance
  * @instance: Target instance
- * @cpus: Bitmap of CPUs to transfer
+ * @cpus: Set of physical CPU IDs to transfer
  *
  * Transfers CPUs from root instance to the target instance.
  * Validates that CPUs are available in root.
@@ -288,36 +288,38 @@ bool multikernel_allow_emergency_restart(void)
  * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_transfer_cpus(struct mk_instance *instance,
-			       const unsigned long *cpus)
+			       const struct mk_cpu_set *cpus)
 {
-	int phys_cpu, logical_cpu;
+	unsigned int i, requested_count;
+	mk_phys_cpu_t phys_cpu;
 	int unavailable = 0;
-	int requested_count;
+	char buf[256];
+	int ret;
 
 	if (!cpus || !instance->cpus || !root_instance || !root_instance->cpus) {
-		pr_err("Invalid CPU bitmaps for transfer\n");
+		pr_err("Invalid CPU sets for transfer\n");
 		return -EINVAL;
 	}
 
-	requested_count = bitmap_weight(cpus, NR_CPUS);
+	requested_count = mk_cpu_set_count(cpus);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested for instance %d (%s)\n",
 			instance->id, instance->name);
 		return 0;
 	}
 
-	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
-		if (!test_bit(phys_cpu, root_instance->cpus)) {
-			pr_err("CPU %u not available in root instance pool\n", phys_cpu);
+	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+		if (!mk_cpu_set_contains(root_instance->cpus, phys_cpu)) {
+			pr_err("CPU %llu not available in root instance pool\n",
+			       phys_cpu);
 			unavailable++;
 			continue;
 		}
 
-		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
-		if (logical_cpu < 0) {
-			pr_err("Physical CPU %d not found in logical CPU map\n", phys_cpu);
+		if (arch_cpu_from_physical_id(phys_cpu) < 0) {
+			pr_err("Physical CPU %llu not found in logical CPU map\n",
+			       phys_cpu);
 			unavailable++;
-			continue;
 		}
 	}
 
@@ -327,14 +329,18 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return -EBUSY;
 	}
 
-	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
-		clear_bit(phys_cpu, root_instance->cpus);
-		set_bit(phys_cpu, instance->cpus);
+	ret = mk_cpu_set_reserve(instance->cpus, requested_count);
+	if (ret)
+		return ret;
+
+	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+		mk_cpu_set_del(root_instance->cpus, phys_cpu);
+		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
 
-	pr_info("Transferred %d CPUs from root to instance %d (%s): %*pbl\n",
-		requested_count, instance->id, instance->name,
-		NR_CPUS, instance->cpus);
+	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
+	pr_info("Transferred %u CPUs from root to instance %d (%s): %s\n",
+		requested_count, instance->id, instance->name, buf);
 
 	return 0;
 }
@@ -342,7 +348,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 /**
  * mk_instance_return_cpus() - Return CPUs from instance back to root
  * @instance: Source instance
- * @cpus: Bitmap of CPUs to return
+ * @cpus: Set of physical CPU IDs to return (may be instance->cpus itself)
  *
  * Transfers CPUs from the instance back to root instance.
  * Validates that CPUs are assigned to the source instance.
@@ -350,18 +356,20 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
  * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_return_cpus(struct mk_instance *instance,
-			     const unsigned long *cpus)
+			     const struct mk_cpu_set *cpus)
 {
-	int phys_cpu;
+	unsigned int i, requested_count;
+	mk_phys_cpu_t phys_cpu;
 	int not_found = 0;
-	int requested_count;
+	char buf[256];
+	int ret;
 
 	if (!cpus || !instance->cpus || !root_instance || !root_instance->cpus) {
-		pr_err("Invalid CPU bitmaps for return\n");
+		pr_err("Invalid CPU sets for return\n");
 		return -EINVAL;
 	}
 
-	requested_count = bitmap_weight(cpus, NR_CPUS);
+	requested_count = mk_cpu_set_count(cpus);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested to return from instance %d (%s)\n",
 			instance->id, instance->name);
@@ -369,9 +377,9 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	}
 
 	/* Validate all CPUs are assigned to this instance */
-	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
-		if (!test_bit(phys_cpu, instance->cpus)) {
-			pr_err("CPU %u not assigned to instance %d (%s)\n",
+	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+		if (!mk_cpu_set_contains(instance->cpus, phys_cpu)) {
+			pr_err("CPU %llu not assigned to instance %d (%s)\n",
 			       phys_cpu, instance->id, instance->name);
 			not_found++;
 		}
@@ -383,15 +391,25 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	/* Transfer: remove from instance, add back to root */
-	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
-		clear_bit(phys_cpu, instance->cpus);
-		set_bit(phys_cpu, root_instance->cpus);
+	ret = mk_cpu_set_reserve(root_instance->cpus, requested_count);
+	if (ret)
+		return ret;
+
+	mk_cpu_set_format(buf, sizeof(buf), cpus);
+
+	/*
+	 * @cpus may alias instance->cpus (returning everything on
+	 * teardown), so walk it back-to-front: a deletion then never
+	 * shifts entries the walk has yet to visit.
+	 */
+	for (i = requested_count; i-- > 0; ) {
+		phys_cpu = cpus->ids[i];
+		mk_cpu_set_add(root_instance->cpus, phys_cpu);
+		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
 
-	pr_info("Returned %d CPUs from instance %d (%s) to root: %*pbl\n",
-		requested_count, instance->id, instance->name,
-		NR_CPUS, cpus);
+	pr_info("Returned %u CPUs from instance %d (%s) to root: %s\n",
+		requested_count, instance->id, instance->name, buf);
 
 	return 0;
 }
@@ -1325,7 +1343,8 @@ int multikernel_force_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
 	struct mk_shutdown_payload payload;
-	int phys_cpu;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
 	int cpu_count = 0;
 	int ret;
 
@@ -1340,7 +1359,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		return -EINVAL;
 	}
 
-	if (!instance->cpus) {
+	if (mk_cpu_set_empty(instance->cpus)) {
 		pr_err("Instance %d has no CPUs assigned\n", mk_id);
 		mk_instance_put(instance);
 		return -EINVAL;
@@ -1357,7 +1376,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		pr_err("Failed to queue shutdown message: %d (sending NMI anyway)\n", ret);
 
 	/* Send NMI to each CPU in the instance */
-	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
 		mk_force_stop_cpu(phys_cpu);
 		cpu_count++;
 	}

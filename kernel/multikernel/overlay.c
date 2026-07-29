@@ -23,6 +23,30 @@
 #include <linux/multikernel.h>
 #include "internal.h"
 
+/*
+ * Parse a cpu@N node's reg property into a physical CPU ID. Accepts one
+ * 64-bit cell or, for compatibility with older overlays, one 32-bit cell.
+ */
+static int mk_overlay_parse_cpu_reg(const void *fdt, int item_node,
+				    const char *name, mk_phys_cpu_t *cpu_id)
+{
+	const void *reg;
+	int len;
+
+	reg = fdt_getprop(fdt, item_node, "reg", &len);
+	if (!reg || (len != sizeof(fdt32_t) && len != sizeof(fdt64_t))) {
+		pr_err("Invalid reg property in %s\n", name);
+		return -EINVAL;
+	}
+
+	if (len == sizeof(fdt64_t))
+		*cpu_id = fdt64_to_cpu(*(const fdt64_t *)reg);
+	else
+		*cpu_id = fdt32_to_cpu(*(const fdt32_t *)reg);
+
+	return 0;
+}
+
 /* Transaction status */
 enum mk_overlay_tx_status {
 	MK_OVERLAY_TX_PENDING = 0,
@@ -482,15 +506,13 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 			if (strncmp(name, "cpu@", 4) != 0)
 				continue;
 
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 4) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
+			mk_phys_cpu_t cpu_id;
 
-			u32 cpu_id = fdt32_to_cpu(*reg);
+			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
+			if (ret)
+				return ret;
 
-			pr_info("Overlay tx%d: -cpu %u from %s\n",
+			pr_info("Overlay tx%d: -cpu %llu from %s\n",
 				tx->id, cpu_id, remove_instance->name);
 
 			ret = mk_send_cpu_remove(remove_instance->id, cpu_id);
@@ -517,13 +539,11 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 				continue;
 
 			/* Get CPU ID: reg = <cpuid> */
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 4) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
+			mk_phys_cpu_t cpu_id;
 
-			u32 cpu_id = fdt32_to_cpu(*reg);
+			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
+			if (ret)
+				return ret;
 
 			/* Get optional numa-node */
 			u32 numa_node = 0;
@@ -537,7 +557,7 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 			if (flags_prop && len >= 4)
 				flags = fdt32_to_cpu(*flags_prop);
 
-			pr_info("Overlay tx%d: +cpu %u numa=%u -> %s\n",
+			pr_info("Overlay tx%d: +cpu %llu numa=%u -> %s\n",
 				tx->id, cpu_id, numa_node, add_instance->name);
 
 			ret = mk_send_cpu_add(add_instance->id, cpu_id, numa_node, flags);
@@ -884,15 +904,13 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			if (strncmp(name, "cpu@", 4) != 0)
 				continue;
 
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 4) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
+			mk_phys_cpu_t cpu_id;
 
-			u32 cpu_id = fdt32_to_cpu(*reg);
+			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
+			if (ret)
+				return ret;
 
-			pr_info("Rollback tx%d: -cpu %u from %s\n",
+			pr_info("Rollback tx%d: -cpu %llu from %s\n",
 				tx->id, cpu_id, add_instance->name);
 
 			/* Send remove for what was added */
@@ -923,13 +941,11 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			if (strncmp(name, "cpu@", 4) != 0)
 				continue;
 
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 4) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
+			mk_phys_cpu_t cpu_id;
 
-			u32 cpu_id = fdt32_to_cpu(*reg);
+			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
+			if (ret)
+				return ret;
 
 			/* Get optional numa-node */
 			u32 numa_node = 0;
@@ -943,7 +959,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			if (flags_prop && len >= 4)
 				flags = fdt32_to_cpu(*flags_prop);
 
-			pr_info("Rollback tx%d: +cpu %u numa=%u to %s\n",
+			pr_info("Rollback tx%d: +cpu %llu numa=%u to %s\n",
 				tx->id, cpu_id, numa_node, remove_instance->name);
 
 			/* Send add for what was removed */
