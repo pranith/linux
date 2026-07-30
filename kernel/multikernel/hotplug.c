@@ -1027,23 +1027,26 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
-		return mk_instance_return_cpus(target_instance, &cpus);
+		ret = mk_instance_return_cpus(target_instance, &cpus);
+		goto out;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, cpu_id);
-	if (!pending)
-		return -ENOMEM;
+	if (!pending) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		return ret;
+		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	/*
 	 * The spawn kernel parked the CPU on its own context when it went
@@ -1060,7 +1063,10 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
 			cpu_id);
 
-	return 0;
+	ret = 0;
+out:
+	mk_instance_put(target_instance);
+	return ret;
 }
 
 /**
@@ -1104,7 +1110,8 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
-		return mk_instance_transfer_cpus(target_instance, &cpus);
+		ret = mk_instance_transfer_cpus(target_instance, &cpus);
+		goto out;
 	}
 
 	/*
@@ -1116,13 +1123,14 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to repark CPU %llu to instance %d: %d\n",
 		       cpu_id, instance_id, ret);
-		return ret;
+		goto out;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
 	if (!pending) {
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
@@ -1130,7 +1138,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		return ret;
+		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
@@ -1142,7 +1150,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		 * watching the context and this times out harmlessly.
 		 */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		return ret;
+		goto out;
 	}
 
 	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
@@ -1150,7 +1158,10 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 			cpu_id, instance_id);
 	mk_cpu_set_del(root_instance->cpus, cpu_id);
 
-	return 0;
+	ret = 0;
+out:
+	mk_instance_put(target_instance);
+	return ret;
 }
 
 /**
@@ -1195,25 +1206,31 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		size_t size;
 
 		size = PFN_PHYS(nr_pages);
-		return mk_instance_add_memory_region(target_instance, size);
+		ret = mk_instance_add_memory_region(target_instance, size);
+		goto out;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_ADD, start_pfn);
-	if (!pending)
-		return -ENOMEM;
+	if (!pending) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_ADD,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		return ret;
+		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		return ret;
+		goto out;
 
-	return mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages));
+	ret = mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages));
+out:
+	mk_instance_put(target_instance);
+	return ret;
 }
 
 /**
@@ -1257,28 +1274,34 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 
 		phys_addr = PFN_PHYS(start_pfn);
 		size = PFN_PHYS(nr_pages);
-		return mk_instance_remove_memory_region(target_instance, phys_addr, size);
+		ret = mk_instance_remove_memory_region(target_instance, phys_addr, size);
+		goto out;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_REMOVE, start_pfn);
-	if (!pending)
-		return -ENOMEM;
+	if (!pending) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_REMOVE,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		return ret;
+		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	/* Update root kernel's view of instance memory after successful IPI */
-	return mk_instance_remove_memory_region(target_instance,
-						PFN_PHYS(start_pfn),
-						PFN_PHYS(nr_pages));
+	ret = mk_instance_remove_memory_region(target_instance,
+					       PFN_PHYS(start_pfn),
+					       PFN_PHYS(nr_pages));
+out:
+	mk_instance_put(target_instance);
+	return ret;
 }
 
 /**
@@ -1327,23 +1350,26 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		return -ENODEV;
 
 	if (target_instance->state != MK_STATE_ACTIVE) {
-		return mk_instance_add_pci_device(target_instance, domain, bus, devfn);
+		ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
+		goto out;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
-	if (!pending)
-		return -ENOMEM;
+	if (!pending) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_ADD,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);
-		return ret;
+		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
 	if (ret < 0) {
@@ -1353,7 +1379,10 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully added to instance %d\n",
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
 
-	return 0;
+	ret = 0;
+out:
+	mk_instance_put(target_instance);
+	return ret;
 }
 
 /**
@@ -1395,23 +1424,26 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 		return -ENODEV;
 
 	if (target_instance->state != MK_STATE_ACTIVE) {
-		return mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
+		ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
+		goto out;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE, resource_id);
-	if (!pending)
-		return -ENOMEM;
+	if (!pending) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);
-		return ret;
+		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 	if (ret < 0) {
@@ -1421,5 +1453,8 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully removed from instance %d\n",
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
 
-	return 0;
+	ret = 0;
+out:
+	mk_instance_put(target_instance);
+	return ret;
 }
