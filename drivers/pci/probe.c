@@ -24,9 +24,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/bitfield.h>
 #include <trace/events/pci.h>
-#ifdef CONFIG_MULTIKERNEL
 #include <linux/multikernel.h>
-#endif
 #include "pci.h"
 
 static struct resource busn_resource = {

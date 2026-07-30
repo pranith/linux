@@ -41,10 +41,22 @@ struct kimage;
 
 void kho_populate(phys_addr_t fdt_phys, u64 fdt_len, phys_addr_t scratch_phys,
 		  u64 scratch_len);
+
+#ifdef CONFIG_MULTIKERNEL
 void mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* Multikernel kexec finalization */
 int mk_kexec_finalize(struct kimage *target_image);
+#else
+static inline void mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len)
+{
+}
+
+static inline int mk_kexec_finalize(struct kimage *target_image)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 
 /* KHO FDT access */
 phys_addr_t kho_get_fdt_phys(void);

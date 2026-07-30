@@ -661,24 +661,6 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
 
 /**
- * mk_instance_put() - Decrement reference count
- * @instance: Instance to dereference
- *
- * May free the instance if reference count reaches zero.
- */
-void mk_instance_put(struct mk_instance *instance);
-
-/**
- * mk_instance_set_state() - Update instance state
- * @instance: Instance to update
- * @state: New state
- *
- * Updates the instance state and notifies sysfs.
- */
-void mk_instance_set_state(struct mk_instance *instance,
-			   enum mk_instance_state state);
-
-/**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
  *
  * Notifies the host and parks every CPU in the pool wait loop, keeping
@@ -724,9 +706,6 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align);
 void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size);
 
-void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
-void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
-
 /**
  * String conversion helpers
  */
@@ -741,14 +720,6 @@ enum mk_instance_state mk_string_to_state(const char *str);
  */
 
 /**
- * mk_instance_find() - Find instance by a multikernel instance ID
- * @mk_id: Multikernel instance ID
- *
- * Returns pointer to mk_instance if found, NULL otherwise.
- */
-struct mk_instance *mk_instance_find(int mk_id);
-
-/**
  * mk_instance_set_kexec_active() - Mark instance as active for kexec
  * @mk_id: Multikernel ID from kexec system
  *
@@ -756,12 +727,37 @@ struct mk_instance *mk_instance_find(int mk_id);
  */
 int mk_instance_set_kexec_active(int mk_id);
 
+/*
+ * The declarations below are referenced from always-built code (kexec,
+ * PCI and platform device probing, SMP setup), so they carry stubs for
+ * the CONFIG_MULTIKERNEL=n build.
+ */
+struct kimage;
+struct pci_bus;
+
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
 bool mk_has_pending_shutdown(void);
+
+/* Instance lookup and reference counting */
+struct mk_instance *mk_instance_find(int mk_id);
+void mk_instance_put(struct mk_instance *instance);
+void mk_instance_set_state(struct mk_instance *instance,
+			   enum mk_instance_state state);
+
+/* Kimage-based access to the instance memory pool */
+void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
+void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
+
+/* Device probe filtering against the instance's allowlist */
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_platform_device_allowed(const char *name, const char *hid);
+
+/* Early CPU registration from the KHO DTB (spawn kernels) */
+void mk_register_cpus_from_kho(void);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -778,6 +774,37 @@ static inline int multikernel_force_halt_by_id(int mk_id)
 static inline bool cpu_is_multikernel_pool(unsigned int cpu)
 {
 	return false;
+}
+static inline struct mk_instance *mk_instance_find(int mk_id)
+{
+	return NULL;
+}
+static inline void mk_instance_put(struct mk_instance *instance)
+{
+}
+static inline void mk_instance_set_state(struct mk_instance *instance,
+					 enum mk_instance_state state)
+{
+}
+static inline void *mk_kimage_alloc(struct kimage *image, size_t size,
+				    size_t align)
+{
+	return NULL;
+}
+static inline void mk_kimage_free(struct kimage *image, void *virt_addr,
+				  size_t size)
+{
+}
+static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
+{
+	return true;
+}
+static inline bool mk_platform_device_allowed(const char *name, const char *hid)
+{
+	return true;
+}
+static inline void mk_register_cpus_from_kho(void)
+{
 }
 #endif
 
@@ -855,14 +882,11 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
  */
 int __init mk_kho_restore_dtbs(void);
 
-/**
- * mk_register_cpus_from_kho() - Register CPUs from KHO DTB during SMP config
- *
- * Called early during SMP configuration to register CPUs from the KHO DTB.
- * This must happen before topology_init_possible_cpus() to ensure CPUs are
- * properly registered in the topology.
+/*
+ * mk_register_cpus_from_kho() registers CPUs from the KHO DTB during SMP
+ * configuration, before topology_init_possible_cpus(); it is declared
+ * above with the CONFIG_MULTIKERNEL stubs.
  */
-void __init mk_register_cpus_from_kho(void);
 
 /**
  * PCI Device Enforcement Functions
@@ -878,8 +902,9 @@ void __init mk_register_cpus_from_kho(void);
  * that are not in the whitelist, avoiding hardware conflicts on bare metal.
  *
  * Returns: true if probing should proceed, false to skip entirely
+ *
+ * Declared above with the CONFIG_MULTIKERNEL stubs.
  */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 
 /**
  * mk_platform_device_allowed() - Check if a platform device is allowed by DTB allowlist
@@ -893,8 +918,9 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
  * The check matches against either the device name or ACPI HID for portability.
  *
  * Returns: true if device is allowed, false otherwise
+ *
+ * Declared above with the CONFIG_MULTIKERNEL stubs.
  */
-bool mk_platform_device_allowed(const char *name, const char *hid);
 
 void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 			     size_t align);

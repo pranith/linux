@@ -27,6 +27,7 @@ extern pmd_t *populate_extra_pmd(unsigned long vaddr);
 /* Physical address of original boot_params (saved during boot) */
 extern unsigned long orig_boot_params;
 
+#ifdef CONFIG_MULTIKERNEL
 /*
  * Custom wakeup for multikernel spawn kernels.
  * Uses shared spawn table instead of realmode trampoline.
@@ -104,6 +105,7 @@ static void __init multikernel_parse_smp_config(void)
 	 */
 	apic_update_callback(wakeup_secondary_cpu_64, multikernel_wakeup_cpu);
 }
+#endif /* CONFIG_MULTIKERNEL */
 
 void __init x86_early_init_platform_quirks(void)
 {
@@ -156,6 +158,7 @@ void __init x86_early_init_platform_quirks(void)
 #endif
 		x86_init.resources.memory_setup = e820__memory_setup_multikernel;
 		x86_init.paging.init_direct_mapping = init_direct_mapping_sparse;
+#ifdef CONFIG_MULTIKERNEL
 #ifdef CONFIG_X86_64
 		/*
 		 * Use custom pagetable_init that ensures PGD[508] exists
@@ -163,8 +166,9 @@ void __init x86_early_init_platform_quirks(void)
 		 */
 		x86_init.paging.pagetable_init = multikernel_pagetable_init;
 #endif
-		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
+#endif
+		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
 		/*
 		 * No legacy timer setup. There is no HPET without ACPI, so
 		 * the default timer_init() would fall back to programming
