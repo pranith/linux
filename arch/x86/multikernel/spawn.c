@@ -26,6 +26,7 @@
 #include <linux/mm.h>
 #include <linux/mem_encrypt.h>
 #include <linux/io.h>
+#include <linux/kexec.h>
 #include <linux/slab.h>
 #include <linux/memblock.h>
 #include <linux/multikernel.h>
@@ -272,6 +273,150 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 	if (!ret)
 		instance->cpus_on_instance_slot = true;
 	return ret;
+}
+
+/**
+ * mk_arch_spawn_instance - Build boot state and start an instance's boot CPU
+ * @image: Loaded kimage for the instance
+ * @instance: Instance being spawned
+ * @cpu: Logical CPU, currently parked in the pool, to boot the instance on
+ *
+ * Builds or reuses the identity page tables, trampoline, park page and
+ * spawn context, stamps in the boot parameters the loader prepared, and
+ * releases the parked CPU into the trampoline. On success the spawn
+ * resources are stored in the instance so a re-spawn can reuse them; on
+ * failure any newly built resources are freed.
+ */
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
+			   int cpu)
+{
+	struct mk_ident_pgtable *ident_pgt = NULL;
+	struct mk_spawn_context *spawn_ctx = NULL;
+	phys_addr_t spawn_ctx_phys;
+	void *trampoline_va = NULL;
+	unsigned long trampoline_phys;
+	void *park_va = NULL;
+	unsigned long park_phys = 0;
+	struct boot_params *src_bp;
+	int rc;
+
+	/* Reuse spawn resources if already allocated (re-spawn case) */
+	if (instance->ident_pgt) {
+		ident_pgt = instance->ident_pgt;
+	} else {
+		ident_pgt = mk_build_identity_pgtable(instance,
+						      image->arch.mk_pool_start,
+						      image->arch.mk_pool_end);
+		if (IS_ERR(ident_pgt)) {
+			pr_err("Failed to build identity page table: %ld\n",
+			       PTR_ERR(ident_pgt));
+			rc = PTR_ERR(ident_pgt);
+			ident_pgt = NULL;
+			goto err;
+		}
+	}
+
+	if (instance->trampoline_va) {
+		trampoline_va = instance->trampoline_va;
+		trampoline_phys = virt_to_phys(trampoline_va);
+	} else {
+		trampoline_va = mk_setup_trampoline(instance, ident_pgt,
+						    &trampoline_phys);
+		if (IS_ERR(trampoline_va)) {
+			pr_err("Failed to set up trampoline: %ld\n",
+			       PTR_ERR(trampoline_va));
+			rc = PTR_ERR(trampoline_va);
+			trampoline_va = NULL;
+			goto err;
+		}
+	}
+
+	if (instance->park_va) {
+		park_va = instance->park_va;
+		park_phys = virt_to_phys(park_va);
+	} else {
+		park_va = mk_setup_park_page(instance, &park_phys);
+		if (IS_ERR(park_va)) {
+			pr_err("Failed to set up pool park page: %ld\n",
+			       PTR_ERR(park_va));
+			rc = PTR_ERR(park_va);
+			park_va = NULL;
+			goto err;
+		}
+	}
+
+	if (instance->spawn_ctx) {
+		spawn_ctx = instance->spawn_ctx;
+		spawn_ctx_phys = instance->spawn_ctx_phys;
+	} else {
+		spawn_ctx = mk_alloc_spawn_context(instance, &spawn_ctx_phys);
+		if (!spawn_ctx) {
+			pr_err("Failed to allocate spawn context\n");
+			rc = -ENOMEM;
+			goto err;
+		}
+	}
+
+	/* Copy the boot_params the loader prepared into the spawn context */
+	src_bp = memremap(image->arch.mk_boot_params,
+			  sizeof(struct boot_params), MEMREMAP_WB);
+	if (!src_bp) {
+		pr_err("Failed to map boot_params at 0x%lx\n",
+		       image->arch.mk_boot_params);
+		rc = -ENOMEM;
+		goto err;
+	}
+	memcpy(mk_spawn_context_boot_params(spawn_ctx), src_bp,
+	       sizeof(struct boot_params));
+	memunmap(src_bp);
+
+	mk_set_spawn_context(spawn_ctx,
+			     mk_get_identity_cr3(ident_pgt),
+			     image->arch.mk_kernel_entry,
+			     (unsigned long)trampoline_va,
+			     trampoline_phys,
+			     park_phys);
+
+	rc = mk_spawn_cpu(instance, cpu, spawn_ctx);
+	if (rc)
+		goto err;
+
+	instance->spawn_ctx = spawn_ctx;
+	instance->spawn_ctx_phys = spawn_ctx_phys;
+	instance->ident_pgt = ident_pgt;
+	instance->trampoline_va = trampoline_va;
+	instance->park_va = park_va;
+	return 0;
+
+err:
+	if (ident_pgt && !instance->ident_pgt)
+		mk_free_identity_pgtable(ident_pgt);
+	if (trampoline_va && !instance->trampoline_va)
+		mk_instance_free(instance, trampoline_va, PAGE_SIZE);
+	if (park_va && !instance->park_va)
+		mk_instance_free(instance, park_va, PAGE_SIZE);
+	return rc;
+}
+
+/**
+ * mk_arch_release_instance - Free an instance's spawn resources
+ * @instance: Instance being torn down
+ *
+ * Returns parked CPUs to the host slot and frees the identity page
+ * tables. The trampoline, park page and spawn context are carved from
+ * the instance's control block, which the caller returns to the pool as
+ * one allocation; only the pointers are cleared here.
+ */
+void mk_arch_release_instance(struct mk_instance *instance)
+{
+	mk_repark_instance_to_host(instance);
+
+	mk_free_identity_pgtable(instance->ident_pgt);
+	instance->ident_pgt = NULL;
+	instance->trampoline_va = NULL;
+	instance->park_va = NULL;
+	instance->spawn_ctx = NULL;
+	instance->spawn_ctx_phys = 0;
 }
 
 /**

@@ -945,6 +945,18 @@ void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
 /* Host pool park area, set up when the baseline is applied */
 int mk_setup_host_park(void);
 
+/*
+ * Build the boot state for @instance from the loaded @image and start
+ * its boot CPU (a parked pool CPU, given as a logical CPU number). On
+ * success the arch keeps its spawn resources in the instance so a
+ * re-spawn can reuse them; mk_arch_release_instance() frees them when
+ * the instance's memory is torn down.
+ */
+struct kimage;
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
+			   int cpu);
+void mk_arch_release_instance(struct mk_instance *instance);
+
 /* Return an instance's parked CPUs to the host slot before teardown */
 int mk_repark_instance_to_host(struct mk_instance *instance);
 

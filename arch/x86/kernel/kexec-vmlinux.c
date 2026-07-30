@@ -500,8 +500,8 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 		unsigned long entry_phys = kernel_load_addr + offset;
 
 		/* Store physical entry point and boot_params */
-		image->mk_kernel_entry = entry_phys;
-		image->mk_boot_params = bootparam_load_addr;
+		image->arch.mk_kernel_entry = entry_phys;
+		image->arch.mk_boot_params = bootparam_load_addr;
 
 		/*
 		 * Set pool bounds for page table isolation.
@@ -523,17 +523,17 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 					max_addr = end;
 			}
 
-			image->multikernel_pool_start = min_addr;
-			image->multikernel_pool_end = max_addr;
+			image->arch.mk_pool_start = min_addr;
+			image->arch.mk_pool_end = max_addr;
 		} else {
 			/* Fallback: use kernel image bounds only */
-			image->multikernel_pool_start = kernel_load_addr;
-			image->multikernel_pool_end = kernel_load_addr + elf_info.load_size;
+			image->arch.mk_pool_start = kernel_load_addr;
+			image->arch.mk_pool_end = kernel_load_addr + elf_info.load_size;
 		}
 
 		pr_info("Multikernel: entry=0x%lx boot_params=0x%lx pool=0x%lx-0x%lx\n",
 			entry_phys, bootparam_load_addr,
-			image->multikernel_pool_start, image->multikernel_pool_end);
+			image->arch.mk_pool_start, image->arch.mk_pool_end);
 
 		image->start = bootparam_load_addr;
 	} else {

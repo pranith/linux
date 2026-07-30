@@ -863,24 +863,15 @@ void mk_instance_free_memory(struct mk_instance *instance)
 			total_freed, instance->id, instance->name);
 
 		/*
-		 * CPUs still parked on this instance's context would be
-		 * destroyed with it; move them back to the host slot first.
-		 */
-		mk_repark_instance_to_host(instance);
-
-		/*
 		 * The spawn context, trampoline, park page and identity page
 		 * tables are all carved from the control block, so they are
 		 * returned to the pool as one allocation rather than
 		 * individually. Freeing them piecemeal would punch holes in
 		 * the block's bitmap and leave the rest of it allocated.
+		 * The arch reparks CPUs still watching this instance's
+		 * context back to the host slot before the block goes away.
 		 */
-		mk_free_identity_pgtable(instance->ident_pgt);
-		instance->ident_pgt = NULL;
-		instance->trampoline_va = NULL;
-		instance->park_va = NULL;
-		instance->spawn_ctx = NULL;
-		instance->spawn_ctx_phys = 0;
+		mk_arch_release_instance(instance);
 
 		if (instance->ctrl_va) {
 			mk_instance_free(instance, instance->ctrl_va,

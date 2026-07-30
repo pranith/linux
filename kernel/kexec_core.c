@@ -1654,6 +1654,7 @@ kset_exit:
 
 subsys_initcall(init_kexec_sysctl);
 
+#ifdef CONFIG_MULTIKERNEL
 /*
  * Find a multikernel image by ID using mk_instance lookup
  */
@@ -1679,13 +1680,6 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
-	struct mk_ident_pgtable *ident_pgt = NULL;
-	struct mk_spawn_context *spawn_ctx = NULL;
-	phys_addr_t spawn_ctx_phys;
-	void *trampoline_va = NULL;
-	unsigned long trampoline_phys;
-	void *park_va = NULL;
-	unsigned long park_phys = 0;
 	int cpu = -1;
 	int i, rc;
 
@@ -1746,84 +1740,6 @@ int multikernel_kexec_by_id(int mk_id)
 	else
 		pr_info("KHO finalized for multikernel instance\n");
 
-	/* Reuse spawn resources if already allocated (re-spawn case) */
-	if (instance->ident_pgt) {
-		ident_pgt = instance->ident_pgt;
-	} else {
-		ident_pgt = mk_build_identity_pgtable(instance,
-						      mk_image->multikernel_pool_start,
-						      mk_image->multikernel_pool_end);
-		if (IS_ERR(ident_pgt)) {
-			pr_err("Failed to build identity page table: %ld\n", PTR_ERR(ident_pgt));
-			rc = PTR_ERR(ident_pgt);
-			ident_pgt = NULL;
-			goto unlock;
-		}
-	}
-
-	if (instance->trampoline_va) {
-		trampoline_va = instance->trampoline_va;
-		trampoline_phys = virt_to_phys(trampoline_va);
-	} else {
-		trampoline_va = mk_setup_trampoline(instance, ident_pgt, &trampoline_phys);
-		if (IS_ERR(trampoline_va)) {
-			pr_err("Failed to set up trampoline: %ld\n", PTR_ERR(trampoline_va));
-			rc = PTR_ERR(trampoline_va);
-			trampoline_va = NULL;
-			goto unlock;
-		}
-	}
-
-	if (instance->park_va) {
-		park_va = instance->park_va;
-		park_phys = virt_to_phys(park_va);
-	} else {
-		park_va = mk_setup_park_page(instance, &park_phys);
-		if (IS_ERR(park_va)) {
-			pr_err("Failed to set up pool park page: %ld\n", PTR_ERR(park_va));
-			rc = PTR_ERR(park_va);
-			park_va = NULL;
-			goto unlock;
-		}
-	}
-
-	if (instance->spawn_ctx) {
-		spawn_ctx = instance->spawn_ctx;
-		spawn_ctx_phys = instance->spawn_ctx_phys;
-	} else {
-		spawn_ctx = mk_alloc_spawn_context(instance, &spawn_ctx_phys);
-		if (!spawn_ctx) {
-			pr_err("Failed to allocate spawn context\n");
-			rc = -ENOMEM;
-			goto unlock;
-		}
-	}
-
-	/* Copy boot_params into spawn context */
-	{
-		struct boot_params *src_bp;
-		struct boot_params *dst_bp;
-
-		src_bp = memremap(mk_image->mk_boot_params,
-				  sizeof(struct boot_params), MEMREMAP_WB);
-		if (!src_bp) {
-			pr_err("Failed to map boot_params at 0x%lx\n",
-			       mk_image->mk_boot_params);
-			rc = -ENOMEM;
-			goto unlock;
-		}
-		dst_bp = mk_spawn_context_boot_params(spawn_ctx);
-		memcpy(dst_bp, src_bp, sizeof(struct boot_params));
-		memunmap(src_bp);
-	}
-
-	mk_set_spawn_context(spawn_ctx,
-			     mk_get_identity_cr3(ident_pgt),
-			     mk_image->mk_kernel_entry,
-			     (unsigned long)trampoline_va,
-			     trampoline_phys,
-			     park_phys);
-
 	/*
 	 * Point at the ring this image actually carries. Every load
 	 * allocates a new one and publishes it through KHO, so the spawn
@@ -1848,27 +1764,15 @@ int multikernel_kexec_by_id(int mk_id)
 	if (instance->ipi_data)
 		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
 
-	rc = mk_spawn_cpu(instance, cpu, spawn_ctx);
+	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
 	if (rc == 0) {
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
 		if (rc)
 			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
-		instance->spawn_ctx = spawn_ctx;
-		instance->spawn_ctx_phys = spawn_ctx_phys;
-		instance->ident_pgt = ident_pgt;
-		instance->trampoline_va = trampoline_va;
-		instance->park_va = park_va;
 	}
 
 unlock:
-	if (rc) {
-		if (ident_pgt && !instance->ident_pgt)
-			mk_free_identity_pgtable(ident_pgt);
-		if (trampoline_va && !instance->trampoline_va)
-			mk_instance_free(instance, trampoline_va, PAGE_SIZE);
-		if (park_va && !instance->park_va)
-			mk_instance_free(instance, park_va, PAGE_SIZE);
-	}
 	kexec_unlock();
 	return rc;
 }
+#endif /* CONFIG_MULTIKERNEL */
