@@ -904,6 +904,9 @@ static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
 	case MK_RES_ACK:
 		if (payload_len >= sizeof(struct mk_resource_ack)) {
 			struct mk_resource_ack *ack = (struct mk_resource_ack *)payload;
+
+			pr_info("Multikernel hotplug: ACK op=0x%x resource=%llu result=%d\n",
+				ack->operation, ack->resource_id, (int)ack->result);
 			mk_msg_pending_complete(MK_MSG_RESOURCE, ack->operation,
 						ack->resource_id, ack->result);
 		} else {
@@ -1070,8 +1073,11 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		return mk_do_cpu_add(cpu_id, numa_node, flags);
 
 	target_instance = mk_instance_find(instance_id);
-	if (!target_instance)
+	if (!target_instance) {
+		pr_err("Multikernel hotplug: instance %d not found for CPU add\n",
+		       instance_id);
 		return -ENODEV;
+	}
 
 	/* For non-running instances, transfer CPU from root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {

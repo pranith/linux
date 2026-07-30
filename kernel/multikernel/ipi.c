@@ -109,7 +109,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 	target = mk_cpu_set_first(instance->cpus);
 	if (target == MK_PHYS_CPU_INVALID) {
-		pr_debug("Instance %d has no CPUs to receive the IPI\n", instance_id);
+		pr_err("Instance %d has no CPUs to receive the IPI\n", instance_id);
 		mk_instance_put(instance);
 		return -ENODEV;
 	}
@@ -128,7 +128,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	}
 
 	if (!instance->ipi_data) {
-		pr_debug("Multikernel IPI buffer not available for instance %d\n", instance_id);
+		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
 		mk_instance_put(instance);
 		return -ENODEV;
 	}
