@@ -18,7 +18,6 @@
 #include <linux/string.h>
 #include <linux/ioport.h>
 #include <linux/sizes.h>
-#include <asm/smp.h>
 #include <linux/cpumask.h>
 #include <linux/multikernel.h>
 

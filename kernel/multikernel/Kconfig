@@ -3,8 +3,12 @@
 # Multikernel configuration
 #
 
+config ARCH_SUPPORTS_MULTIKERNEL
+	bool
+
 config MULTIKERNEL
 	bool "Multikernel support"
+	depends on ARCH_SUPPORTS_MULTIKERNEL
 	depends on KEXEC_CORE
 	depends on KEXEC_HANDOVER
 	select LIBFDT

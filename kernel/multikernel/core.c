@@ -13,12 +13,6 @@
 #include <linux/multikernel.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
-#include <asm/multikernel.h>
-#include <asm/cpu.h>
-#include <asm/irq_vectors.h>
-#include <asm/page.h>
-#include <asm/processor.h>
-#include <asm/smp.h>
 #include "internal.h"
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)

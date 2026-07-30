@@ -19,7 +19,6 @@
 #include <linux/kexec_handover.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
-#include <asm/apic.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
@@ -286,7 +285,7 @@ void __init mk_register_cpus_from_kho(void)
 	for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
 		mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
-		topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
+		mk_arch_register_cpu(phys_id);
 		pr_debug("Registered CPU physical ID %llu from KHO DTB\n", phys_id);
 	}
 
@@ -303,7 +302,7 @@ void __init mk_register_cpus_from_kho(void)
 		for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
 			mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
-			topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
+			mk_arch_register_cpu(phys_id);
 			pr_debug("Registered pool CPU physical ID %llu from KHO\n",
 				 phys_id);
 		}

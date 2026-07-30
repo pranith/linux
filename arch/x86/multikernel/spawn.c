@@ -33,6 +33,7 @@
 #include <linux/set_memory.h>
 #include <linux/sched.h>
 
+#include <asm/apic.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable_types.h>
@@ -352,6 +353,20 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 
 	instance->cpus_on_instance_slot = false;
 	return failed ? -ETIMEDOUT : 0;
+}
+
+/**
+ * mk_arch_register_cpu - Enumerate a pool CPU in this kernel's topology
+ * @phys_id: Physical (APIC) ID of the CPU
+ *
+ * Called during early SMP configuration for every CPU this kernel may
+ * ever own, including pool CPUs it does not own yet: the topology code
+ * rejects APIC IDs it did not see during enumeration, so a CPU that is
+ * not registered here can never be hot-added later.
+ */
+void __init mk_arch_register_cpu(u64 phys_id)
+{
+	topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
 }
 
 /*

@@ -23,7 +23,6 @@
 #include <linux/mmzone.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
-#include <asm/apic.h>
 #include "internal.h"
 
 static const char mk_mem_resource_name[] = "System RAM (multikernel)";

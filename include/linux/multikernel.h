@@ -896,80 +896,60 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
  */
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
+void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
+			     size_t align);
+
 /**
- * Direct 64-bit Spawn Functions
+ * Architecture interface
  *
- * These functions implement the direct 64-bit to 64-bit spawn mechanism.
- * Pool CPUs wait in multikernel_play_dead() with APIC enabled, and can be
- * triggered to execute the spawn trampoline via IPI.
+ * Everything below is implemented per architecture. An architecture that
+ * selects ARCH_SUPPORTS_MULTIKERNEL must provide these functions, plus,
+ * through <asm/multikernel.h>:
  *
- * The spawn context combines boot_params with spawn-specific fields,
- * allocated once per instance and reused for secondary CPU bringup.
+ *  - arch_cpu_physical_id() / arch_cpu_from_physical_id(): translate
+ *    between logical CPU numbers and the physical CPU IDs (APIC ID,
+ *    MPIDR, hartid) that name CPUs across kernel instances.
+ *  - MK_CTRL_BLOCK_SIZE: size of the per-instance control block that
+ *    holds the arch's boot structures (spawn context, trampolines, page
+ *    tables), carved from instance memory and reserved from the spawn
+ *    kernel's allocator.
+ *  - The spawn mechanics themselves (context setup, trampolines, CPU
+ *    wakeup), which generic code currently drives from the kexec path;
+ *    their declarations live in the arch header until that path is
+ *    extracted behind a single arch hook.
  */
+#ifdef CONFIG_MULTIKERNEL
+#include <asm/multikernel.h>
+#endif
 
-struct mk_spawn_context;
-struct mk_ident_pgtable;
+/* Doorbell for the message ring: IPI a CPU owned by another kernel */
+void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu);
 
-/* Allocate spawn context (includes boot_params) */
-struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
-						phys_addr_t *phys_out);
-struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
+/* Enumerate a pool CPU in this kernel's topology during early boot */
+void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
 
-/* Set up spawn context for kernel boot */
-void mk_set_spawn_context(struct mk_spawn_context *ctx,
-			  unsigned long identity_cr3,
-			  unsigned long kernel_entry,
-			  unsigned long trampoline_virt,
-			  unsigned long trampoline_phys,
-			  unsigned long park_phys);
+/* Mark/query a CPU as parked in the multikernel pool */
+void mk_set_pool_cpu(int cpu, bool is_pool);
 
-/* Trigger spawn on a pool CPU */
-int mk_spawn_cpu(struct mk_instance *instance, int cpu,
-		 struct mk_spawn_context *ctx);
+/* Park the calling CPU in the pool wait loop; never returns */
+void __noreturn mk_enter_pool_state(void *info);
+
+/*
+ * Forcible stop of another instance's CPUs (NMI on x86). Registration
+ * may fail where the architecture has nothing suitable; graceful
+ * shutdown must keep working without it.
+ */
+int mk_register_stop_nmi_handler(void);
+void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
 
 /* Host pool park area, set up when the baseline is applied */
 int mk_setup_host_park(void);
 
-
-/*
- * Control block: spawn context, trampoline page, park page and identity
- * page tables, plus slack for alignment. Sized once so the whole thing is
- * one contiguous range the spawn kernel can reserve with a single call.
- */
-#define MK_CTRL_PGTABLE_PAGES	64
-#define MK_CTRL_BLOCK_SIZE	(SZ_16K + (3 + MK_CTRL_PGTABLE_PAGES) * PAGE_SIZE)
-
-void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
-			     size_t align);
-
 /* Return an instance's parked CPUs to the host slot before teardown */
 int mk_repark_instance_to_host(struct mk_instance *instance);
 
-/* Move one parked CPU between the host slot and a live instance's context */
+/* Move one parked CPU between the host pool and a live instance */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-
-/* Initialize boot context tracking in spawn kernel */
-void mk_init_boot_context(phys_addr_t ctx_phys);
-
-/* Identity page table and trampoline setup */
-struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
-						    unsigned long start,
-						    unsigned long end);
-void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
-unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
-void *mk_setup_trampoline(struct mk_instance *instance,
-			  struct mk_ident_pgtable *pgt,
-			  unsigned long *phys_out);
-void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out);
-
-/* Secondary CPU wakeup for spawn kernels (reuses boot context) */
-int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
-					unsigned int cpu);
-
-/* Restore AP to spawn context (used by hibernation/switch) */
-int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
-			   unsigned long gs_base, unsigned long stack,
-			   unsigned long entry);
 
 #endif /* _LINUX_MULTIKERNEL_H */

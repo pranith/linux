@@ -318,6 +318,20 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
 	generic_multikernel_interrupt();
 }
 
+/**
+ * mk_arch_send_ipi - Ring the multikernel doorbell on another kernel's CPU
+ * @phys_cpu: Physical (APIC) ID of the target CPU
+ *
+ * The target belongs to a different kernel instance, so the IPI goes to
+ * the physical APIC ID directly; logical CPU numbers only have meaning
+ * within one kernel.
+ */
+void mk_arch_send_ipi(u64 phys_cpu)
+{
+	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
+		       (u32)phys_cpu);
+}
+
 /*
  * Enter pool state: mask all local APIC LVT entries to prevent timer,
  * thermal, performance counter, and other local interrupts from firing

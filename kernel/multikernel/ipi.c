@@ -12,7 +12,6 @@
 #include <linux/kexec.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
-#include <asm/apic.h>
 #include "internal.h"
 
 /* Callback management */
@@ -167,9 +166,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	 */
 	smp_store_release(&slot->data_size, data_size);
 
-	/* The target's physical CPU ID is its APIC ID, use it directly */
-	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
-		       (u32)target);
+	mk_arch_send_ipi(target);
 
 	mk_instance_put(instance);
 	return 0;

@@ -101,23 +101,6 @@ static inline void arch_send_call_function_ipi_mask(const struct cpumask *mask)
 	smp_ops.send_call_func_ipi(mask);
 }
 
-/* Physical CPU IDs (APIC IDs) are u64 to match the multikernel core */
-static inline u64 arch_cpu_physical_id(int cpu)
-{
-	return smp_ops.cpu_physical_id(cpu);
-}
-
-static inline int arch_cpu_from_physical_id(u64 phys_id)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu) {
-		if (arch_cpu_physical_id(cpu) == phys_id)
-			return cpu;
-	}
-	return -1;
-}
-
 void cpu_disable_common(void);
 void native_smp_prepare_boot_cpu(void);
 void smp_prepare_cpus_common(void);
@@ -137,14 +120,6 @@ void wbnoinvd_on_cpus_mask(struct cpumask *cpus);
 
 void smp_kick_mwait_play_dead(void);
 void __noreturn mwait_play_dead(unsigned int eax_hint);
-
-#ifdef CONFIG_MULTIKERNEL
-void mk_set_pool_cpu(int cpu, bool is_pool);
-void __noreturn multikernel_play_dead(void);
-int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
-			   unsigned long gs_base, unsigned long stack,
-			   unsigned long entry);
-#endif
 
 void native_smp_send_reschedule(int cpu);
 void native_send_call_func_ipi(const struct cpumask *mask);

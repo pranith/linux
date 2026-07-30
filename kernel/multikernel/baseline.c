@@ -17,7 +17,6 @@
 #include <linux/multikernel.h>
 #include <linux/ioport.h>
 #include <linux/pci.h>
-#include <asm/smp.h>
 
 #include "internal.h"
 
