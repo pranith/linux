@@ -274,6 +274,69 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 }
 
 /**
+ * mk_repark_cpu_to_instance - Point one parked pool CPU at an instance
+ * @instance: Running instance the CPU is being hot-added to
+ * @phys_cpu: Physical (APIC) ID of the parked CPU
+ *
+ * A hot-added CPU is parked on the host slot, but the spawn kernel wakes
+ * secondaries by publishing into its own context, so the CPU must watch
+ * that context before the spawn's bringup can reach it. First spawn moves
+ * the initial CPUs in bulk (mk_repark_to_instance); this is the per-CPU
+ * variant for hotplug on a live instance.
+ */
+int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+{
+	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	struct mk_spawn_context *slot = mk_host_park.slot;
+
+	if (!ctx || !slot || !instance->park_va)
+		return -ENODEV;
+
+	slot->park_phys = virt_to_phys(instance->park_va);
+	slot->park_cr3 = mk_host_park.cr3;
+	slot->self_phys = instance->spawn_ctx_phys;
+	slot->flags = MK_SPAWN_F_REPARK;
+	return mk_slot_wake(slot, (u32)phys_cpu, "repark hot-added cpu");
+}
+
+/**
+ * mk_repark_cpu_to_host - Return one parked CPU to the host slot
+ * @instance: Instance the CPU was removed from
+ * @phys_cpu: Physical (APIC) ID of the parked CPU
+ *
+ * After the spawn kernel offlines a CPU it parks on the instance's
+ * context. Move it back to the host slot so it can be spawned or
+ * hot-added elsewhere. Counterpart of mk_repark_cpu_to_instance().
+ */
+int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+{
+	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	int ret;
+
+	if (!ctx || !mk_host_park.slot || !instance->park_va)
+		return -ENODEV;
+
+	ctx->park_phys = mk_host_park.park_phys;
+	ctx->park_cr3 = mk_host_park.cr3;
+	ctx->self_phys = mk_host_park.slot_phys;
+	ctx->flags = MK_SPAWN_F_REPARK;
+	ret = mk_slot_wake(ctx, (u32)phys_cpu, "repark removed cpu to host");
+
+	/*
+	 * The context doubles as the instance's park anchor: the spawn
+	 * kernel reads park_phys/park_cr3/self_phys whenever it parks a
+	 * CPU on halt or offline. Restore them once the reparked CPU has
+	 * staged its copy, or the next halt parks every CPU on the host's
+	 * page, which is outside the instance's memory map.
+	 */
+	ctx->park_phys = virt_to_phys(instance->park_va);
+	ctx->park_cr3 = mk_host_park.cr3;
+	ctx->self_phys = instance->spawn_ctx_phys;
+	ctx->flags = 0;
+	return ret;
+}
+
+/**
  * mk_repark_instance_to_host - Return an instance's CPUs to the host slot
  * @instance: Instance being torn down
  *

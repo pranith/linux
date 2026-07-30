@@ -108,8 +108,19 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
-		pr_err("Multikernel hotplug: CPU %llu not found in present CPUs\n", cpu_id);
-		return -ENODEV;
+		/*
+		 * Not present: this pool CPU has never run here (or was
+		 * removed earlier). It was enumerated at boot from the KHO
+		 * pool-cpus list, so it has a logical slot in the possible
+		 * map; mark it present again before onlining.
+		 */
+		logical_cpu = arch_cpu_from_physical_id(cpu_id);
+		if (logical_cpu < 0) {
+			pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
+			       cpu_id);
+			return -ENODEV;
+		}
+		set_cpu_present(logical_cpu, true);
 	}
 
 	if (cpu_online(logical_cpu)) {
@@ -1034,6 +1045,16 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (ret < 0)
 		return ret;
 
+	/*
+	 * The spawn kernel parked the CPU on its own context when it went
+	 * offline. Bring it back to the host slot so it can be spawned or
+	 * hot-added elsewhere.
+	 */
+	ret = mk_repark_cpu_to_host(target_instance, cpu_id);
+	if (ret < 0)
+		pr_warn("Multikernel hotplug: CPU %llu removed but not reparked to host: %d\n",
+			cpu_id, ret);
+
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
 	if (mk_cpu_set_add(root_instance->cpus, cpu_id))
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
@@ -1086,20 +1107,43 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		return mk_instance_transfer_cpus(target_instance, &cpus);
 	}
 
+	/*
+	 * The CPU is parked on the host slot, where the spawn kernel's
+	 * secondary wakeup cannot reach it. Point it at the instance's
+	 * context before asking the instance to online it.
+	 */
+	ret = mk_repark_cpu_to_instance(target_instance, cpu_id);
+	if (ret < 0) {
+		pr_err("Multikernel hotplug: Failed to repark CPU %llu to instance %d: %d\n",
+		       cpu_id, instance_id, ret);
+		return ret;
+	}
+
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
-	if (!pending)
+	if (!pending) {
+		mk_repark_cpu_to_host(target_instance, cpu_id);
 		return -ENOMEM;
+	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
+		mk_repark_cpu_to_host(target_instance, cpu_id);
 		return ret;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
+	if (ret < 0) {
+		/*
+		 * Best effort: if the instance never picked the CPU up, it
+		 * is still parked on the instance context and comes home;
+		 * if the instance onlined it despite the error, nothing is
+		 * watching the context and this times out harmlessly.
+		 */
+		mk_repark_cpu_to_host(target_instance, cpu_id);
 		return ret;
+	}
 
 	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",

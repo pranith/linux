@@ -40,6 +40,67 @@
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
 
+/*
+ * Collect every pool CPU the instance might receive through hotplug
+ * later: the unallocated pool plus other instances' CPUs, minus the
+ * instance's own (those are already in its DTB). The spawn kernel can
+ * only online a CPU whose physical ID it enumerated at boot, so the
+ * whole pool must be in its topology from the start.
+ */
+static int mk_kho_add_pool_cpus(void *fdt, struct mk_instance *target)
+{
+	struct mk_cpu_set *pool;
+	struct mk_instance *other;
+	mk_phys_cpu_t id;
+	fdt64_t *cells;
+	unsigned int i, count;
+	int ret = 0;
+
+	pool = mk_cpu_set_alloc();
+	if (!pool)
+		return -ENOMEM;
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(other, &mk_instance_list, list) {
+		if (other == target)
+			continue;
+		mk_cpu_set_for_each(i, id, other->cpus) {
+			ret = mk_cpu_set_add(pool, id);
+			if (ret)
+				break;
+		}
+		if (ret)
+			break;
+	}
+	if (!ret && root_instance != target) {
+		mk_cpu_set_for_each(i, id, root_instance->cpus) {
+			ret = mk_cpu_set_add(pool, id);
+			if (ret)
+				break;
+		}
+	}
+	mutex_unlock(&mk_instance_mutex);
+
+	count = mk_cpu_set_count(pool);
+	if (ret || count == 0)
+		goto out;
+
+	cells = kmalloc_array(count, sizeof(*cells), GFP_KERNEL);
+	if (!cells) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	mk_cpu_set_for_each(i, id, pool)
+		cells[i] = cpu_to_fdt64(id);
+
+	ret = fdt_property(fdt, "pool-cpus", cells, count * sizeof(*cells));
+	kfree(cells);
+out:
+	mk_cpu_set_free(pool);
+	return ret;
+}
+
 /**
  * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
@@ -80,6 +141,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 
 	ret |= fdt_begin_node(fdt, "multikernel");
 	ret |= fdt_property(fdt, "dtb-data", instance->dtb_data, instance->dtb_size);
+	ret |= mk_kho_add_pool_cpus(fdt, instance);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
@@ -226,6 +288,25 @@ void __init mk_register_cpus_from_kho(void)
 
 		topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
 		pr_debug("Registered CPU physical ID %llu from KHO DTB\n", phys_id);
+	}
+
+	/*
+	 * Register the rest of the pool so those CPUs can be hot-added
+	 * later: the topology rejects post-boot APIC IDs it did not see
+	 * during enumeration. They are registered present and pruned from
+	 * the present mask in mk_kho_restore_cpus(), which keeps a logical
+	 * CPU assigned to each and avoids the hot-pluggable-APIC checks.
+	 */
+	cpus_prop = fdt_getprop(kho_fdt, mk_node, "pool-cpus", &cpus_len);
+	if (cpus_prop && cpus_len >= sizeof(fdt64_t) &&
+	    cpus_len % sizeof(fdt64_t) == 0) {
+		for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
+			mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
+
+			topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
+			pr_debug("Registered pool CPU physical ID %llu from KHO\n",
+				 phys_id);
+		}
 	}
 
 out:

@@ -945,6 +945,10 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 /* Return an instance's parked CPUs to the host slot before teardown */
 int mk_repark_instance_to_host(struct mk_instance *instance);
 
+/* Move one parked CPU between the host slot and a live instance's context */
+int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
 /* Initialize boot context tracking in spawn kernel */
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
