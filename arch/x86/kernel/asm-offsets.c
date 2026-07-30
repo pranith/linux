@@ -58,6 +58,9 @@ static void __used common(void)
 	OFFSET(MK_CTX_spawn_cr3, mk_spawn_context, spawn_cr3);
 	OFFSET(MK_CTX_park_phys, mk_spawn_context, park_phys);
 	OFFSET(MK_CTX_park_cr3, mk_spawn_context, park_cr3);
+	OFFSET(MK_CTX_repark_park_phys, mk_spawn_context, repark_park_phys);
+	OFFSET(MK_CTX_repark_park_cr3, mk_spawn_context, repark_park_cr3);
+	OFFSET(MK_CTX_repark_slot_phys, mk_spawn_context, repark_slot_phys);
 	OFFSET(MK_CTX_target_apic_id, mk_spawn_context, target_apic_id);
 	OFFSET(MK_CTX_flags, mk_spawn_context, flags);
 	OFFSET(MK_CTX_ready, mk_spawn_context, ready);

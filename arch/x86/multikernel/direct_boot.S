@@ -390,10 +390,14 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	 * Move to another park slot: reload the watch address, page table
 	 * and park page from the publication and start over. Our APIC ID
 	 * and MWAIT capability stay in R13/R15; interrupts stay off.
+	 *
+	 * The repark_* dispatch fields are separate from the park_phys/
+	 * park_cr3/self_phys anchor so that publishing a repark on a live
+	 * instance context never corrupts the context's own park identity.
 	 */
-	movq	MK_CTX_park_cr3(%r12), %r14
-	movq	MK_CTX_park_phys(%r12), %rcx
-	movq	MK_CTX_self_phys(%r12), %r10
+	movq	MK_CTX_repark_park_cr3(%r12), %r14
+	movq	MK_CTX_repark_park_phys(%r12), %rcx
+	movq	MK_CTX_repark_slot_phys(%r12), %r10
 	movl	$1, %eax
 	xorl	%ebp, %ebp
 	lock cmpxchgl %ebp, MK_CTX_ready(%r12)

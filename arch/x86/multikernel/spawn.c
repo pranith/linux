@@ -223,9 +223,9 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		if ((u32)phys_cpu == boot_apic_id)
 			continue;
 
-		slot->park_phys = ctx->park_phys;
-		slot->park_cr3 = ctx->park_cr3;
-		slot->self_phys = virt_to_phys(ctx);
+		slot->repark_park_phys = ctx->park_phys;
+		slot->repark_park_cr3 = ctx->park_cr3;
+		slot->repark_slot_phys = virt_to_phys(ctx);
 		slot->flags = MK_SPAWN_F_REPARK;
 		ret = mk_slot_wake(slot, (u32)phys_cpu, "repark to instance");
 		if (ret)
@@ -289,12 +289,12 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	struct mk_spawn_context *ctx = instance->spawn_ctx;
 	struct mk_spawn_context *slot = mk_host_park.slot;
 
-	if (!ctx || !slot || !instance->park_va)
+	if (!ctx || !slot || !ctx->park_phys)
 		return -ENODEV;
 
-	slot->park_phys = virt_to_phys(instance->park_va);
-	slot->park_cr3 = mk_host_park.cr3;
-	slot->self_phys = instance->spawn_ctx_phys;
+	slot->repark_park_phys = ctx->park_phys;
+	slot->repark_park_cr3 = ctx->park_cr3;
+	slot->repark_slot_phys = instance->spawn_ctx_phys;
 	slot->flags = MK_SPAWN_F_REPARK;
 	return mk_slot_wake(slot, (u32)phys_cpu, "repark hot-added cpu");
 }
@@ -311,29 +311,15 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	struct mk_spawn_context *ctx = instance->spawn_ctx;
-	int ret;
 
-	if (!ctx || !mk_host_park.slot || !instance->park_va)
+	if (!ctx || !mk_host_park.slot)
 		return -ENODEV;
 
-	ctx->park_phys = mk_host_park.park_phys;
-	ctx->park_cr3 = mk_host_park.cr3;
-	ctx->self_phys = mk_host_park.slot_phys;
+	ctx->repark_park_phys = mk_host_park.park_phys;
+	ctx->repark_park_cr3 = mk_host_park.cr3;
+	ctx->repark_slot_phys = mk_host_park.slot_phys;
 	ctx->flags = MK_SPAWN_F_REPARK;
-	ret = mk_slot_wake(ctx, (u32)phys_cpu, "repark removed cpu to host");
-
-	/*
-	 * The context doubles as the instance's park anchor: the spawn
-	 * kernel reads park_phys/park_cr3/self_phys whenever it parks a
-	 * CPU on halt or offline. Restore them once the reparked CPU has
-	 * staged its copy, or the next halt parks every CPU on the host's
-	 * page, which is outside the instance's memory map.
-	 */
-	ctx->park_phys = virt_to_phys(instance->park_va);
-	ctx->park_cr3 = mk_host_park.cr3;
-	ctx->self_phys = instance->spawn_ctx_phys;
-	ctx->flags = 0;
-	return ret;
+	return mk_slot_wake(ctx, (u32)phys_cpu, "repark removed cpu to host");
 }
 
 /**
@@ -355,9 +341,9 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 		return 0;
 
 	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
-		ctx->park_phys = mk_host_park.park_phys;
-		ctx->park_cr3 = mk_host_park.cr3;
-		ctx->self_phys = mk_host_park.slot_phys;
+		ctx->repark_park_phys = mk_host_park.park_phys;
+		ctx->repark_park_cr3 = mk_host_park.cr3;
+		ctx->repark_slot_phys = mk_host_park.slot_phys;
 		ctx->flags = MK_SPAWN_F_REPARK;
 		ret = mk_slot_wake(ctx, (u32)phys_cpu, "repark to host");
 		if (ret)

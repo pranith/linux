@@ -27,6 +27,21 @@
  * The field offsets are a cross-kernel ABI: the pool park code reads them
  * from a page written by the host while running on CPUs parked by (possibly
  * differently built) spawn kernels.
+ *
+ * The fields fall into two classes that must not be mixed up:
+ *
+ *  - Anchor fields (self_phys, park_phys, park_cr3, ctrl_phys,
+ *    ctrl_size): the context's own identity, written once when the
+ *    context is set up. The spawn kernel reads them whenever it parks a
+ *    CPU on halt or offline, so they must stay valid for the context's
+ *    whole lifetime.
+ *
+ *  - Dispatch fields (everything else): the wake mailbox, rewritten for
+ *    every publication and staged into registers by the CPU that claims
+ *    it. Reparking gets its own repark_* dispatch fields precisely so a
+ *    repark publication never overwrites the anchor: the two used to
+ *    share fields, and a repark left the anchor pointing at another
+ *    kernel's park area, which triple-faulted the next halt.
  */
 struct mk_spawn_context {
 	/* Fixed-size fields first - offsets are same regardless of kernel config */
@@ -41,6 +56,9 @@ struct mk_spawn_context {
 	unsigned long spawn_cr3;	/* Spawn kernel's CR3 (for secondary CPU final switch) */
 	unsigned long park_phys;	/* Pool park code page (host owned, never reloaded) */
 	unsigned long park_cr3;		/* Page table parked CPUs run on (host owned) */
+	unsigned long repark_park_phys;	/* REPARK dispatch: park page to move to */
+	unsigned long repark_park_cr3;	/* REPARK dispatch: page table for it */
+	unsigned long repark_slot_phys;	/* REPARK dispatch: slot to watch there */
 	unsigned long ctrl_phys;	/* Host control area: this context, trampoline, */
 	unsigned long ctrl_size;	/* park page, page tables. Spawn must not reuse it */
 	u32 target_apic_id;		/* Target CPU's APIC ID */
