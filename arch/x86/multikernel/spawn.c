@@ -213,16 +213,37 @@ static int mk_slot_wake(struct mk_spawn_context *slot, u32 apic_id,
  * at the instance's own context, so the spawn kernel can wake them by
  * writing memory inside its own partition.
  */
+/* The instance's set of CPUs parked on its own context, allocated on demand */
+static struct mk_cpu_set *mk_slot_set(struct mk_instance *instance)
+{
+	if (!instance->cpus_on_slot)
+		instance->cpus_on_slot = mk_cpu_set_alloc();
+
+	return instance->cpus_on_slot;
+}
+
 static int mk_repark_to_instance(struct mk_instance *instance,
 				 struct mk_spawn_context *ctx, u32 boot_apic_id)
 {
 	struct mk_spawn_context *slot = mk_host_park.slot;
+	struct mk_cpu_set *on_slot = mk_slot_set(instance);
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret;
 
+	if (!on_slot)
+		return -ENOMEM;
+
 	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
 		if ((u32)phys_cpu == boot_apic_id)
+			continue;
+
+		/*
+		 * Skip CPUs already watching this context; the rest are on
+		 * the host slot, either because the instance has never run
+		 * or because they were assigned to it while it was stopped.
+		 */
+		if (mk_cpu_set_contains(on_slot, phys_cpu))
 			continue;
 
 		slot->repark_park_phys = ctx->park_phys;
@@ -230,6 +251,10 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		slot->repark_slot_phys = virt_to_phys(ctx);
 		slot->flags = MK_SPAWN_F_REPARK;
 		ret = mk_slot_wake(slot, (u32)phys_cpu, "repark to instance");
+		if (ret)
+			return ret;
+
+		ret = mk_cpu_set_add(on_slot, phys_cpu);
 		if (ret)
 			return ret;
 	}
@@ -249,20 +274,22 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		return -ENODEV;
 	}
 
-	if (instance->cpus_on_instance_slot) {
-		/* Re-spawn: the CPUs already watch the instance context */
-		ctx->flags = 0;
-		return mk_slot_wake(ctx, apic_id, "re-spawn boot cpu");
-	}
-
 	/*
-	 * First spawn: the instance's CPUs still watch the host slot.
-	 * Re-park the secondaries onto the instance context first, then
-	 * boot the target CPU through the host slot.
+	 * Move every secondary still parked on the host slot onto the
+	 * instance context, where this instance's kernel wakes them. A
+	 * re-spawn can need this too: CPUs assigned while the instance was
+	 * stopped are on the host slot even though the ones it already ran
+	 * on are not.
 	 */
 	ret = mk_repark_to_instance(instance, ctx, apic_id);
 	if (ret)
 		return ret;
+
+	if (mk_cpu_set_contains(instance->cpus_on_slot, apic_id)) {
+		/* The boot CPU parked on this context when the instance halted */
+		ctx->flags = 0;
+		return mk_slot_wake(ctx, apic_id, "re-spawn boot cpu");
+	}
 
 	slot->identity_cr3 = ctx->identity_cr3;
 	slot->kernel_entry = ctx->kernel_entry;
@@ -270,8 +297,13 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 	slot->self_phys = virt_to_phys(ctx);
 	slot->flags = 0;
 	ret = mk_slot_wake(slot, apic_id, "first spawn boot cpu");
-	if (!ret)
-		instance->cpus_on_instance_slot = true;
+	if (!ret) {
+		/*
+		 * It is running the instance's kernel now, and will park on
+		 * that kernel's context when the instance halts.
+		 */
+		ret = mk_cpu_set_add(instance->cpus_on_slot, apic_id);
+	}
 	return ret;
 }
 
@@ -410,6 +442,8 @@ err:
 void mk_arch_release_instance(struct mk_instance *instance)
 {
 	mk_repark_instance_to_host(instance);
+	mk_cpu_set_free(instance->cpus_on_slot);
+	instance->cpus_on_slot = NULL;
 
 	mk_free_identity_pgtable(instance->ident_pgt);
 	instance->ident_pgt = NULL;
@@ -434,15 +468,23 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 {
 	struct mk_spawn_context *ctx = instance->spawn_ctx;
 	struct mk_spawn_context *slot = mk_host_park.slot;
+	struct mk_cpu_set *on_slot = mk_slot_set(instance);
+	int ret;
 
-	if (!ctx || !slot || !ctx->park_phys)
+	if (!ctx || !slot || !ctx->park_phys || !on_slot)
 		return -ENODEV;
+
+	if (mk_cpu_set_contains(on_slot, phys_cpu))
+		return 0;
 
 	slot->repark_park_phys = ctx->park_phys;
 	slot->repark_park_cr3 = ctx->park_cr3;
 	slot->repark_slot_phys = instance->spawn_ctx_phys;
 	slot->flags = MK_SPAWN_F_REPARK;
-	return mk_slot_wake(slot, (u32)phys_cpu, "repark hot-added cpu");
+	ret = mk_slot_wake(slot, (u32)phys_cpu, "repark hot-added cpu");
+	if (!ret)
+		ret = mk_cpu_set_add(on_slot, phys_cpu);
+	return ret;
 }
 
 /**
@@ -457,15 +499,23 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	int ret;
 
 	if (!ctx || !mk_host_park.slot)
 		return -ENODEV;
+
+	/* Already on the host slot: nothing watches this context for it */
+	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
+		return 0;
 
 	ctx->repark_park_phys = mk_host_park.park_phys;
 	ctx->repark_park_cr3 = mk_host_park.cr3;
 	ctx->repark_slot_phys = mk_host_park.slot_phys;
 	ctx->flags = MK_SPAWN_F_REPARK;
-	return mk_slot_wake(ctx, (u32)phys_cpu, "repark removed cpu to host");
+	ret = mk_slot_wake(ctx, (u32)phys_cpu, "repark removed cpu to host");
+	if (!ret)
+		mk_cpu_set_del(instance->cpus_on_slot, phys_cpu);
+	return ret;
 }
 
 /**
@@ -483,10 +533,15 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 	unsigned int i;
 	int ret, failed = 0;
 
-	if (!instance->cpus_on_instance_slot || !ctx || !mk_host_park.slot)
+	if (mk_cpu_set_empty(instance->cpus_on_slot) || !ctx ||
+	    !mk_host_park.slot)
 		return 0;
 
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+	/*
+	 * Only the CPUs actually watching this context: waking one that is
+	 * already on the host slot would just time out, a second per CPU.
+	 */
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
 		ctx->repark_park_phys = mk_host_park.park_phys;
 		ctx->repark_park_cr3 = mk_host_park.cr3;
 		ctx->repark_slot_phys = mk_host_park.slot_phys;
@@ -496,7 +551,7 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 			failed++;
 	}
 
-	instance->cpus_on_instance_slot = false;
+	mk_cpu_set_clear(instance->cpus_on_slot);
 	return failed ? -ETIMEDOUT : 0;
 }
 

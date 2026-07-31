@@ -523,7 +523,14 @@ struct mk_instance {
 	phys_addr_t ctrl_phys;
 	size_t ctrl_used;
 
-	bool cpus_on_instance_slot;	/* CPUs watch the instance context, not the host slot */
+	/*
+	 * CPUs currently parked on this instance's context rather than the
+	 * host pool slot. Membership is per CPU because it changes one CPU
+	 * at a time: hotplug moves CPUs in and out while the instance runs,
+	 * and a stopped instance can gain CPUs that are still parked on the
+	 * host slot while the ones it already ran on watch its context.
+	 */
+	struct mk_cpu_set *cpus_on_slot;
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */

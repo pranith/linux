@@ -1026,6 +1026,17 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
+		/*
+		 * A CPU the instance has already run on is parked on that
+		 * instance's context. Bring it back to the host slot before
+		 * handing it to the pool, or a later spawn would try to wake
+		 * it through a context it no longer watches. No-op for a CPU
+		 * that never left the host slot.
+		 */
+		if (mk_repark_cpu_to_host(target_instance, cpu_id) < 0)
+			pr_warn("Multikernel hotplug: CPU %llu not reparked to host\n",
+				cpu_id);
+
 		ret = mk_instance_return_cpus(target_instance, &cpus);
 		goto out;
 	}
