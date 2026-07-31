@@ -89,7 +89,7 @@ static void __init multikernel_parse_smp_config(void)
 	register_lapic_address(APIC_DEFAULT_PHYS_BASE);
 
 	/* Register CPUs from the manifest if available */
-	mk_register_cpus_from_kho();
+	mk_register_cpus_from_manifest();
 
 	/*
 	 * Initialize boot context for secondary CPU wakeup.

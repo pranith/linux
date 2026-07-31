@@ -115,7 +115,7 @@ int mk_manifest_finalize(struct kimage *image)
 		return ret;
 	}
 
-	ret = mk_kho_preserve_dtb(image, fdt, image->mk_id);
+	ret = mk_manifest_add_instance_dtb(image, fdt, image->mk_id);
 	if (ret) {
 		pr_err("Failed to preserve multikernel DTB: %d\n", ret);
 		fdt_end_node(fdt);
@@ -123,7 +123,7 @@ int mk_manifest_finalize(struct kimage *image)
 		return ret;
 	}
 
-	ret = mk_kho_preserve_host_ipi(image, fdt);
+	ret = mk_manifest_add_host_ipi(image, fdt);
 	if (ret) {
 		pr_err("Failed to preserve host IPI buffer: %d\n", ret);
 		fdt_end_node(fdt);

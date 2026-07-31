@@ -24,7 +24,7 @@
 /*
  * Global root instance representing the current kernel.
  *
- * Initialization (in mk_kho_restore_dtbs at early_initcall):
+ * Initialization (in mk_instance_restore_from_manifest at early_initcall):
  *   - For host kernels (no manifest): Created with id=0, name="/"
  *   - For spawn kernels: Restored from the manifest's instance DTB
  *
@@ -41,7 +41,7 @@ EXPORT_SYMBOL_GPL(root_instance);
  * only online a CPU whose physical ID it enumerated at boot, so the
  * whole pool must be in its topology from the start.
  */
-static int mk_kho_add_pool_cpus(void *fdt, struct mk_instance *target)
+static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 {
 	struct mk_cpu_set *pool;
 	struct mk_instance *other;
@@ -96,7 +96,7 @@ out:
 }
 
 /**
- * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
+ * mk_manifest_add_instance_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
  * @fdt: The manifest FDT being built
  * @mk_id: Multikernel instance ID
@@ -106,7 +106,7 @@ out:
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
+int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id)
 {
 	struct mk_instance *instance;
 	void *fresh_dtb = NULL;
@@ -135,7 +135,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 
 	ret |= fdt_begin_node(fdt, "multikernel");
 	ret |= fdt_property(fdt, "dtb-data", instance->dtb_data, instance->dtb_size);
-	ret |= mk_kho_add_pool_cpus(fdt, instance);
+	ret |= mk_manifest_add_pool_cpus(fdt, instance);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
@@ -150,7 +150,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 }
 
 /**
- * mk_kho_preserve_host_ipi() - Add the host's IPI buffer address to the manifest
+ * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
  * @image: Target kimage
  * @fdt: The manifest FDT being built
  *
@@ -159,7 +159,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
+int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
 {
 	int ret = 0;
 
@@ -238,7 +238,7 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
  * Register CPUs from the manifest during SMP config phase.
  * Called from multikernel_parse_smp_config() before topology is finalized.
  */
-void __init mk_register_cpus_from_kho(void)
+void __init mk_register_cpus_from_manifest(void)
 {
 	phys_addr_t fdt_phys;
 	const void *manifest;
@@ -288,7 +288,7 @@ void __init mk_register_cpus_from_kho(void)
 	 * Register the rest of the pool so those CPUs can be hot-added
 	 * later: the topology rejects post-boot APIC IDs it did not see
 	 * during enumeration. They are registered present and pruned from
-	 * the present mask in mk_kho_restore_cpus(), which keeps a logical
+	 * the present mask in mk_restore_instance_cpus(), which keeps a logical
 	 * CPU assigned to each and avoids the hot-pluggable-APIC checks.
 	 */
 	cpus_prop = fdt_getprop(manifest, mk_node, "pool-cpus", &cpus_len);
@@ -312,7 +312,7 @@ out:
  * CPUs are already registered during multikernel_parse_smp_config() via
  * topology_register_apic(), so we just need to restrict the present mask.
  */
-static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
+static int __init mk_restore_instance_cpus(struct mk_dt_config *config)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
@@ -427,7 +427,7 @@ err_free_instance:
 	return NULL;
 }
 
-static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
+static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
 					  struct mk_instance *instance)
 {
 	struct mk_pci_device *src_dev, *dst_dev;
@@ -466,7 +466,7 @@ static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
 	return 0;
 }
 
-static int __init mk_kho_copy_platform_devices(const struct mk_dt_config *config,
+static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
 					       struct mk_instance *instance)
 {
 	struct mk_platform_device *src_dev, *dst_dev;
@@ -503,7 +503,7 @@ static int __init mk_kho_copy_platform_devices(const struct mk_dt_config *config
 	return 0;
 }
 
-static int __init mk_kho_restore_ipi(const void *manifest, struct mk_instance *instance)
+static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instance *instance)
 {
 	int ipi_node;
 	const fdt64_t *phys_prop;
@@ -552,7 +552,7 @@ static int __init mk_kho_restore_ipi(const void *manifest, struct mk_instance *i
 	return 0;
 }
 
-static struct mk_instance * __init mk_kho_restore_host_instance(const void *manifest)
+static struct mk_instance * __init mk_restore_host_instance(const void *manifest)
 {
 	struct mk_instance *host_instance;
 	int host_ipi_node;
@@ -617,7 +617,7 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *mani
 }
 
 /**
- * mk_kho_restore_dtbs() - Restore this instance from the manifest
+ * mk_instance_restore_from_manifest() - Restore this instance from the manifest
  *
  * Called during multikernel initialization in the spawned kernel to restore
  * the single DTB the host kernel placed in the manifest. The spawned
@@ -625,7 +625,7 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *mani
  *
  * Returns: 0 on success, negative error code on failure
  */
-int __init mk_kho_restore_dtbs(void)
+int __init mk_instance_restore_from_manifest(void)
 {
 	void *dtb_virt;
 	int dtb_len;
@@ -730,7 +730,7 @@ int __init mk_kho_restore_dtbs(void)
 		goto config_free;
 	}
 
-	ret = mk_kho_restore_cpus(&config);
+	ret = mk_restore_instance_cpus(&config);
 	if (ret) {
 		pr_err("Failed to restore CPU restrictions: %d\n", ret);
 		goto config_free;
@@ -758,19 +758,19 @@ int __init mk_kho_restore_dtbs(void)
 	memcpy(instance->dtb_data, dtb_virt, dtb_len);
 	instance->dtb_size = dtb_len;
 
-	ret = mk_kho_copy_pci_devices(&config, instance);
+	ret = mk_copy_pci_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy PCI devices: %d\n", ret);
 		goto cleanup_devices;
 	}
 
-	ret = mk_kho_copy_platform_devices(&config, instance);
+	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy platform devices: %d\n", ret);
 		goto cleanup_devices;
 	}
 
-	ret = mk_kho_restore_ipi(manifest, instance);
+	ret = mk_restore_instance_ipi(manifest, instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
 		goto cleanup_devices;
@@ -778,7 +778,7 @@ int __init mk_kho_restore_dtbs(void)
 
 	root_instance = instance;
 
-	host_instance = mk_kho_restore_host_instance(manifest);
+	host_instance = mk_restore_host_instance(manifest);
 	if (!host_instance)
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
@@ -819,7 +819,7 @@ cleanup_fdt:
 }
 
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
-early_initcall(mk_kho_restore_dtbs);
+early_initcall(mk_instance_restore_from_manifest);
 
 /**
  * mk_pci_should_probe - Check if PCI probing should occur at all

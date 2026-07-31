@@ -757,7 +757,7 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
-void mk_register_cpus_from_kho(void);
+void mk_register_cpus_from_manifest(void);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
@@ -809,7 +809,7 @@ static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
 }
-static inline void mk_register_cpus_from_kho(void)
+static inline void mk_register_cpus_from_manifest(void)
 {
 }
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
@@ -860,7 +860,7 @@ static inline bool mk_is_resource_property(const char *prop_name)
  */
 
 /**
- * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
+ * mk_manifest_add_instance_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
  * @fdt: The manifest FDT being built
  * @mk_id: Multikernel instance ID
@@ -869,30 +869,30 @@ static inline bool mk_is_resource_property(const char *prop_name)
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id);
+int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id);
 
 /**
- * mk_kho_preserve_host_ipi() - Add the host's IPI buffer address to the manifest
+ * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
  * @image: Target kimage
  * @fdt: The manifest FDT being built
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
+int mk_manifest_add_host_ipi(struct kimage *image, void *fdt);
 
 
 /**
- * mk_kho_restore_dtbs() - Restore this instance from the manifest
+ * mk_instance_restore_from_manifest() - Restore this instance from the manifest
  *
  * Called during multikernel initialization to restore DTBs that were
  * placed in the manifest by the host kernel.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int __init mk_kho_restore_dtbs(void);
+int __init mk_instance_restore_from_manifest(void);
 
 /*
- * mk_register_cpus_from_kho() registers CPUs from the manifest during SMP
+ * mk_register_cpus_from_manifest() registers CPUs from the manifest during SMP
  * configuration, before topology_init_possible_cpus(); it is declared
  * above with the CONFIG_MULTIKERNEL stubs.
  */
