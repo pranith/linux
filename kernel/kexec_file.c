@@ -349,7 +349,7 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 			ret = -ENOMEM;
 			goto out_free_image;
 		}
-		image->kho.fdt = page_to_phys(fdt_page);
+		image->mk_manifest = page_to_phys(fdt_page);
 
 		{
 			struct page *ipi_page;
@@ -365,10 +365,10 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 				ret = -ENOMEM;
 				goto out_free_fdt;
 			}
-			image->kho.ipi = page_to_phys(ipi_page);
+			image->mk_ipi = page_to_phys(ipi_page);
 
 			pr_info("Allocated IPI ring buffer: phys=0x%llx, size=%zu bytes (order %u)\n",
-				(unsigned long long)image->kho.ipi, ipi_buffer_size, order);
+				(unsigned long long)image->mk_ipi, ipi_buffer_size, order);
 		}
 	}
 
@@ -405,14 +405,14 @@ out_free_post_load_bufs:
 	kimage_file_post_load_cleanup(image);
 out_free_fdt:
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		if (image->kho.ipi) {
+		if (image->mk_ipi) {
 			unsigned int order = get_order(sizeof(struct mk_shared_data));
-			__free_pages(phys_to_page(image->kho.ipi), order);
-			image->kho.ipi = 0;
+			__free_pages(phys_to_page(image->mk_ipi), order);
+			image->mk_ipi = 0;
 		}
-		if (image->kho.fdt) {
-			put_page(phys_to_page(image->kho.fdt));
-			image->kho.fdt = 0;
+		if (image->mk_manifest) {
+			put_page(phys_to_page(image->mk_manifest));
+			image->mk_manifest = 0;
 		}
 		if (image->mk_instance) {
 			image->mk_instance->kimage = NULL;

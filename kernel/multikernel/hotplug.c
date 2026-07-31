@@ -109,7 +109,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	if (logical_cpu < 0) {
 		/*
 		 * Not present: this pool CPU has never run here (or was
-		 * removed earlier). It was enumerated at boot from the KHO
+		 * removed earlier). It was enumerated at boot from the manifest
 		 * pool-cpus list, so it has a logical slot in the possible
 		 * map; mark it present again before onlining.
 		 */

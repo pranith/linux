@@ -2,10 +2,10 @@
 /*
  * Copyright (C) 2025 Multikernel Technologies, Inc. All rights reserved
  *
- * Multikernel KHO (Kexec HandOver)
+ * Multikernel instance device trees
  *
- * Provides KHO support for preserving and restoring multikernel instance
- * device trees across kexec boundaries using shared memory.
+ * Builds the instance device tree the host hands to a spawn kernel in the
+ * manifest, and restores an instance from the manifest on the spawn side.
  */
 
 #include <linux/kernel.h>
@@ -15,23 +15,18 @@
 #include <linux/multikernel.h>
 #include <linux/io.h>
 #include <linux/pci.h>
-#ifdef CONFIG_KEXEC_HANDOVER
-#include <linux/kexec_handover.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
-#endif
-
-#ifdef CONFIG_KEXEC_HANDOVER
 
 /*
  * Global root instance representing the current kernel.
  *
  * Initialization (in mk_kho_restore_dtbs at early_initcall):
- *   - For host kernels (no KHO): Created with id=0, name="/"
- *   - For spawn kernels (KHO present): Restored from KHO DTB
+ *   - For host kernels (no manifest): Created with id=0, name="/"
+ *   - For spawn kernels: Restored from the manifest's instance DTB
  *
  * The root instance is used by overlay operations to specify the host/current
  * kernel as a source or target for resource transfers (e.g., mk,instance="/").
@@ -103,11 +98,11 @@ out:
 /**
  * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  * @mk_id: Multikernel instance ID
  *
- * Called by mk_kexec_finalize() to preserve the multikernel DTB
- * in the KHO FDT for the target kernel.
+ * Called by mk_manifest_finalize() to preserve the multikernel DTB
+ * in the manifest for the target kernel.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -155,9 +150,9 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 }
 
 /**
- * mk_kho_preserve_host_ipi() - Preserve host's IPI buffer address in KHO
+ * mk_kho_preserve_host_ipi() - Add the host's IPI buffer address to the manifest
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  *
  * Called during kexec preparation to pass the host's IPI receive buffer
  * address to the spawn kernel so it can send messages back to the host.
@@ -182,11 +177,11 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
-		pr_err("Failed to add host IPI buffer to KHO FDT: %d\n", ret);
+		pr_err("Failed to add host IPI buffer to manifest: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("Preserved host IPI buffer in KHO\n");
+	pr_info("Added host IPI buffer to manifest\n");
 	return 0;
 }
 
@@ -240,33 +235,33 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
 }
 
 /*
- * Register CPUs from KHO DTB during SMP config phase.
+ * Register CPUs from the manifest during SMP config phase.
  * Called from multikernel_parse_smp_config() before topology is finalized.
  */
 void __init mk_register_cpus_from_kho(void)
 {
 	phys_addr_t fdt_phys;
-	const void *kho_fdt;
+	const void *manifest;
 	int mk_node, resources_node;
 	const fdt64_t *cpus_prop;
 	int cpus_len, i;
 	const void *dtb_data;
 	int dtb_len;
 
-	fdt_phys = kho_get_fdt_phys();
+	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys)
 		return;
 
-	kho_fdt = early_memremap(fdt_phys, PAGE_SIZE);
-	if (!kho_fdt)
+	manifest = early_memremap(fdt_phys, PAGE_SIZE);
+	if (!manifest)
 		return;
 
-	mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
+	mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0)
 		goto out;
 
 	/* Get the embedded DTB */
-	dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
+	dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0)
 		goto out;
 
@@ -286,7 +281,7 @@ void __init mk_register_cpus_from_kho(void)
 		mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
 		mk_arch_register_cpu(phys_id);
-		pr_debug("Registered CPU physical ID %llu from KHO DTB\n", phys_id);
+		pr_debug("Registered CPU physical ID %llu from manifest\n", phys_id);
 	}
 
 	/*
@@ -296,20 +291,20 @@ void __init mk_register_cpus_from_kho(void)
 	 * the present mask in mk_kho_restore_cpus(), which keeps a logical
 	 * CPU assigned to each and avoids the hot-pluggable-APIC checks.
 	 */
-	cpus_prop = fdt_getprop(kho_fdt, mk_node, "pool-cpus", &cpus_len);
+	cpus_prop = fdt_getprop(manifest, mk_node, "pool-cpus", &cpus_len);
 	if (cpus_prop && cpus_len >= sizeof(fdt64_t) &&
 	    cpus_len % sizeof(fdt64_t) == 0) {
 		for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
 			mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
 			mk_arch_register_cpu(phys_id);
-			pr_debug("Registered pool CPU physical ID %llu from KHO\n",
+			pr_debug("Registered pool CPU physical ID %llu from manifest\n",
 				 phys_id);
 		}
 	}
 
 out:
-	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+	early_memunmap((void *)manifest, PAGE_SIZE);
 }
 
 /*
@@ -508,7 +503,7 @@ static int __init mk_kho_copy_platform_devices(const struct mk_dt_config *config
 	return 0;
 }
 
-static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *instance)
+static int __init mk_kho_restore_ipi(const void *manifest, struct mk_instance *instance)
 {
 	int ipi_node;
 	const fdt64_t *phys_prop;
@@ -518,18 +513,18 @@ static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *in
 	u32 ipi_pages = 0;
 	size_t ipi_size = 0;
 
-	ipi_node = fdt_subnode_offset(kho_fdt, 0, "ipi-buffer");
+	ipi_node = fdt_subnode_offset(manifest, 0, "ipi-buffer");
 	if (ipi_node < 0) {
 		instance->ipi_data = NULL;
-		pr_debug("No IPI buffer available from KHO\n");
+		pr_debug("No IPI buffer available in manifest\n");
 		return 0;
 	}
 
-	phys_prop = fdt_getprop(kho_fdt, ipi_node, "phys-addr", &len);
+	phys_prop = fdt_getprop(manifest, ipi_node, "phys-addr", &len);
 	if (phys_prop && len == sizeof(*phys_prop))
 		ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
 
-	pages_prop = fdt_getprop(kho_fdt, ipi_node, "pages", &len);
+	pages_prop = fdt_getprop(manifest, ipi_node, "pages", &len);
 	if (pages_prop && len == sizeof(*pages_prop)) {
 		ipi_pages = fdt32_to_cpu(*pages_prop);
 		ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
@@ -557,7 +552,7 @@ static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *in
 	return 0;
 }
 
-static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_fdt)
+static struct mk_instance * __init mk_kho_restore_host_instance(const void *manifest)
 {
 	struct mk_instance *host_instance;
 	int host_ipi_node;
@@ -568,17 +563,17 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	size_t host_ipi_size = 0;
 	int len;
 
-	host_ipi_node = fdt_subnode_offset(kho_fdt, 0, "host-ipi-buffer");
+	host_ipi_node = fdt_subnode_offset(manifest, 0, "host-ipi-buffer");
 	if (host_ipi_node < 0) {
-		pr_warn("No host-ipi-buffer node in KHO (spawn won't be able to send to host)\n");
+		pr_warn("No host-ipi-buffer node in manifest (spawn won't be able to send to host)\n");
 		return NULL;
 	}
 
-	phys_prop = fdt_getprop(kho_fdt, host_ipi_node, "phys-addr", &len);
+	phys_prop = fdt_getprop(manifest, host_ipi_node, "phys-addr", &len);
 	if (phys_prop && len == sizeof(*phys_prop))
 		host_ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
 
-	pages_prop = fdt_getprop(kho_fdt, host_ipi_node, "pages", &len);
+	pages_prop = fdt_getprop(manifest, host_ipi_node, "pages", &len);
 	if (pages_prop && len == sizeof(*pages_prop)) {
 		host_ipi_pages = fdt32_to_cpu(*pages_prop);
 		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
@@ -622,10 +617,10 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 }
 
 /**
- * mk_kho_restore_dtbs() - Restore DTB from KHO shared memory
+ * mk_kho_restore_dtbs() - Restore this instance from the manifest
  *
  * Called during multikernel initialization in the spawned kernel to restore
- * the single DTB that was preserved by the host kernel via KHO. The spawned
+ * the single DTB the host kernel placed in the manifest. The spawned
  * kernel receives exactly one DTB and parses the instance ID from it.
  *
  * Returns: 0 on success, negative error code on failure
@@ -640,12 +635,12 @@ int __init mk_kho_restore_dtbs(void)
 	struct mk_dt_config config;
 	int instance_id;
 	const char *instance_name;
-	const void *kho_fdt = NULL;
+	const void *manifest = NULL;
 	phys_addr_t fdt_phys;
 
-	fdt_phys = kho_get_fdt_phys();
+	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys) {
-		pr_info("No KHO FDT available for multikernel DTB restoration\n");
+		pr_info("No manifest available for multikernel DTB restoration\n");
 
 		instance = alloc_mk_instance(0, "", true);
 		if (!instance) {
@@ -669,23 +664,23 @@ int __init mk_kho_restore_dtbs(void)
 		return 0;
 	}
 
-	pr_info("Restoring multikernel DTB from KHO (phys: 0x%llx)\n", fdt_phys);
+	pr_info("Restoring multikernel DTB from manifest (phys: 0x%llx)\n", fdt_phys);
 
 	/* Map the FDT for early boot access */
-	kho_fdt = early_memremap(fdt_phys, PAGE_SIZE);
-	if (!kho_fdt) {
-		pr_err("Failed to map KHO FDT at 0x%llx\n", fdt_phys);
+	manifest = early_memremap(fdt_phys, PAGE_SIZE);
+	if (!manifest) {
+		pr_err("Failed to map manifest at 0x%llx\n", fdt_phys);
 		return -EFAULT;
 	}
 
-	int mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
+	int mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0) {
-		pr_info("No multikernel node found in KHO FDT\n");
+		pr_info("No multikernel node found in manifest\n");
 		ret = 0;
 		goto cleanup_fdt;
 	}
 
-	const void *dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
+	const void *dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0) {
 		pr_info("No dtb-data property found in multikernel node\n");
 		ret = 0;
@@ -697,7 +692,7 @@ int __init mk_kho_restore_dtbs(void)
 	/* Validate DTB header */
 	ret = fdt_check_header(dtb_data);
 	if (ret) {
-		pr_err("Invalid DTB header from KHO: %d\n", ret);
+		pr_err("Invalid DTB header in manifest: %d\n", ret);
 		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
@@ -731,7 +726,7 @@ int __init mk_kho_restore_dtbs(void)
 	/* In the new flat format, the root node IS the instance node */
 	ret = mk_dt_parse(dtb_virt, dtb_len, &config);
 	if (ret) {
-		pr_err("Failed to parse DTB from KHO: %d\n", ret);
+		pr_err("Failed to parse DTB from manifest: %d\n", ret);
 		goto config_free;
 	}
 
@@ -775,7 +770,7 @@ int __init mk_kho_restore_dtbs(void)
 		goto cleanup_devices;
 	}
 
-	ret = mk_kho_restore_ipi(kho_fdt, instance);
+	ret = mk_kho_restore_ipi(manifest, instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
 		goto cleanup_devices;
@@ -783,15 +778,15 @@ int __init mk_kho_restore_dtbs(void)
 
 	root_instance = instance;
 
-	host_instance = mk_kho_restore_host_instance(kho_fdt);
+	host_instance = mk_kho_restore_host_instance(manifest);
 	if (!host_instance)
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
-	pr_info("Successfully restored multikernel root instance %d ('%s') from KHO (%d bytes)\n",
+	pr_info("Successfully restored multikernel root instance %d ('%s') from manifest (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
 	kfree(dtb_virt);
-	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+	early_memunmap((void *)manifest, PAGE_SIZE);
 	return 0;
 
 cleanup_devices:
@@ -819,7 +814,7 @@ config_free:
 cleanup_dtb:
 	kfree(dtb_virt);
 cleanup_fdt:
-	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+	early_memunmap((void *)manifest, PAGE_SIZE);
 	return ret;
 }
 
@@ -938,28 +933,3 @@ bool mk_platform_device_allowed(const char *name, const char *hid)
 	return false;
 }
 EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
-
-#else /* !CONFIG_KEXEC_HANDOVER */
-
-/* No root instance when KHO is not enabled */
-struct mk_instance *root_instance = NULL;
-
-/* Stub functions when KHO is not enabled */
-int __init mk_kho_restore_dtbs(void)
-{
-	return 0;
-}
-
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
-{
-	return true;
-}
-EXPORT_SYMBOL_GPL(mk_pci_should_probe);
-
-bool mk_platform_device_allowed(const char *name, const char *hid)
-{
-	return true;
-}
-EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
-
-#endif /* CONFIG_KEXEC_HANDOVER */

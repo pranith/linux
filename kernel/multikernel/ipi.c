@@ -116,12 +116,12 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	if (!instance->ipi_data) {
 		struct mk_shared_data *ipi_data = NULL;
 
-		if (instance->kimage && instance->kimage->kho.ipi)
-			ipi_data = phys_to_virt(instance->kimage->kho.ipi);
+		if (instance->kimage && instance->kimage->mk_ipi)
+			ipi_data = phys_to_virt(instance->kimage->mk_ipi);
 
 		if (ipi_data && cmpxchg(&instance->ipi_data, NULL, ipi_data) == NULL) {
 			pr_info("Initialized IPI ring buffer for instance %d: phys=0x%llx, virt=%px\n",
-				instance->id, (unsigned long long)instance->kimage->kho.ipi,
+				instance->id, (unsigned long long)instance->kimage->mk_ipi,
 				ipi_data);
 		}
 	}

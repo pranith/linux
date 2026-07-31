@@ -422,6 +422,10 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 		kbuf.bufsz += sizeof(struct setup_data) +
 			      sizeof(struct kho_data);
 
+	if (IS_ENABLED(CONFIG_MULTIKERNEL))
+		kbuf.bufsz += sizeof(struct setup_data) +
+			      sizeof(struct mk_setup_data);
+
 	params = kvzalloc(kbuf.bufsz, GFP_KERNEL);
 	if (!params)
 		return ERR_PTR(-ENOMEM);

@@ -271,21 +271,13 @@ static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node
 	if (ret && ret != -FDT_ERR_NOTFOUND)
 		return ret;
 
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		if (!image->kho.fdt)
-			return 0;
-	} else if (!image->kho.fdt || !image->kho.scratch)
+	if (!image->kho.fdt || !image->kho.scratch)
 		return 0;
 
 	fdt_mem = image->kho.fdt;
 	fdt_len = PAGE_SIZE;
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		scratch_mem = 0;
-		scratch_len = 0;
-	} else {
-		scratch_mem = image->kho.scratch->mem;
-		scratch_len = image->kho.scratch->bufsz;
-	}
+	scratch_mem = image->kho.scratch->mem;
+	scratch_len = image->kho.scratch->bufsz;
 
 	pr_debug("Adding kho metadata to DT");
 
@@ -294,12 +286,33 @@ static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node
 	if (ret)
 		return ret;
 
-	if (scratch_mem && scratch_len)
-		ret = fdt_appendprop_addrrange(fdt, 0, chosen_node, "linux,kho-scratch",
-					       scratch_mem, scratch_len);
+	ret = fdt_appendprop_addrrange(fdt, 0, chosen_node, "linux,kho-scratch",
+				       scratch_mem, scratch_len);
 
 #endif /* CONFIG_KEXEC_HANDOVER */
 	return ret;
+}
+
+/*
+ * The multikernel manifest travels on its own /chosen property, distinct
+ * from KHO's: a spawn kernel may later use the real KHO channel for its
+ * own live update within its partition, so the two must not share.
+ */
+static int mk_add_chosen(const struct kimage *image, void *fdt, int chosen_node)
+{
+	int ret;
+
+	ret = fdt_delprop(fdt, chosen_node, "linux,multikernel-fdt");
+	if (ret && ret != -FDT_ERR_NOTFOUND)
+		return ret;
+
+	if (!IS_ENABLED(CONFIG_MULTIKERNEL) ||
+	    image->type != KEXEC_TYPE_MULTIKERNEL || !image->mk_manifest)
+		return 0;
+
+	return fdt_appendprop_addrrange(fdt, 0, chosen_node,
+					"linux,multikernel-fdt",
+					image->mk_manifest, PAGE_SIZE);
 }
 
 /*
@@ -454,6 +467,11 @@ void *of_kexec_alloc_and_setup_fdt(const struct kimage *image,
 
 	/* Add kho metadata if this is a KHO image */
 	ret = kho_add_chosen(image, fdt, chosen_node);
+	if (ret)
+		goto out;
+
+	/* Add the manifest reference if this is a multikernel image */
+	ret = mk_add_chosen(image, fdt, chosen_node);
 	if (ret)
 		goto out;
 

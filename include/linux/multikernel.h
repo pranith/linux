@@ -756,8 +756,14 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
-/* Early CPU registration from the KHO DTB (spawn kernels) */
+/* Early CPU registration from the manifest (spawn kernels) */
 void mk_register_cpus_from_kho(void);
+
+/* Accept the manifest handed over at boot (spawn kernels) */
+void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+
+/* Build the manifest for a spawn (host, kexec path) */
+int mk_manifest_finalize(struct kimage *image);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -806,6 +812,9 @@ static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 static inline void mk_register_cpus_from_kho(void)
 {
 }
+static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
+{
+}
 #endif
 
 /**
@@ -844,28 +853,28 @@ static inline bool mk_is_resource_property(const char *prop_name)
 }
 
 /**
- * KHO (Kexec HandOver) Integration Functions
+ * Manifest Integration Functions
  *
- * These functions provide KHO support for preserving and restoring
- * multikernel instance device trees across kexec boundaries.
+ * These functions build the instance device tree into the manifest on
+ * the host side, and restore an instance from it on the spawn side.
  */
 
 /**
  * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  * @mk_id: Multikernel instance ID
  *
- * Called by mk_kexec_finalize() to add multikernel DTB to KHO FDT.
+ * Called by mk_manifest_finalize() to add the multikernel DTB to the manifest.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id);
 
 /**
- * mk_kho_preserve_host_ipi() - Preserve host's IPI buffer address in KHO
+ * mk_kho_preserve_host_ipi() - Add the host's IPI buffer address to the manifest
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -873,17 +882,17 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
 
 
 /**
- * mk_kho_restore_dtbs() - Restore DTBs from KHO shared memory
+ * mk_kho_restore_dtbs() - Restore this instance from the manifest
  *
  * Called during multikernel initialization to restore DTBs that were
- * preserved by the previous kernel via KHO.
+ * placed in the manifest by the host kernel.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int __init mk_kho_restore_dtbs(void);
 
 /*
- * mk_register_cpus_from_kho() registers CPUs from the KHO DTB during SMP
+ * mk_register_cpus_from_kho() registers CPUs from the manifest during SMP
  * configuration, before topology_init_possible_cpus(); it is declared
  * above with the CONFIG_MULTIKERNEL stubs.
  */

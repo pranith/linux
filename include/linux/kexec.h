@@ -422,8 +422,6 @@ struct kimage {
 	struct {
 		struct kexec_segment *scratch;
 		phys_addr_t fdt;
-		phys_addr_t ipi;  /* IPI buffer physical address (host->spawn) */
-		phys_addr_t host_ipi;  /* Host's receive buffer (spawn->host) */
 	} kho;
 
 	/* Core ELF header buffer */
@@ -443,6 +441,10 @@ struct kimage {
 
 	/* Multikernel instance cross-reference */
 	struct mk_instance *mk_instance;
+
+	/* Multikernel manifest page and message ring (physical addresses) */
+	phys_addr_t mk_manifest;
+	phys_addr_t mk_ipi;
 };
 
 /* kexec interface functions */

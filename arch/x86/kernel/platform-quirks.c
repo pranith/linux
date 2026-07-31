@@ -76,7 +76,7 @@ static void __init multikernel_pagetable_init(void)
 
 /*
  * Multikernel SMP configuration - similar to Jailhouse.
- * Parses CPU configuration from KHO DTB and registers CPUs.
+ * Parses CPU configuration from the multikernel manifest and registers CPUs.
  */
 static void __init multikernel_parse_smp_config(void)
 {
@@ -88,7 +88,7 @@ static void __init multikernel_parse_smp_config(void)
 
 	register_lapic_address(APIC_DEFAULT_PHYS_BASE);
 
-	/* Register CPUs from KHO DTB if available */
+	/* Register CPUs from the manifest if available */
 	mk_register_cpus_from_kho();
 
 	/*

@@ -35,3 +35,6 @@ int multikernel_add_pool_memory(phys_addr_t start, size_t size);
 
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
+
+/* manifest.c */
+phys_addr_t mk_manifest_phys(void);

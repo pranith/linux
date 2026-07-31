@@ -17,6 +17,7 @@
 #include <linux/initrd.h>
 #include <linux/iscsi_ibft.h>
 #include <linux/memblock.h>
+#include <linux/multikernel.h>
 #include <linux/panic_notifier.h>
 #include <linux/pci.h>
 #include <linux/random.h>
@@ -471,15 +472,32 @@ static void __init add_kho(u64 phys_addr, u32 data_len)
 		return;
 	}
 
-	if (kho->scratch_addr == 0 && kho->scratch_size == 0) {
-		pr_info("setup: detected multikernel KHO data\n");
-		mk_kho_populate(kho->fdt_addr, kho->fdt_size);
-	} else {
-		pr_info("setup: detected regular KHO data\n");
-		kho_populate(kho->fdt_addr, kho->fdt_size, kho->scratch_addr, kho->scratch_size);
-	}
+	kho_populate(kho->fdt_addr, kho->fdt_size, kho->scratch_addr, kho->scratch_size);
 
 	early_memunmap(kho, size);
+}
+
+static void __init add_multikernel(u64 phys_addr, u32 data_len)
+{
+	struct mk_setup_data *mk;
+	u64 addr = phys_addr + sizeof(struct setup_data);
+	u64 size = data_len - sizeof(struct setup_data);
+
+	if (!IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		pr_warn("Passed multikernel manifest, but CONFIG_MULTIKERNEL not set. Ignoring.\n");
+		return;
+	}
+
+	mk = early_memremap(addr, size);
+	if (!mk) {
+		pr_warn("setup: failed to memremap multikernel data (0x%llx, 0x%llx)\n",
+			addr, size);
+		return;
+	}
+
+	mk_manifest_populate(mk->fdt_addr, mk->fdt_size);
+
+	early_memunmap(mk, size);
 }
 
 static void __init parse_setup_data(void)
@@ -512,6 +530,9 @@ static void __init parse_setup_data(void)
 			break;
 		case SETUP_KEXEC_KHO:
 			add_kho(pa_data, data_len);
+			break;
+		case SETUP_MULTIKERNEL:
+			add_multikernel(pa_data, data_len);
 			break;
 		case SETUP_RNG_SEED:
 			data = early_memremap(pa_data, data_len);

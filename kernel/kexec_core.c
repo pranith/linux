@@ -625,16 +625,16 @@ void kimage_free(struct kimage *image)
 			image->mk_instance = NULL;
 		}
 
-		if (image->kho.fdt) {
-			put_page(phys_to_page(image->kho.fdt));
-			image->kho.fdt = 0;
+		if (image->mk_manifest) {
+			put_page(phys_to_page(image->mk_manifest));
+			image->mk_manifest = 0;
 		}
 
-		if (image->kho.ipi) {
+		if (image->mk_ipi) {
 			size_t ipi_buffer_size = sizeof(struct mk_shared_data);
 			unsigned int order = get_order(ipi_buffer_size);
-			__free_pages(phys_to_page(image->kho.ipi), order);
-			image->kho.ipi = 0;
+			__free_pages(phys_to_page(image->mk_ipi), order);
+			image->mk_ipi = 0;
 		}
 	}
 #ifdef CONFIG_CRASH_DUMP
@@ -1734,11 +1734,11 @@ int multikernel_kexec_by_id(int mk_id)
 		}
 	}
 
-	rc = mk_kexec_finalize(mk_image);
+	rc = mk_manifest_finalize(mk_image);
 	if (rc)
-		pr_warn("KHO finalization failed: %d\n", rc);
+		pr_warn("Manifest finalization failed: %d\n", rc);
 	else
-		pr_info("KHO finalized for multikernel instance\n");
+		pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
 	 * Point at the ring this image actually carries. Every load
@@ -1748,9 +1748,9 @@ int multikernel_kexec_by_id(int mk_id)
 	 * which after a re-load belongs to nobody. The two then never see
 	 * each other's messages.
 	 */
-	if (mk_image->kho.ipi) {
-		instance->ipi_phys = mk_image->kho.ipi;
-		instance->ipi_data = phys_to_virt(mk_image->kho.ipi);
+	if (mk_image->mk_ipi) {
+		instance->ipi_phys = mk_image->mk_ipi;
+		instance->ipi_data = phys_to_virt(mk_image->mk_ipi);
 	}
 
 	/*
