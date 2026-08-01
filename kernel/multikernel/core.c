@@ -272,6 +272,41 @@ bool multikernel_allow_emergency_restart(void)
  */
 
 /**
+ * mk_instance_confirm_parked() - Wait for an instance's CPUs to park
+ * @instance: Instance that has been shut down
+ *
+ * A halted instance acknowledges the shutdown before its CPUs have
+ * actually reached the park page: they still have to run the rest of the
+ * shutdown path, which lives in the instance's own kernel image. Loading
+ * a new image over that memory while a CPU is still executing it kills
+ * the machine, so callers that are about to rewrite the image wait here
+ * first.
+ *
+ * Returns 0 when every CPU is parked, -EBUSY if any did not get there.
+ */
+int mk_instance_confirm_parked(struct mk_instance *instance)
+{
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+	int ret, failed = 0;
+
+	/* Never started, so nothing of it is running */
+	if (!instance->spawn_ctx)
+		return 0;
+
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+		ret = mk_arch_confirm_parked(instance, phys_cpu);
+		if (ret) {
+			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
+			       instance->id, instance->name, phys_cpu, ret);
+			failed++;
+		}
+	}
+
+	return failed ? -EBUSY : 0;
+}
+
+/**
  * mk_instance_transfer_cpus() - Transfer CPUs from root to instance
  * @instance: Target instance
  * @cpus: Set of physical CPU IDs to transfer
@@ -1303,6 +1338,16 @@ int multikernel_halt_by_id(int mk_id)
 
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
+		/*
+		 * The ACK only says the instance began shutting down. Wait
+		 * for its CPUs to reach the park loop before reporting it
+		 * down, so a prompt re-spawn does not rewrite the image
+		 * they are still running.
+		 */
+		if (mk_instance_confirm_parked(instance))
+			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
+				mk_id);
+
 		mk_instance_set_state(instance, MK_STATE_LOADED);
 		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}

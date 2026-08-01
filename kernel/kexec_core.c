@@ -1713,6 +1713,19 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	/*
+	 * Every CPU of a previous run must be parked before the image is
+	 * rewritten underneath it. A CPU still executing the old image
+	 * when it is overwritten faults with interrupts disabled and takes
+	 * the machine down, console included.
+	 */
+	rc = mk_instance_confirm_parked(instance);
+	if (rc) {
+		pr_err("Instance %d still has running CPUs, refusing to reload its image\n",
+		       mk_id);
+		goto unlock;
+	}
+
+	/*
 	 * Booting consumes the image: the spawn kernel writes its .data and
 	 * patches its own text, so the copy in instance memory is spent once
 	 * it has run. Re-copy it from the source buffers kept at load time,

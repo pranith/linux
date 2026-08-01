@@ -519,6 +519,32 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 }
 
 /**
+ * mk_arch_confirm_parked - Verify a CPU has reached the instance's park loop
+ * @instance: Instance the CPU belongs to
+ * @phys_cpu: Physical (APIC) ID of the CPU
+ *
+ * Publishes a repark that moves the CPU to the slot it is already on, so
+ * the move itself is a no-op and the claim is the answer: only a CPU
+ * sitting in the park loop can take it. A CPU still running the
+ * instance's kernel, on its way down, cannot.
+ *
+ * Returns 0 once the CPU is known to be parked.
+ */
+int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+{
+	struct mk_spawn_context *ctx = instance->spawn_ctx;
+
+	if (!ctx || !ctx->park_phys)
+		return -ENODEV;
+
+	ctx->repark_park_phys = ctx->park_phys;
+	ctx->repark_park_cr3 = ctx->park_cr3;
+	ctx->repark_slot_phys = instance->spawn_ctx_phys;
+	ctx->flags = MK_SPAWN_F_REPARK;
+	return mk_slot_wake(ctx, (u32)phys_cpu, "confirm parked");
+}
+
+/**
  * mk_repark_instance_to_host - Return an instance's CPUs to the host slot
  * @instance: Instance being torn down
  *

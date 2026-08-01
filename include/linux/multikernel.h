@@ -999,6 +999,16 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu);
 void mk_arch_release_instance(struct mk_instance *instance);
 
+/* Verify one of an instance's CPUs has reached its park loop */
+int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
+/*
+ * Wait until every CPU an instance owns is parked. Its kernel image may
+ * only be overwritten once this succeeds: a CPU still executing that
+ * image when it is rewritten takes the machine down with it.
+ */
+int mk_instance_confirm_parked(struct mk_instance *instance);
+
 /* Return an instance's parked CPUs to the host slot before teardown */
 int mk_repark_instance_to_host(struct mk_instance *instance);
 
