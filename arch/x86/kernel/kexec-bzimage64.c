@@ -461,11 +461,21 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	}
 
 #ifdef CONFIG_EFI
-	/* Setup EFI state */
-	setup_efi_state(params, params_load_addr, efi_map_offset, efi_map_sz,
-			setup_data_offset);
-	setup_data_offset += sizeof(struct setup_data) +
-			sizeof(struct efi_setup_data);
+	/*
+	 * A spawn kernel gets no EFI state. It runs alongside the kernel that
+	 * owns the firmware, so entering virtual mode on the same runtime
+	 * services and enumerating variables concurrently would corrupt state
+	 * the host is using. It also has no business reserving the host's EFI
+	 * memory regions: its memory map is the instance partition.
+	 */
+	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
+		setup_efi_state(params, params_load_addr, efi_map_offset,
+				efi_map_sz, setup_data_offset);
+		setup_data_offset += sizeof(struct setup_data) +
+				sizeof(struct efi_setup_data);
+	} else {
+		memset(&params->efi_info, 0, sizeof(params->efi_info));
+	}
 #endif
 
 #ifdef CONFIG_OF_FLATTREE
