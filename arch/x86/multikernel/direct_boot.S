@@ -186,6 +186,13 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_secondary_identity)
 	movq	%cr3, %rax
 	movq	%rax, %cr3
 
+	/*
+	 * Restore CR4 minus CET: a CPU parked by a spawn kernel carries that
+	 * kernel's IBT arming, and the jump below lands on a NOENDBR entry.
+	 * The spawn kernel re-enables CET for this CPU in cpu_init(), the
+	 * same as after the boot trampoline's CET clear.
+	 */
+	andq	$~X86_CR4_CET, %rbx
 	movq	%rbx, %cr4
 
 	movl	$MSR_GS_BASE, %ecx
