@@ -213,6 +213,21 @@ SYM_CODE_START(multikernel_secondary_startup)
 	wrmsr
 
 	/*
+	 * KERNEL_GS_BASE and FS_BASE still hold whatever the parking
+	 * kernel left: the selector writes above do not touch
+	 * KERNEL_GS_BASE, and nothing before cpu_init() rewrites either,
+	 * while a paranoid entry (NMI) taken before then trusts them.
+	 * INIT would have cleared both on a real secondary bringup; this
+	 * path skips INIT, so clear them by hand.
+	 */
+	xorl	%eax, %eax
+	xorl	%edx, %edx
+	movl	$MSR_KERNEL_GS_BASE, %ecx
+	wrmsr
+	movl	$MSR_FS_BASE, %ecx
+	wrmsr
+
+	/*
 	 * Sync EFER/CR0 with spawn kernel's expectations - CPU inherits
 	 * these from host kernel where it was in play_dead.
 	 */
