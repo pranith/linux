@@ -35,11 +35,12 @@ struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
 
 /*
- * Collect every pool CPU the instance might receive through hotplug
- * later: the unallocated pool plus other instances' CPUs, minus the
- * instance's own (those are already in its DTB). The spawn kernel can
- * only online a CPU whose physical ID it enumerated at boot, so the
- * whole pool must be in its topology from the start.
+ * Collect every CPU the instance might receive through hotplug later:
+ * the unassigned pool plus every other kernel's CPUs (the host's and
+ * other instances'), minus the instance's own (those are already in its
+ * DTB). The spawn kernel can only online a CPU whose physical ID it
+ * enumerated at boot, so the whole pool must be in its topology from
+ * the start.
  */
 static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 {
@@ -56,7 +57,13 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
-		if (other == target)
+		/*
+		 * Skip the root instance: its set is the CPUs the host
+		 * itself runs on, and enumerating a big host's full CPU set
+		 * in every spawn bloats the spawn's possible map and percpu
+		 * allocations.
+		 */
+		if (other == target || other == root_instance)
 			continue;
 		mk_cpu_set_for_each(i, id, other->cpus) {
 			ret = mk_cpu_set_add(pool, id);
@@ -66,8 +73,8 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 		if (ret)
 			break;
 	}
-	if (!ret && root_instance != target) {
-		mk_cpu_set_for_each(i, id, root_instance->cpus) {
+	if (!ret) {
+		mk_cpu_set_for_each(i, id, mk_cpu_pool) {
 			ret = mk_cpu_set_add(pool, id);
 			if (ret)
 				break;
@@ -647,11 +654,11 @@ int __init mk_instance_restore_from_manifest(void)
 			pr_err("Failed to allocate root instance\n");
 			return -ENOMEM;
 		}
-		/* Initially, root has all online CPUs (physical IDs) */
+		/* Initially, root owns all online CPUs (physical IDs) */
 		for_each_online_cpu(cpu) {
 			if (mk_cpu_set_add(instance->cpus,
 					   arch_cpu_physical_id(cpu)))
-				pr_warn("Failed to add CPU %d to root pool\n",
+				pr_warn("Failed to add CPU %d to root instance\n",
 					cpu);
 		}
 		mk_cpu_set_format(cpus_buf, sizeof(cpus_buf), instance->cpus);

@@ -325,7 +325,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	char buf[256];
 	int ret;
 
-	if (!cpus || !instance->cpus || !root_instance || !root_instance->cpus) {
+	if (!cpus || !instance->cpus || !mk_cpu_pool) {
 		pr_err("Invalid CPU sets for transfer\n");
 		return -EINVAL;
 	}
@@ -338,8 +338,8 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	}
 
 	mk_cpu_set_for_each(i, phys_cpu, cpus) {
-		if (!mk_cpu_set_contains(root_instance->cpus, phys_cpu)) {
-			pr_err("CPU %llu not available in root instance pool\n",
+		if (!mk_cpu_set_contains(mk_cpu_pool, phys_cpu)) {
+			pr_err("CPU %llu not available in the pool\n",
 			       phys_cpu);
 			unavailable++;
 			continue;
@@ -363,12 +363,12 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return ret;
 
 	mk_cpu_set_for_each(i, phys_cpu, cpus) {
-		mk_cpu_set_del(root_instance->cpus, phys_cpu);
+		mk_cpu_set_del(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
 
 	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
-	pr_info("Transferred %u CPUs from root to instance %d (%s): %s\n",
+	pr_info("Transferred %u CPUs from pool to instance %d (%s): %s\n",
 		requested_count, instance->id, instance->name, buf);
 
 	return 0;
@@ -393,7 +393,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	char buf[256];
 	int ret;
 
-	if (!cpus || !instance->cpus || !root_instance || !root_instance->cpus) {
+	if (!cpus || !instance->cpus || !mk_cpu_pool) {
 		pr_err("Invalid CPU sets for return\n");
 		return -EINVAL;
 	}
@@ -420,7 +420,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	ret = mk_cpu_set_reserve(root_instance->cpus, requested_count);
+	ret = mk_cpu_set_reserve(mk_cpu_pool, requested_count);
 	if (ret)
 		return ret;
 
@@ -433,11 +433,11 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	 */
 	for (i = requested_count; i-- > 0; ) {
 		phys_cpu = cpus->ids[i];
-		mk_cpu_set_add(root_instance->cpus, phys_cpu);
+		mk_cpu_set_add(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
 
-	pr_info("Returned %u CPUs from instance %d (%s) to root: %s\n",
+	pr_info("Returned %u CPUs from instance %d (%s) to the pool: %s\n",
 		requested_count, instance->id, instance->name, buf);
 
 	return 0;

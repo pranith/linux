@@ -35,6 +35,13 @@ int multikernel_add_pool_memory(phys_addr_t start, size_t size);
 
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
+/*
+ * Parked CPUs this kernel can assign to child instances. Created when a
+ * baseline is applied to this kernel; NULL until then. Managing a pool
+ * is a role, not an identity: any kernel given a baseline becomes a
+ * parent, which is what allows spawn kernels to spawn in turn.
+ */
+extern struct mk_cpu_set *mk_cpu_pool;
 
 /* manifest.c */
 phys_addr_t mk_manifest_phys(void);

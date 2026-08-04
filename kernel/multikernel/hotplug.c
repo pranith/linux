@@ -77,6 +77,25 @@ struct mk_cpu_hotplug_work {
 	u32 operation;           /* MK_RES_CPU_ADD or MK_RES_CPU_REMOVE */
 };
 
+/*
+ * Ownership tracking for this kernel's own hotplug: root_instance->cpus
+ * is the set of CPUs this kernel owns, in the host and in spawn kernels
+ * alike. The assignable-pool bookkeeping (mk_cpu_pool) is not done here;
+ * it belongs to the mk_send_cpu_* initiator paths of the kernel that
+ * manages the pool.
+ */
+static void mk_account_cpu_online(mk_phys_cpu_t cpu_id)
+{
+	if (root_instance->cpus && mk_cpu_set_add(root_instance->cpus, cpu_id))
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu\n",
+			cpu_id);
+}
+
+static void mk_account_cpu_offline(mk_phys_cpu_t cpu_id)
+{
+	mk_cpu_set_del(root_instance->cpus, cpu_id);
+}
+
 /**
  * Search present CPUs (not possible CPUs) to find the logical CPU with matching
  * physical ID. Using present CPUs is important because topology can change during
@@ -125,10 +144,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	if (cpu_online(logical_cpu)) {
 		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already online\n",
 			logical_cpu, cpu_id);
-		if (root_instance->cpus &&
-		    mk_cpu_set_add(root_instance->cpus, cpu_id))
-			pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
-				cpu_id);
+		mk_account_cpu_online(cpu_id);
 		return 0;
 	}
 
@@ -150,9 +166,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		return ret;
 	}
 
-	if (root_instance->cpus && mk_cpu_set_add(root_instance->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
-			cpu_id);
+	mk_account_cpu_online(cpu_id);
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
@@ -187,7 +201,7 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	if (!cpu_online(logical_cpu)) {
 		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already offline\n",
 			logical_cpu, cpu_id);
-		mk_cpu_set_del(root_instance->cpus, cpu_id);
+		mk_account_cpu_offline(cpu_id);
 		return 0;
 	}
 
@@ -207,7 +221,7 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 		return ret;
 	}
 
-	mk_cpu_set_del(root_instance->cpus, cpu_id);
+	mk_account_cpu_offline(cpu_id);
 
 	/*
 	 * Clear CPU from present mask to prevent host kernel from trying
@@ -1015,8 +1029,17 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	int ret;
 
 	/* For self-removal, execute directly (we're in process context) */
-	if (instance_id == root_instance->id)
-		return mk_do_cpu_remove(cpu_id);
+	if (instance_id == root_instance->id) {
+		ret = mk_do_cpu_remove(cpu_id);
+		/*
+		 * If this kernel manages a pool, the CPU parked in its park
+		 * area and is assignable again.
+		 */
+		if (!ret && mk_cpu_pool && mk_cpu_set_add(mk_cpu_pool, cpu_id))
+			pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
+				cpu_id);
+		return ret;
+	}
 
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
@@ -1069,8 +1092,8 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 			cpu_id, ret);
 
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
-	if (mk_cpu_set_add(root_instance->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+	if (!mk_cpu_pool || mk_cpu_set_add(mk_cpu_pool, cpu_id))
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
 			cpu_id);
 
 	ret = 0;
@@ -1106,8 +1129,20 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	int ret;
 
 	/* For self-addition, execute directly (we're in process context) */
-	if (instance_id == root_instance->id)
-		return mk_do_cpu_add(cpu_id, numa_node, flags);
+	if (instance_id == root_instance->id) {
+		ret = mk_do_cpu_add(cpu_id, numa_node, flags);
+		/*
+		 * If the CPU came out of this kernel's pool, it is an
+		 * ordinary CPU of this kernel from here on.
+		 */
+		if (!ret && mk_cpu_set_del(mk_cpu_pool, cpu_id)) {
+			int cpu = arch_cpu_from_physical_id(cpu_id);
+
+			if (cpu >= 0)
+				mk_set_pool_cpu(cpu, false);
+		}
+		return ret;
+	}
 
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance) {
@@ -1121,6 +1156,17 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
 		ret = mk_instance_transfer_cpus(target_instance, &cpus);
+		goto out;
+	}
+
+	/*
+	 * Only a CPU from the assignable pool is parked on the host slot;
+	 * publishing a wakeup for any other CPU can only time out.
+	 */
+	if (!mk_cpu_set_contains(mk_cpu_pool, cpu_id)) {
+		pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
+		       cpu_id);
+		ret = -EBUSY;
 		goto out;
 	}
 
@@ -1166,7 +1212,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
 			cpu_id, instance_id);
-	mk_cpu_set_del(root_instance->cpus, cpu_id);
+	mk_cpu_set_del(mk_cpu_pool, cpu_id);
 
 	ret = 0;
 out:

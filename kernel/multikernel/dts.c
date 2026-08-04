@@ -952,9 +952,19 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 		}
 	}
 
-	/* CPU resources, as an array of 64-bit physical CPU IDs */
-	if (!mk_cpu_set_empty(instance->cpus)) {
-		unsigned int idx, cpu_count = mk_cpu_set_count(instance->cpus);
+	/*
+	 * CPU resources, as an array of 64-bit physical CPU IDs. The root
+	 * instance's device tree is the baseline: in the kernel that
+	 * manages a pool it describes the assignable pool, not the CPUs
+	 * the kernel itself runs on.
+	 */
+	const struct mk_cpu_set *cpus = instance->cpus;
+
+	if (instance == root_instance && mk_cpu_pool)
+		cpus = mk_cpu_pool;
+
+	if (!mk_cpu_set_empty(cpus)) {
+		unsigned int idx, cpu_count = mk_cpu_set_count(cpus);
 		mk_phys_cpu_t phys_cpu_id;
 		fdt64_t *cpu_array;
 
@@ -964,7 +974,7 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 			goto err_free;
 		}
 
-		mk_cpu_set_for_each(idx, phys_cpu_id, instance->cpus)
+		mk_cpu_set_for_each(idx, phys_cpu_id, cpus)
 			cpu_array[idx] = cpu_to_fdt64(phys_cpu_id);
 
 		ret = fdt_property(fdt, "cpus", cpu_array,

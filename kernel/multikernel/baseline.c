@@ -20,8 +20,16 @@
 
 #include "internal.h"
 
-static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
-				  struct mk_instance *instance)
+/*
+ * Parked CPUs this kernel can assign to child instances. The baseline
+ * creates it, so it exists exactly in a kernel acting as a parent; it
+ * stays NULL until a baseline is applied. instance->cpus,
+ * root_instance's included, always means "CPUs that kernel instance
+ * owns".
+ */
+struct mk_cpu_set *mk_cpu_pool;
+
+static int mk_baseline_parse_cpus(const void *fdt, int resources_node)
 {
 	const fdt64_t *prop;
 	int len, i, cpu_count;
@@ -45,23 +53,24 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 		return -EINVAL;
 	}
 
-	if (!instance->cpus) {
-		pr_err("Instance CPU set not allocated\n");
-		return -ENOMEM;
+	if (!mk_cpu_pool) {
+		mk_cpu_pool = mk_cpu_set_alloc();
+		if (!mk_cpu_pool)
+			return -ENOMEM;
 	}
 
-	mk_cpu_set_clear(instance->cpus);
+	mk_cpu_set_clear(mk_cpu_pool);
 
 	for (i = 0; i < cpu_count; i++) {
 		mk_phys_cpu_t cpu_id = fdt64_to_cpu(prop[i]);
-		int ret = mk_cpu_set_add(instance->cpus, cpu_id);
+		int ret = mk_cpu_set_add(mk_cpu_pool, cpu_id);
 
 		if (ret)
 			return ret;
 		pr_debug("Baseline CPU pool: added physical CPU %llu\n", cpu_id);
 	}
 
-	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
+	mk_cpu_set_format(buf, sizeof(buf), mk_cpu_pool);
 	pr_info("Baseline CPU pool: %d CPUs specified: %s\n", cpu_count, buf);
 
 	return 0;
@@ -167,7 +176,7 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 		return;
 
 	mk_instance_free_memory(instance);
-	mk_cpu_set_clear(instance->cpus);
+	mk_cpu_set_clear(mk_cpu_pool);
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
 		list_del(&pci_dev->list);
 		kfree(pci_dev);
@@ -183,14 +192,14 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	instance->platform_devices_valid = false;
 }
 
-static int mk_baseline_validate_cpus(const struct mk_instance *instance)
+static int mk_baseline_validate_cpus(void)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
 	int logical_cpu;
 	int validated = 0;
 
-	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0) {
 			pr_err("Baseline CPU %llu not found in system (not present)\n",
@@ -426,17 +435,17 @@ static int mk_baseline_validate_memory(const struct mk_instance *instance)
 	return 0;
 }
 
-static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
+static int mk_baseline_initialize_cpus(void)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
 	int logical_cpu;
 	int ret, failed = 0, offlined = 0;
-	unsigned int cpu_count = mk_cpu_set_count(instance->cpus);
+	unsigned int cpu_count = mk_cpu_set_count(mk_cpu_pool);
 
 	pr_info("Offlining %u CPUs for multikernel pool\n", cpu_count);
 
-	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0)
 			continue;
@@ -477,10 +486,13 @@ static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 
 	pr_info("Successfully offlined %d CPUs for multikernel pool\n", offlined);
 
-	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu > 0 && !cpu_online(logical_cpu))
 			set_cpu_present(logical_cpu, false);
+
+		/* Donated to the pool: this kernel no longer owns it */
+		mk_cpu_set_del(root_instance->cpus, phys_cpu_id);
 	}
 
 	return 0;
@@ -581,7 +593,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 
 	mk_baseline_clear_resources(root_instance);
 
-	ret = mk_baseline_parse_cpus(fdt, resources_node, root_instance);
+	ret = mk_baseline_parse_cpus(fdt, resources_node);
 	if (ret) {
 		pr_err("Failed to parse baseline CPUs: %d\n", ret);
 		return ret;
@@ -599,7 +611,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return ret;
 	}
 
-	ret = mk_baseline_validate_cpus(root_instance);
+	ret = mk_baseline_validate_cpus();
 	if (ret) {
 		pr_err("Baseline CPU validation failed: %d\n", ret);
 		return ret;
@@ -623,7 +635,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return ret;
 	}
 
-	ret = mk_baseline_initialize_cpus(root_instance);
+	ret = mk_baseline_initialize_cpus();
 	if (ret) {
 		pr_err("Baseline CPU initialization failed: %d\n", ret);
 		return ret;
