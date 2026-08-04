@@ -1054,11 +1054,15 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		 * instance's context. Bring it back to the host slot before
 		 * handing it to the pool, or a later spawn would try to wake
 		 * it through a context it no longer watches. No-op for a CPU
-		 * that never left the host slot.
+		 * that never left the host slot; on failure the CPU stays
+		 * with the instance rather than entering the pool unreachable.
 		 */
-		if (mk_repark_cpu_to_host(target_instance, cpu_id) < 0)
-			pr_warn("Multikernel hotplug: CPU %llu not reparked to host\n",
-				cpu_id);
+		ret = mk_repark_cpu_to_host(target_instance, cpu_id);
+		if (ret < 0) {
+			pr_err("Multikernel hotplug: CPU %llu not reparked to host: %d\n",
+			       cpu_id, ret);
+			goto out;
+		}
 
 		ret = mk_instance_return_cpus(target_instance, &cpus);
 		goto out;
@@ -1084,12 +1088,17 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	/*
 	 * The spawn kernel parked the CPU on its own context when it went
 	 * offline. Bring it back to the host slot so it can be spawned or
-	 * hot-added elsewhere.
+	 * hot-added elsewhere. If the CPU never claims the repark it still
+	 * watches the instance's context, so it must stay accounted to the
+	 * instance; released to the pool, a later spawn would target a CPU
+	 * that cannot hear the host slot.
 	 */
 	ret = mk_repark_cpu_to_host(target_instance, cpu_id);
-	if (ret < 0)
-		pr_warn("Multikernel hotplug: CPU %llu removed but not reparked to host: %d\n",
-			cpu_id, ret);
+	if (ret < 0) {
+		pr_err("Multikernel hotplug: CPU %llu offline in instance %d but not reparked to host: %d\n",
+		       cpu_id, instance_id, ret);
+		goto out;
+	}
 
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
 	if (!mk_cpu_pool || mk_cpu_set_add(mk_cpu_pool, cpu_id))

@@ -906,7 +906,21 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		 * The arch reparks CPUs still watching this instance's
 		 * context back to the host slot before the block goes away.
 		 */
-		mk_arch_release_instance(instance);
+		if (mk_arch_release_instance(instance)) {
+			/*
+			 * A CPU never claimed its repark: it is still parked
+			 * on this instance's context, executing from the park
+			 * page inside this pool. Handing the memory back
+			 * would let the next instance overwrite code a CPU is
+			 * running, so leak the whole pool instead.
+			 */
+			pr_err("Instance %d (%s): leaking its %zu byte pool, a lost CPU still parks in it\n",
+			       instance->id, instance->name,
+			       instance->pool_size);
+			instance->instance_pool = NULL;
+			instance->pool_size = 0;
+			return;
+		}
 
 		if (instance->ctrl_va) {
 			mk_instance_free(instance, instance->ctrl_va,

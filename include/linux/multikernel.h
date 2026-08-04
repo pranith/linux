@@ -1001,7 +1001,7 @@ int mk_setup_host_park(void);
 struct kimage;
 int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu);
-void mk_arch_release_instance(struct mk_instance *instance);
+int mk_arch_release_instance(struct mk_instance *instance);
 
 /* Verify one of an instance's CPUs has reached its park loop */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
