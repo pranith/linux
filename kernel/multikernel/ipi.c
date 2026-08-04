@@ -20,6 +20,43 @@ static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lo
 
 static void mk_ipi_drain_ring(void);
 
+/*
+ * Ring indices live in memory another kernel instance can write, so every
+ * read is masked before it indexes the entry array. An instance that dies
+ * mid-update must not be able to walk this kernel off the end of its ring.
+ */
+static inline unsigned int mk_ring_idx(unsigned int i)
+{
+	return i & (MK_IPI_RING_SIZE - 1);
+}
+
+/**
+ * mk_ipi_ring_drop_pending - Discard everything queued in this kernel's ring
+ *
+ * Called when an instance is re-spawned. A halting instance parks its CPUs
+ * wherever they were, including between claiming a ring slot and publishing
+ * it, and the drain stops at such a slot forever. Anything still queued was
+ * sent by a kernel that is gone, so drop it all rather than let one
+ * abandoned slot wedge the ring.
+ */
+void mk_ipi_ring_drop_pending(void)
+{
+	struct mk_ipi_ring *ring;
+	unsigned int head, tail;
+
+	if (!root_instance || !root_instance->ipi_data)
+		return;
+
+	ring = &root_instance->ipi_data->ring;
+	head = mk_ring_idx(atomic_read(&ring->head));
+
+	for (tail = mk_ring_idx(atomic_read(&ring->tail)); tail != head;
+	     tail = mk_ring_idx(tail + 1))
+		ring->entries[tail].data_size = 0;
+
+	atomic_set(&ring->tail, head);
+}
+
 /**
  * multikernel_register_handler - Register a callback for multikernel IPI
  * @callback: Function to call when IPI is received
@@ -134,14 +171,20 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 	/* Try to enqueue the message in the ring buffer */
 	do {
-		head = atomic_read(&instance->ipi_data->ring.head);
-		next_head = (head + 1) % MK_IPI_RING_SIZE;
-		tail = atomic_read(&instance->ipi_data->ring.tail);
+		head = mk_ring_idx(atomic_read(&instance->ipi_data->ring.head));
+		next_head = mk_ring_idx(head + 1);
+		tail = mk_ring_idx(atomic_read(&instance->ipi_data->ring.tail));
 
 		/* Check if ring buffer is full */
 		if (next_head == tail) {
-			pr_warn("IPI ring buffer full for instance %d (head=%u, tail=%u)\n",
-				instance_id, head, tail);
+			/*
+			 * Console output reaches this path, so a plain printk
+			 * here re-enters the console write that called us and
+			 * deadlocks on its lock with interrupts already off.
+			 */
+			printk_deferred(KERN_WARNING
+					"multikernel: IPI ring full for instance %d (head=%u, tail=%u)\n",
+					instance_id, head, tail);
 			mk_instance_put(instance);
 			return -ENOSPC;
 		}
@@ -184,8 +227,8 @@ static void mk_ipi_drain_ring(void)
 		return;
 
 	while (1) {
-		tail = atomic_read(&root_instance->ipi_data->ring.tail);
-		head = atomic_read(&root_instance->ipi_data->ring.head);
+		tail = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.tail));
+		head = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.head));
 
 		if (tail == head)
 			break;
@@ -198,6 +241,10 @@ static void mk_ipi_drain_ring(void)
 		 * finished writing it. Leave it alone: skipping it would
 		 * drop the message it is about to publish. Its own IPI, or
 		 * the next one, brings us back here.
+		 *
+		 * A sender stopped before publishing leaves its slot zero
+		 * forever; mk_ipi_ring_drop_pending() clears those out when
+		 * the instance is re-spawned.
 		 */
 		data_size = smp_load_acquire(&slot->data_size);
 		if (data_size == 0)
@@ -207,7 +254,7 @@ static void mk_ipi_drain_ring(void)
 			pr_warn_once("Multikernel IPI slot %u has bad size %zu\n",
 				     tail, data_size);
 			slot->data_size = 0;
-			next_tail = (tail + 1) % MK_IPI_RING_SIZE;
+			next_tail = mk_ring_idx(tail + 1);
 			atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
 			continue;
 		}
@@ -229,7 +276,7 @@ static void mk_ipi_drain_ring(void)
 advance_tail:
 		/* Mark consumed so the slot reads as unpublished again */
 		slot->data_size = 0;
-		next_tail = (tail + 1) % MK_IPI_RING_SIZE;
+		next_tail = mk_ring_idx(tail + 1);
 		atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
 		messages_processed++;
 
@@ -285,16 +332,23 @@ bool mk_has_pending_shutdown(void)
 	struct mk_ipi_data *slot;
 	struct mk_message *msg;
 	struct mk_shutdown_payload *payload;
-	unsigned int head, tail, idx;
+	unsigned int head, tail, idx, scanned;
 
 	if (!root_instance || !root_instance->ipi_data)
 		return false;
 
-	tail = atomic_read(&root_instance->ipi_data->ring.tail);
-	head = atomic_read(&root_instance->ipi_data->ring.head);
+	tail = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.tail));
+	head = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.head));
 
-	/* Scan all pending messages (without consuming) */
-	for (idx = tail; idx != head; idx = (idx + 1) % MK_IPI_RING_SIZE) {
+	/*
+	 * Scan pending messages without consuming them. The trip count is
+	 * bounded by the ring size rather than by the indices alone: this
+	 * runs in NMI context, where a never-terminating loop takes the CPU
+	 * out permanently with NMIs latched.
+	 */
+	for (scanned = 0, idx = tail;
+	     idx != head && scanned < MK_IPI_RING_SIZE;
+	     idx = mk_ring_idx(idx + 1), scanned++) {
 		slot = &root_instance->ipi_data->ring.entries[idx];
 
 		if (slot->data_size < sizeof(struct mk_message))

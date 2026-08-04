@@ -619,6 +619,14 @@ void kimage_free(struct kimage *image)
 		kimage_file_post_load_cleanup(image);
 
 		if (image->mk_instance) {
+			/*
+			 * The ring is freed below. Drop the instance's pointer
+			 * to it first, or the next message sent to this
+			 * instance lands in pages the allocator has already
+			 * handed to someone else.
+			 */
+			image->mk_instance->ipi_data = NULL;
+			image->mk_instance->ipi_phys = 0;
 			image->mk_instance->kimage = NULL;
 			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
 			mk_instance_put(image->mk_instance);
@@ -1776,6 +1784,14 @@ int multikernel_kexec_by_id(int mk_id)
 	 */
 	if (instance->ipi_data)
 		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+
+	/*
+	 * Same for the other direction: whatever the halted instance left
+	 * queued for us is addressed from a kernel that no longer exists,
+	 * and a slot it claimed but never published stalls our ring for
+	 * good.
+	 */
+	mk_ipi_ring_drop_pending();
 
 	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
 	if (rc == 0) {
