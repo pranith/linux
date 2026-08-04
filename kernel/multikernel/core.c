@@ -1158,12 +1158,13 @@ struct mk_shutdown_work {
 
 
 /*
- * Send the shutdown ACK to @target_id while messaging still works, then
- * park every CPU in the pool wait loop. Common tail of host-requested
- * shutdown and self-initiated halt: the host treats the ACK as "this
- * instance's CPUs are back in the pool" and marks it re-spawnable.
+ * Notify @target_id that this kernel is going down, while messaging
+ * still works, then park every CPU in the pool wait loop. The subtype
+ * distinguishes a reply to a host-requested shutdown (SHUTDOWN_ACK)
+ * from a voluntary halt the parent never asked for (HALTED); both mean
+ * "my CPUs are about to park on my context".
  */
-static void __noreturn mk_shutdown_ack_and_park(int target_id)
+static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 {
 	struct mk_resource_ack ack;
 
@@ -1171,8 +1172,7 @@ static void __noreturn mk_shutdown_ack_and_park(int target_id)
 	ack.result = 0;
 	ack.resource_id = root_instance->id;
 
-	mk_send_message(target_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN_ACK,
-			&ack, sizeof(ack));
+	mk_send_message(target_id, MK_MSG_SYSTEM, subtype, &ack, sizeof(ack));
 
 	pr_info("Multikernel instance %d shutting down\n", root_instance->id);
 
@@ -1189,14 +1189,15 @@ static void __noreturn mk_shutdown_ack_and_park(int target_id)
 /**
  * mk_halt_to_pool - Halt this spawn kernel, returning its CPUs to the pool
  *
- * Called from the spawn kernel's machine halt path. Notifies the host
- * (instance 0) with the same shutdown ACK used for host-requested
- * shutdown, so the host marks the instance re-spawnable, then parks
- * every CPU in the pool wait loop.
+ * Called from the spawn kernel's machine halt path. A voluntary exit
+ * cannot stay contained in this kernel: the parent owns the instance's
+ * lifecycle, and without notice it would consider the instance running
+ * forever. Send the parent (instance 0) a HALTED event, then park every
+ * CPU in the pool wait loop.
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	mk_shutdown_ack_and_park(0);
+	mk_notify_down_and_park(0, MK_SYS_HALTED);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)
@@ -1205,25 +1206,37 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	int sender_instance_id = sw->sender_instance_id;
 
 	kfree(sw);
-	mk_shutdown_ack_and_park(sender_instance_id);
+	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK);
 }
 
-struct mk_shutdown_ack_work {
+/*
+ * Mark a halted instance re-spawnable. No wakeups are published here:
+ * the instance's CPUs may still be on their way to the park loop, and
+ * poking its context while its (old or next) kernel also publishes on
+ * it corrupts the single-producer mailbox. The kexec path confirms the
+ * CPUs are parked before it rewrites the image.
+ */
+static void mk_instance_settle_halted(struct mk_instance *instance)
+{
+	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
+		instance->id, instance->name);
+	mk_instance_set_state(instance, MK_STATE_LOADED);
+}
+
+struct mk_halted_work {
 	struct work_struct work;
 	int instance_id;
 };
 
-static void mk_shutdown_ack_work_fn(struct work_struct *work)
+static void mk_halted_work_fn(struct work_struct *work)
 {
-	struct mk_shutdown_ack_work *aw =
-		container_of(work, struct mk_shutdown_ack_work, work);
+	struct mk_halted_work *aw =
+		container_of(work, struct mk_halted_work, work);
 	struct mk_instance *instance;
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		pr_info("Instance %d (%s) halted, CPUs parked in pool\n",
-			instance->id, instance->name);
-		mk_instance_set_state(instance, MK_STATE_LOADED);
+		mk_instance_settle_halted(instance);
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1261,28 +1274,37 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 	}
 	case MK_SYS_SHUTDOWN_ACK: {
 		struct mk_resource_ack *ack = payload;
-		struct mk_shutdown_ack_work *aw;
 
 		if (payload_len < sizeof(*ack))
 			return;
+		/*
+		 * Reply to a shutdown this kernel requested: wake the
+		 * requester, which waits for the instance's CPUs to park
+		 * and settles its state itself.
+		 */
 		mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
 					ack->resource_id, ack->result);
+		break;
+	}
+	case MK_SYS_HALTED: {
+		struct mk_resource_ack *ack = payload;
+		struct mk_halted_work *aw;
+
+		if (payload_len < sizeof(*ack))
+			return;
 
 		/*
-		 * A successful ACK means the instance's CPUs are parked in
-		 * the pool, whether we requested the shutdown or the
-		 * instance halted itself. Mark it re-spawnable; deferred to
-		 * a workqueue because instance lookup takes a mutex and we
-		 * are in IPI context here.
+		 * The instance halted itself; nobody is waiting on it, so
+		 * settle its state from here. Deferred to a workqueue
+		 * because instance lookup takes a mutex and the CPUs still
+		 * need time to reach the park loop, while this runs in IPI
+		 * context.
 		 */
-		if (ack->result != 0)
-			break;
-
 		aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
 		if (!aw)
 			break;
 
-		INIT_WORK(&aw->work, mk_shutdown_ack_work_fn);
+		INIT_WORK(&aw->work, mk_halted_work_fn);
 		aw->instance_id = ack->resource_id;
 		schedule_work(&aw->work);
 		break;
@@ -1338,12 +1360,6 @@ int multikernel_halt_by_id(int mk_id)
 
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
-		/*
-		 * The ACK only says the instance began shutting down. Wait
-		 * for its CPUs to reach the park loop before reporting it
-		 * down, so a prompt re-spawn does not rewrite the image
-		 * they are still running.
-		 */
 		if (mk_instance_confirm_parked(instance))
 			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
 				mk_id);
@@ -1413,7 +1429,12 @@ int multikernel_force_halt_by_id(int mk_id)
 
 	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
 
-	mk_instance_set_state(instance, MK_STATE_LOADED);
+	/*
+	 * The NMI handler parks each CPU on the instance's context. Wait
+	 * for them to arrive before reporting the instance re-spawnable,
+	 * exactly as the graceful path does after its shutdown ACK.
+	 */
+	mk_instance_settle_halted(instance);
 	mk_instance_put(instance);
 	return 0;
 }

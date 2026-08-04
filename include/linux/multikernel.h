@@ -172,6 +172,7 @@ void generic_multikernel_interrupt(void);
 #define MK_SYS_HEARTBEAT    (MK_MSG_SYSTEM + 1)
 #define MK_SYS_SHUTDOWN     (MK_MSG_SYSTEM + 2)
 #define MK_SYS_SHUTDOWN_ACK (MK_MSG_SYSTEM + 3)
+#define MK_SYS_HALTED       (MK_MSG_SYSTEM + 4)  /* Voluntary halt notification */
 
 /* Network/vsock subtypes */
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
