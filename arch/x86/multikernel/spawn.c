@@ -21,6 +21,8 @@
 #include <linux/kernel.h>
 #include <linux/compiler.h>
 #include <linux/iopoll.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/smp.h>
 #include <linux/cpu.h>
 #include <linux/mm.h>
@@ -44,6 +46,7 @@
 #include <asm/irqflags.h>
 #include <asm/processor-flags.h>
 #include <asm/processor.h>
+#include <asm/tsc.h>
 #include <asm/apic.h>
 #include <asm/bootparam.h>
 #include <asm/reboot.h>
@@ -472,6 +475,14 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			     (unsigned long)instance->trampoline_va,
 			     virt_to_phys(instance->trampoline_va),
 			     park_phys);
+	instance->spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
+	if (!instance->spawn_ctx->boot_lps)
+		instance->spawn_ctx->boot_lps = loops_per_jiffy;
+	instance->spawn_ctx->boot_lps *= HZ;
+	instance->spawn_ctx->boot_cpu_khz = cpu_khz;
+	instance->spawn_ctx->boot_tsc_khz = tsc_khz;
+	instance->spawn_ctx->boot_apic_hz =
+		(unsigned long)lapic_timer_period * HZ;
 
 	return mk_spawn_cpu(instance, cpu, instance->spawn_ctx);
 }
@@ -730,6 +741,17 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 	}
 
 	mk_boot_context = ctx;
+	/*
+	 * A spawn kernel cannot calibrate against legacy timers because they
+	 * belong to the host. Reuse the selected physical CPU's delay and local
+	 * APIC timer calibration, while keeping explicit command-line values
+	 * authoritative.
+	 */
+	if (!preset_lpj && ctx->boot_lps)
+		preset_lpj = DIV_ROUND_CLOSEST_ULL(ctx->boot_lps, HZ);
+	if (!lapic_timer_period && ctx->boot_apic_hz)
+		lapic_timer_period =
+			DIV_ROUND_CLOSEST_ULL(ctx->boot_apic_hz, HZ);
 
 	/*
 	 * The host's control area (this context, the trampoline and park
