@@ -106,6 +106,9 @@ extern char mk_pool_park_end[];
  */
 void mk_park_cpu(void);
 
+/* True only in a spawn kernel whose boot context carries a park area */
+bool mk_cpu_parkable(void);
+
 /* Park an offlined pool CPU (host park area, or instance context) */
 void mk_pool_park_cpu(void);
 

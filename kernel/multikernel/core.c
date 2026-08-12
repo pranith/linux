@@ -1154,7 +1154,7 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
  * 1. Graceful shutdown (MK_SYS_SHUTDOWN via MULTIKERNEL_VECTOR):
  *    - Host sends shutdown message to spawn kernel
  *    - Spawn kernel receives message, sends ACK while still able to communicate
- *    - Spawn kernel uses native_stop_other_cpus() to stop all its CPUs
+ *    - Spawn kernel parks all its CPUs in the pool wait loop
  *    - Works when spawn kernel is responsive
  *
  * 2. Forcible shutdown (NMI-based, multikernel_force_halt_by_id):

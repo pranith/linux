@@ -1409,6 +1409,14 @@ void mk_pool_park_cpu(void)
  * are host-owned and survive re-loads of this instance, unlike the
  * kernel image this code is running from.
  */
+/* True only in a spawn kernel whose boot context carries a park area */
+bool mk_cpu_parkable(void)
+{
+	struct mk_spawn_context *ctx = mk_boot_context;
+
+	return ctx && ctx->park_phys && ctx->park_cr3;
+}
+
 void mk_park_cpu(void)
 {
 	struct mk_spawn_context *ctx = mk_boot_context;
@@ -1515,6 +1523,18 @@ static void __noreturn mk_machine_restart(char *cmd)
 	mk_machine_halt();
 }
 
+/*
+ * stop_this_cpu() is where REBOOT_VECTOR, the smp_stop NMI and panic's
+ * smp_send_stop() put a CPU on the way down. Its native tail marks the
+ * CPU offline and dead-halts it inside this kernel's image: from then
+ * on even the host's force-halt NMI is discarded on entry, the CPU is
+ * unreachable, and the instance can never be re-spawned. Park instead.
+ */
+static void __noreturn mk_stop_this_cpu(void)
+{
+	mk_enter_pool_state(NULL);
+}
+
 static int __init mk_spawn_reboot_init(void)
 {
 	if (!mk_boot_context)
@@ -1524,6 +1544,16 @@ static int __init mk_spawn_reboot_init(void)
 	machine_ops.power_off = mk_machine_halt;
 	machine_ops.restart = mk_machine_restart;
 	machine_ops.emergency_restart = mk_machine_halt;
+	smp_ops.stop_this_cpu = mk_stop_this_cpu;
+
+	/*
+	 * A panicked spawn kernel spinning in the panic loop holds its
+	 * CPUs hostage. "Reboot on panic" is mk_machine_halt here, which
+	 * notifies the host and parks, so make it the default; the panic
+	 * output has already been flushed to the console by then.
+	 */
+	if (!panic_timeout)
+		panic_timeout = -1;
 	return 0;
 }
 core_initcall(mk_spawn_reboot_init);

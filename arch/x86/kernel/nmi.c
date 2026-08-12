@@ -25,6 +25,7 @@
 #include <linux/atomic.h>
 #include <linux/sched/clock.h>
 #include <linux/kvm_types.h>
+#include <linux/multikernel.h>
 
 #include <asm/cpu_entry_area.h>
 #include <asm/traps.h>
@@ -549,6 +550,7 @@ DEFINE_IDTENTRY_RAW(exc_nmi)
 	if (arch_cpu_is_offline(smp_processor_id())) {
 		if (microcode_nmi_handler_enabled())
 			microcode_offline_nmi_handler();
+		mk_nmi_offline_park();
 		return;
 	}
 
@@ -712,6 +714,7 @@ DEFINE_FREDENTRY_NMI(exc_nmi)
 	if (arch_cpu_is_offline(smp_processor_id())) {
 		if (microcode_nmi_handler_enabled())
 			microcode_offline_nmi_handler();
+		mk_nmi_offline_park();
 		return;
 	}
 

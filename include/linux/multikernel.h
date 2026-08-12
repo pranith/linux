@@ -752,6 +752,7 @@ int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
 bool mk_has_pending_shutdown(void);
+void mk_nmi_offline_park(void);
 
 /* Instance lookup and reference counting */
 struct mk_instance *mk_instance_find(int mk_id);
@@ -791,6 +792,9 @@ static inline int multikernel_force_halt_by_id(int mk_id)
 static inline bool cpu_is_multikernel_pool(unsigned int cpu)
 {
 	return false;
+}
+static inline void mk_nmi_offline_park(void)
+{
 }
 static inline struct mk_instance *mk_instance_find(int mk_id)
 {

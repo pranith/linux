@@ -388,6 +388,23 @@ static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 	return NMI_HANDLED; /* unreachable */
 }
 
+/*
+ * Called from the NMI entry's offline bail-out, where the handler chain
+ * (and so mk_stop_nmi_callback()) never runs. A spawn CPU that went down
+ * through a pre-multikernel path sits offline in a HLT loop inside an
+ * image the host wants to reuse; honor a pending force halt by parking
+ * it in the pool like every other stopped CPU.
+ */
+void noinstr mk_nmi_offline_park(void)
+{
+	instrumentation_begin();
+	if (mk_cpu_parkable() && mk_has_pending_shutdown()) {
+		cpu_emergency_disable_virtualization();
+		mk_enter_pool_state(NULL);
+	}
+	instrumentation_end();
+}
+
 static bool mk_nmi_handler_registered;
 
 /**

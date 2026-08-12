@@ -221,9 +221,9 @@ SYM_CODE_END(mk_secondary_identity)
  * struct mk_spawn_context offsets are a cross-kernel ABI, so this code
  * works no matter which kernel binary parked the CPU.
  *
- * A stray NMI or MCE while parked still goes through the dead kernel's
- * IDT and can bring the machine down; local LVT sources are masked
- * before entry, and a park-local IDT/GDT is a possible follow-up.
+ * Local LVT sources are masked before entry, and a park-local GDT/IDT
+ * is installed so a stray exception stops only this CPU (mk_park_fault)
+ * while an NMI resumes the wait loop (mk_park_nmi).
  *
  * Args: %rdi=park_cr3, %rsi=ctx_phys, %rdx=apic_id, %rcx=park_phys,
  *       %r8=mwait_usable
@@ -304,6 +304,16 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	addq	$16, %rdi
 	decl	%ecx
 	jnz	1b
+
+	/* Vector 2: NMIs resume the wait loop instead of stopping the CPU */
+	leaq	mk_park_nmi - mk_pool_park(%rbx), %rax
+	leaq	mk_park_idt_entries + 2*16 - mk_pool_park(%rbx), %rdi
+	movw	%ax, (%rdi)
+	movq	%rax, %rdx
+	shrq	$16, %rdx
+	movw	%dx, 6(%rdi)
+	shrq	$16, %rdx
+	movl	%edx, 8(%rdi)
 
 	leaq	mk_park_idt_entries - mk_pool_park(%rbx), %rax
 	leaq	mk_park_idt - mk_pool_park(%rbx), %rdx
@@ -449,6 +459,17 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_fault)
 3:	hlt
 	jmp	3b
 SYM_CODE_END(mk_park_fault)
+
+/*
+ * NMI must not stop a parked CPU: the host's force halt NMIs every CPU
+ * of an instance without knowing which are already parked. Return into
+ * the wait loop; an mwait cut short just rechecks the slot and re-arms.
+ */
+SYM_CODE_START_LOCAL_NOALIGN(mk_park_nmi)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+	iretq
+SYM_CODE_END(mk_park_nmi)
 
 
 
