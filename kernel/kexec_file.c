@@ -280,8 +280,17 @@ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
 				  image->cmdline_buf_len - 1);
 	}
 
-	/* IMA needs to pass the measurement list to the next kernel. */
-	ima_add_kexec_buffer(image);
+	/*
+	 * IMA needs to pass the measurement list to the next kernel.
+	 *
+	 * A spawn kernel is not a successor of this one: it does not inherit
+	 * the host's TPM state and never consumes the list. IMA reserves that
+	 * segment without a source buffer and fills it from a reboot notifier,
+	 * so leaving it in place would also hand the re-spawn path a segment
+	 * it cannot re-copy.
+	 */
+	if (image->type != KEXEC_TYPE_MULTIKERNEL)
+		ima_add_kexec_buffer(image);
 
 	/* If KHO is active, add its images to the list */
 	ret = kho_fill_kimage(image);
