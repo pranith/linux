@@ -93,6 +93,14 @@ struct mk_ipi_ring {
 /* Shared memory structures - per-instance design */
 struct mk_shared_data {
 	struct mk_ipi_ring ring;  /* IPI message ring buffer */
+	/*
+	 * Force-halt marker, host-owned. Armed before the host NMIs the
+	 * instance's CPUs and cleared with the rest of this struct when
+	 * the instance is re-executed, so it cannot be consumed early the
+	 * way a ring message can, and a repeated force halt still reaches
+	 * CPUs the first one missed.
+	 */
+	u32 force_halt;
 };
 
 /* Function pointer type for IPI callbacks */
@@ -266,7 +274,6 @@ struct mk_shutdown_payload {
 };
 
 #define MK_SHUTDOWN_GRACEFUL  0x01
-#define MK_SHUTDOWN_IMMEDIATE 0x02
 
 /**
  * Message handler callback type

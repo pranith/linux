@@ -117,6 +117,53 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 }
 EXPORT_SYMBOL(multikernel_unregister_handler);
 
+/*
+ * An instance's IPI area is allocated when its image is loaded; the
+ * instance pointer is filled in lazily on first use.
+ */
+static struct mk_shared_data *mk_instance_ipi_area(struct mk_instance *instance)
+{
+	struct mk_shared_data *ipi_data;
+
+	if (instance->ipi_data)
+		return instance->ipi_data;
+
+	if (!instance->kimage || !instance->kimage->mk_ipi)
+		return NULL;
+
+	ipi_data = phys_to_virt(instance->kimage->mk_ipi);
+	if (cmpxchg(&instance->ipi_data, NULL, ipi_data) == NULL)
+		pr_info("Initialized IPI ring buffer for instance %d: phys=0x%llx\n",
+			instance->id, (unsigned long long)instance->kimage->mk_ipi);
+
+	return instance->ipi_data;
+}
+
+/**
+ * mk_arm_force_halt - Post the force-halt marker for an instance
+ * @instance: Instance about to be NMIed
+ *
+ * The instance's CPUs test the marker from their NMI handlers, so it
+ * must be armed before the NMIs are sent. It stays armed until the
+ * kexec path has confirmed every CPU parked and wipes the shared area
+ * for the next run, which is what makes the NMI rescue idempotent: a
+ * repeat force halt still reaches CPUs an earlier one missed.
+ *
+ * Returns 0 on success, -ENODEV if the instance has no shared IPI area.
+ */
+int mk_arm_force_halt(struct mk_instance *instance)
+{
+	struct mk_shared_data *ipi_data = mk_instance_ipi_area(instance);
+
+	if (!ipi_data)
+		return -ENODEV;
+
+	WRITE_ONCE(ipi_data->force_halt, 1);
+	/* The marker must be visible before the NMIs that test it */
+	smp_wmb();
+	return 0;
+}
+
 /**
  * multikernel_send_ipi_data - Send data to another CPU via IPI
  * @instance_id: Target multikernel instance ID
@@ -150,20 +197,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		return -ENODEV;
 	}
 
-	if (!instance->ipi_data) {
-		struct mk_shared_data *ipi_data = NULL;
-
-		if (instance->kimage && instance->kimage->mk_ipi)
-			ipi_data = phys_to_virt(instance->kimage->mk_ipi);
-
-		if (ipi_data && cmpxchg(&instance->ipi_data, NULL, ipi_data) == NULL) {
-			pr_info("Initialized IPI ring buffer for instance %d: phys=0x%llx, virt=%px\n",
-				instance->id, (unsigned long long)instance->kimage->mk_ipi,
-				ipi_data);
-		}
-	}
-
-	if (!instance->ipi_data) {
+	if (!mk_instance_ipi_area(instance)) {
 		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
 		mk_instance_put(instance);
 		return -ENODEV;
@@ -318,52 +352,24 @@ void generic_multikernel_interrupt(void)
 }
 
 /**
- * mk_has_pending_shutdown - Check if there's a pending shutdown message
+ * mk_has_pending_shutdown - Check if the host demanded a forcible shutdown
  *
- * Peeks at the IPI ring buffer to check for a MK_SYS_SHUTDOWN message
- * with MK_SHUTDOWN_IMMEDIATE flag. Used by NMI handler for force halt.
+ * Tests the force-halt marker the host arms before NMIing this kernel's
+ * CPUs. The marker used to be a message peeked in the IPI ring, but a
+ * ring message is consumed by the doorbell interrupt: on a responsive
+ * kernel the ordinary message path could eat it before the NMIs landed,
+ * and every NMI then found nothing to act on. The marker is host-owned
+ * and stays up until the host has confirmed all CPUs parked, so it
+ * gives the same answer no matter when each NMI arrives.
  *
- * Safe to call from NMI context (no locks, read-only peek).
+ * Safe to call from NMI context (a single read of shared memory).
  *
  * Returns: true if shutdown requested, false otherwise
  */
 bool mk_has_pending_shutdown(void)
 {
-	struct mk_ipi_data *slot;
-	struct mk_message *msg;
-	struct mk_shutdown_payload *payload;
-	unsigned int head, tail, idx, scanned;
-
 	if (!root_instance || !root_instance->ipi_data)
 		return false;
 
-	tail = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.tail));
-	head = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.head));
-
-	/*
-	 * Scan pending messages without consuming them. The trip count is
-	 * bounded by the ring size rather than by the indices alone: this
-	 * runs in NMI context, where a never-terminating loop takes the CPU
-	 * out permanently with NMIs latched.
-	 */
-	for (scanned = 0, idx = tail;
-	     idx != head && scanned < MK_IPI_RING_SIZE;
-	     idx = mk_ring_idx(idx + 1), scanned++) {
-		slot = &root_instance->ipi_data->ring.entries[idx];
-
-		if (slot->data_size < sizeof(struct mk_message))
-			continue;
-
-		msg = (struct mk_message *)slot->buffer;
-		if (msg->msg_type != MK_MSG_SYSTEM || msg->msg_subtype != MK_SYS_SHUTDOWN)
-			continue;
-
-		if (msg->payload_len >= sizeof(struct mk_shutdown_payload)) {
-			payload = (struct mk_shutdown_payload *)msg->payload;
-			if (payload->flags & MK_SHUTDOWN_IMMEDIATE)
-				return true;
-		}
-	}
-
-	return false;
+	return READ_ONCE(root_instance->ipi_data->force_halt);
 }

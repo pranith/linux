@@ -25,6 +25,9 @@ int mk_overlay_init(void);
 void mk_overlay_exit(void);
 int mk_overlay_rmdir(struct kernfs_node *kn);
 
+/* ipi.c */
+int mk_arm_force_halt(struct mk_instance *instance);
+
 /* hotplug.c */
 int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);

@@ -1390,19 +1390,26 @@ int multikernel_halt_by_id(int mk_id)
  * multikernel_force_halt_by_id - Forcible shutdown of a multikernel instance via NMI
  * @mk_id: Instance ID to halt
  *
- * Forces a spawn kernel's CPUs to stop by queuing a shutdown message in the
- * IPI ring buffer and sending NMIs directly to each CPU. The NMI handler
- * checks for the pending shutdown message and stops if found.
+ * Forces a spawn kernel's CPUs to stop by arming the force-halt marker
+ * in the instance's shared IPI area and sending NMIs directly to each
+ * CPU. The NMI handler tests the marker and parks the CPU in the pool.
+ *
+ * No message is queued and no doorbell is rung: a ring message is
+ * consumed by the instance's ordinary interrupt path, which on a
+ * responsive kernel races the NMIs for it and can leave them with
+ * nothing to act on. The marker is host-owned and survives until the
+ * instance is re-executed, so the NMIs act on it regardless of timing.
  *
  * Use when: The spawn kernel is stuck/crashed and not responding to graceful
- * shutdown, or when graceful shutdown has failed.
+ * shutdown, or when graceful shutdown has failed. May be repeated: an
+ * already-halted instance absorbs the NMIs in the park loop, so a rerun
+ * only rescues CPUs an earlier halt missed.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int multikernel_force_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
-	struct mk_shutdown_payload payload;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int cpu_count = 0;
@@ -1412,8 +1419,15 @@ int multikernel_force_halt_by_id(int mk_id)
 	if (!instance)
 		return -ENOENT;
 
-	if (instance->state != MK_STATE_ACTIVE) {
-		pr_err("Instance %d not active (state=%d), nothing to force halt\n",
+	/*
+	 * LOADED is allowed for the retry case: a previous halt already
+	 * settled the state, but a CPU that missed its NMI is still
+	 * running the old image and kexec refuses to reload it. Without
+	 * a rerun the instance is stuck for good.
+	 */
+	if (instance->state != MK_STATE_ACTIVE &&
+	    instance->state != MK_STATE_LOADED) {
+		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
 			mk_id, instance->state);
 		mk_instance_put(instance);
 		return -EINVAL;
@@ -1427,13 +1441,9 @@ int multikernel_force_halt_by_id(int mk_id)
 
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
 
-	/* Queue shutdown message - NMI handler will check for this */
-	payload.flags = MK_SHUTDOWN_IMMEDIATE;
-	payload.sender_instance_id = root_instance->id;
-	ret = mk_send_message(mk_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-			      &payload, sizeof(payload));
-	if (ret < 0)
-		pr_err("Failed to queue shutdown message: %d (sending NMI anyway)\n", ret);
+	ret = mk_arm_force_halt(instance);
+	if (ret)
+		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
 
 	/* Send NMI to each CPU in the instance */
 	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
