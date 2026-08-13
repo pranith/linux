@@ -307,52 +307,6 @@ static int vmlinux_probe(const char *buf, unsigned long len)
 }
 
 /*
- * Setup e820 memory map for multikernel spawn kernel
- */
-static int setup_e820_entries_multikernel(struct kimage *image, struct boot_params *params)
-{
-	struct mk_instance *instance = image->mk_instance;
-	struct mk_memory_region *region;
-	unsigned int nr_e820_entries = 0;
-	int i;
-
-	/*
-	 * Only include the assigned memory pool regions for multikernel spawn.
-	 * Don't include first 1MB - multikernel doesn't use real-mode trampoline
-	 * and including unmapped low memory causes sparse_init() to fail.
-	 *
-	 * The spawn kernel uses e820__memory_setup_multikernel() which accepts
-	 * any number of entries without fallback to legacy BIOS memory probing.
-	 */
-	if (instance && !list_empty(&instance->memory_regions)) {
-		list_for_each_entry(region, &instance->memory_regions, list) {
-			if (nr_e820_entries >= E820_MAX_ENTRIES_ZEROPAGE) {
-				pr_warn("Too many e820 entries, truncating\n");
-				break;
-			}
-
-			params->e820_table[nr_e820_entries].addr = region->res.start;
-			params->e820_table[nr_e820_entries].size = resource_size(&region->res);
-			params->e820_table[nr_e820_entries].type = E820_TYPE_RAM;
-			nr_e820_entries++;
-		}
-	}
-
-	params->e820_entries = nr_e820_entries;
-
-	pr_info("Final multikernel e820 map has %d total entries:\n",
-		nr_e820_entries);
-	for (i = 0; i < nr_e820_entries; i++) {
-		pr_info("  e820[%d]: 0x%llx-0x%llx type=%d\n", i,
-			params->e820_table[i].addr,
-			params->e820_table[i].addr + params->e820_table[i].size,
-			params->e820_table[i].type);
-	}
-
-	return 0;
-}
-
-/*
  * Load function - load ELF vmlinux and setup boot parameters
  */
 static void *vmlinux_load(struct kimage *image, char *kernel,
@@ -606,7 +560,7 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 
 	/* For multikernel, setup custom e820 map */
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		ret = setup_e820_entries_multikernel(image, params);
+		ret = mk_e820_fill(image->mk_instance, params);
 		if (ret) {
 			kvfree(ldata->kernel_buf);
 			kfree(ldata);

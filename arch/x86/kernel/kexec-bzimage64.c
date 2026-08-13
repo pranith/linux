@@ -125,63 +125,6 @@ static int setup_e820_entries(struct boot_params *params)
 	return 0;
 }
 
-static int setup_e820_entries_multikernel(struct kimage *image, struct boot_params *params)
-{
-	struct mk_instance *instance = image->mk_instance;
-	struct mk_memory_region *region;
-	unsigned int nr_e820_entries = 0;
-
-	/*
-	 * Don't include first 1MB in e820 for multikernel spawn kernels.
-	 * Multikernel doesn't use real-mode trampoline (init_trampoline is
-	 * skipped), and including unmapped low memory causes sparse_init()
-	 * to fail when trying to populate vmemmap for those sections.
-	 * Only include the assigned memory pool regions.
-	 *
-	 * However, we need at least 2 e820 entries or the kernel's
-	 * append_e820_table() will reject our map and fall back to
-	 * creating a fake memory map that includes low memory.
-	 * Add a small reserved region at 0x0 as a dummy entry.
-	 */
-	params->e820_table[nr_e820_entries].addr = 0;
-	params->e820_table[nr_e820_entries].size = 0x1000;
-	params->e820_table[nr_e820_entries].type = E820_TYPE_RESERVED;
-	nr_e820_entries++;
-
-	if (instance && !list_empty(&instance->memory_regions)) {
-		list_for_each_entry(region, &instance->memory_regions, list) {
-			if (nr_e820_entries >= E820_MAX_ENTRIES_ZEROPAGE) {
-				pr_warn("E820 table full, cannot add all memory regions\n");
-				break;
-			}
-
-			params->e820_table[nr_e820_entries].addr = region->res.start;
-			params->e820_table[nr_e820_entries].size = resource_size(&region->res);
-			params->e820_table[nr_e820_entries].type = E820_TYPE_RAM;
-
-			pr_info("Added memory region to e820: 0x%llx-0x%llx (%llu MB)\n",
-				(unsigned long long)region->res.start,
-				(unsigned long long)region->res.end,
-				(unsigned long long)resource_size(&region->res) >> 20);
-
-			nr_e820_entries++;
-		}
-	}
-
-	params->e820_entries = nr_e820_entries;
-
-	pr_info("Final multikernel e820 map has %d total entries:\n",
-		nr_e820_entries);
-	for (int i = 0; i < nr_e820_entries; i++) {
-		pr_info("  e820[%d]: 0x%llx-0x%llx type=%d\n", i,
-			params->e820_table[i].addr,
-			params->e820_table[i].addr + params->e820_table[i].size,
-			params->e820_table[i].type);
-	}
-
-	return 0;
-}
-
 enum { RNG_SEED_LENGTH = 32 };
 
 static void
@@ -804,7 +747,8 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 
 	/* For multikernel, setup custom e820 map */
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		ret = setup_e820_entries_multikernel(image, params);
+		image->arch.mk_boot_params = bootparam_load_addr;
+		ret = mk_e820_fill(image->mk_instance, params);
 		if (ret)
 			goto out_free_params;
 	}

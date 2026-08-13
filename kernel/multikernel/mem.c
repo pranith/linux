@@ -129,22 +129,15 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 		chunk_base = multikernel_alloc(chunk_size);
 
 		if (!chunk_base) {
-			/* If we can't get the full remaining size, try smaller chunks */
-			if (chunk_size > (1024 * 1024)) {
-				/* Try 1MB chunks */
-				chunk_size = 1024 * 1024;
-				chunk_base = multikernel_alloc(chunk_size);
-			}
-
-			if (!chunk_base && chunk_size > (256 * 1024)) {
-				/* Try 256KB chunks */
-				chunk_size = 256 * 1024;
-				chunk_base = multikernel_alloc(chunk_size);
-			}
-
-			if (!chunk_base && chunk_size > (1 << min_alloc_order)) {
-				/* Try minimum allocation size */
-				chunk_size = 1 << min_alloc_order;
+			/*
+			 * Fragmented pool: halve until a piece fits. Dropping
+			 * straight to tiny chunks would splinter the grant
+			 * into more regions than an E820 table can carry.
+			 */
+			while (!chunk_base &&
+			       chunk_size > (1UL << min_alloc_order)) {
+				chunk_size = ALIGN_DOWN(chunk_size / 2,
+							1UL << min_alloc_order);
 				chunk_base = multikernel_alloc(chunk_size);
 			}
 
@@ -332,6 +325,27 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size)
 	return 0;
 }
 
+/* Does [phys_addr, phys_addr+size) back a segment of the loaded image? */
+static bool mk_range_backs_kimage(struct mk_instance *instance,
+				  phys_addr_t phys_addr, size_t size)
+{
+	struct kimage *image = instance->kimage;
+	unsigned long i;
+
+	if (!image)
+		return false;
+
+	for (i = 0; i < image->nr_segments; i++) {
+		unsigned long start = image->segment[i].mem;
+		unsigned long end = start + image->segment[i].memsz;
+
+		if (phys_addr < end && start < phys_addr + size)
+			return true;
+	}
+
+	return false;
+}
+
 /**
  * mk_instance_remove_memory_region() - Remove a memory region from an instance
  * @instance: Target instance
@@ -353,6 +367,14 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
 
 	if (!instance)
 		return -EINVAL;
+
+	if (mk_range_backs_kimage(instance, phys_addr, size)) {
+		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): the loaded kernel image lives there\n",
+		       (unsigned long long)phys_addr,
+		       (unsigned long long)(phys_addr + size - 1),
+		       instance->id, instance->name);
+		return -EBUSY;
+	}
 
 	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
 		if (region->res.start == phys_addr &&

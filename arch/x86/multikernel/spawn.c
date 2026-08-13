@@ -364,6 +364,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu)
 {
 	struct boot_params *src_bp;
+	int ret;
 
 	if (!instance->ident_pgt) {
 		struct mk_ident_pgtable *pgt;
@@ -440,6 +441,18 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	memcpy(mk_spawn_context_boot_params(instance->spawn_ctx), src_bp,
 	       sizeof(struct boot_params));
 	memunmap(src_bp);
+
+	/*
+	 * The loader's E820 reflects the grant at load time; regions added
+	 * or removed since then only exist in the live region list, which
+	 * the manifest is also rebuilt from on every exec. Rebuild the map
+	 * too, or the spawn boots with the memory it owned at load and the
+	 * difference silently vanishes.
+	 */
+	ret = mk_e820_fill(instance,
+			   mk_spawn_context_boot_params(instance->spawn_ctx));
+	if (ret)
+		return ret;
 
 	mk_set_spawn_context(instance->spawn_ctx,
 			     mk_get_identity_cr3(instance->ident_pgt),
