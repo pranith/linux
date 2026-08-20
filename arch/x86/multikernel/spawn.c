@@ -369,13 +369,18 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	if (!instance->ident_pgt) {
 		struct mk_ident_pgtable *pgt;
 
-		pgt = mk_build_identity_pgtable(instance,
-						image->arch.mk_pool_start,
-						image->arch.mk_pool_end);
+		pgt = mk_build_identity_pgtable(instance);
 		if (IS_ERR(pgt)) {
 			pr_err("Failed to build identity page table: %ld\n",
 			       PTR_ERR(pgt));
 			return PTR_ERR(pgt);
+		}
+
+		ret = mk_ident_map_range(pgt, image->arch.mk_pool_start,
+					 image->arch.mk_pool_end);
+		if (ret) {
+			mk_free_identity_pgtable(pgt);
+			return ret;
 		}
 		instance->ident_pgt = pgt;
 	}
@@ -1000,7 +1005,7 @@ static unsigned long *mk_alloc_pgtable_page(struct mk_ident_pgtable *pgt)
 		page = mk_instance_ctrl_alloc(pgt->instance, PAGE_SIZE, PAGE_SIZE);
 	} else {
 		/* Host-owned page table: allocate from the main pool */
-		phys_addr_t phys = multikernel_alloc(PAGE_SIZE);
+		phys_addr_t phys = multikernel_alloc(PAGE_SIZE, NUMA_NO_NODE);
 
 		page = phys ? __va(phys) : NULL;
 	}
@@ -1117,13 +1122,16 @@ static int mk_build_ident_p4d(struct mk_ident_pgtable *pgt, unsigned long *pgd,
 	return 0;
 }
 
-struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
-						    unsigned long start,
-						    unsigned long end)
+int mk_ident_map_range(struct mk_ident_pgtable *pgt, unsigned long start,
+		       unsigned long end)
+{
+	return mk_build_ident_p4d(pgt, __va(pgt->pgd_phys), start, end);
+}
+
+struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance)
 {
 	struct mk_ident_pgtable *pgt;
 	unsigned long *pgd;
-	int ret;
 
 	pgt = kzalloc(sizeof(*pgt), GFP_KERNEL);
 	if (!pgt)
@@ -1138,12 +1146,6 @@ struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
 	}
 
 	pgt->pgd_phys = virt_to_phys(pgd);
-
-	ret = mk_build_ident_p4d(pgt, pgd, start, end);
-	if (ret) {
-		mk_free_identity_pgtable(pgt);
-		return ERR_PTR(ret);
-	}
 	return pgt;
 }
 
@@ -1309,7 +1311,7 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 	 * A dying spawn kernel enters the park page through its own direct
 	 * map at the default base; the first instructions run at that VA
 	 * until the CR3 switch, so it must be mapped in the pool park page
-	 * table. The identity mapping is covered by the pool-range build.
+	 * table. The identity mapping is covered by the per-chunk build.
 	 */
 	rc = mk_add_trampoline_mapping(mk_host_park.pgt,
 				       mk_default_page_offset() + park_phys,
@@ -1319,6 +1321,19 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 
 	*phys_out = park_phys;
 	return park_va;
+}
+
+static int mk_host_park_map_chunk(struct mk_pool_chunk *chunk, void *data)
+{
+	return mk_ident_map_range(data, chunk->res.start, chunk->res.end + 1);
+}
+
+int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
+{
+	if (!mk_host_park.pgt)
+		return 0;
+
+	return mk_ident_map_range(mk_host_park.pgt, start, start + size);
 }
 
 /**
@@ -1332,7 +1347,6 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
  */
 int mk_setup_host_park(void)
 {
-	struct resource *pool = multikernel_get_pool_resource();
 	size_t size = mk_pool_park_end - mk_pool_park_start;
 	struct mk_ident_pgtable *pgt;
 	phys_addr_t phys;
@@ -1341,16 +1355,22 @@ int mk_setup_host_park(void)
 	if (mk_host_park.slot)
 		return 0;
 
-	if (!pool)
+	if (mk_pool_empty())
 		return -ENODEV;
 
-	pgt = mk_build_identity_pgtable(NULL, pool->start, pool->end + 1);
+	pgt = mk_build_identity_pgtable(NULL);
 	if (IS_ERR(pgt))
 		return PTR_ERR(pgt);
+
+	rc = mk_pool_for_each_chunk(mk_host_park_map_chunk, pgt);
+	if (rc) {
+		mk_free_identity_pgtable(pgt);
+		return rc;
+	}
 	mk_host_park.pgt = pgt;
 	mk_host_park.cr3 = mk_get_identity_cr3(pgt);
 
-	phys = multikernel_alloc(PAGE_SIZE);
+	phys = multikernel_alloc(PAGE_SIZE, NUMA_NO_NODE);
 	if (!phys) {
 		rc = -ENOMEM;
 		goto err_pgt;
@@ -1371,7 +1391,8 @@ int mk_setup_host_park(void)
 	if (rc)
 		goto err_page;
 
-	phys = multikernel_alloc(ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
+	phys = multikernel_alloc(ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE),
+				 NUMA_NO_NODE);
 	if (!phys) {
 		rc = -ENOMEM;
 		goto err_page;

@@ -362,10 +362,43 @@ int __init mk_messaging_init(void);
 void mk_messaging_cleanup(void);
 
 struct resource;
+struct page;
 
-extern phys_addr_t multikernel_alloc(size_t size);
+/**
+ * struct mk_pool_chunk - one physically contiguous piece of the memory pool
+ * @list: link in the global chunk list
+ * @pages: head page of the contiguous allocation backing the chunk
+ * @nr_pages: number of pages in @pages
+ * @node: NUMA node the chunk was allocated on
+ * @res: /proc/iomem resource, parent of every instance region carved out of it
+ */
+struct mk_pool_chunk {
+	struct list_head list;
+	struct page *pages;
+	unsigned long nr_pages;
+	int node;
+	struct resource res;
+};
+
+int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
+int mk_pool_mem_shrink(phys_addr_t start, size_t size);
+extern phys_addr_t multikernel_alloc(size_t size, int node);
 extern void multikernel_free(phys_addr_t addr, size_t size);
-extern struct resource *multikernel_get_pool_resource(void);
+bool mk_pool_contains(phys_addr_t start, size_t size);
+struct resource *mk_pool_chunk_resource(phys_addr_t addr);
+size_t mk_pool_total_bytes(void);
+size_t mk_pool_avail_bytes(void);
+bool mk_pool_empty(void);
+int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
+
+#ifdef CONFIG_X86
+int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
+#else
+static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
+{
+	return 0;
+}
+#endif
 
 /* Per-instance memory pool management */
 extern void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int min_alloc_order);
@@ -569,7 +602,7 @@ struct mk_instance {
  * - linux,multikernel-memory = <start1 size1 start2 size2 ...>;
  *
  * Each memory region becomes a struct resource that will be
- * inserted as a child of the main multikernel_res.
+ * inserted as a child of the pool chunk that holds it.
  *
  * Returns 0 on success, negative error code on failure.
  */

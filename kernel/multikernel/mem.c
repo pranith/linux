@@ -2,81 +2,199 @@
 /*
  * Multikernel memory management
  *
- * Memory pool management for multikernel spawn kernels using gen_pool.
- * Memory is donated at runtime via multikernel_add_pool_memory().
+ * The spawn kernel memory pool is a list of physically contiguous chunks
+ * the kernel allocates at runtime, one gen_pool per NUMA node.
  */
 
 #include <linux/ioport.h>
 #include <linux/kexec.h>
+#include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/genalloc.h>
 #include <linux/io.h>
+#include <linux/nodemask.h>
+#include <linux/slab.h>
 #include <linux/multikernel.h>
 
 #include "internal.h"
 
-/* Global multikernel memory pool resource */
-struct resource multikernel_res = {
-	.name  = "Multikernel Memory Pool",
-	.start = 0,
-	.end   = 0,
-	.flags = IORESOURCE_BUSY | IORESOURCE_MEM,
-	.desc  = IORES_DESC_RESERVED
-};
-
-/* Generic pool for runtime memory allocation */
-static struct gen_pool *multikernel_pool;
-
+static struct gen_pool *mk_node_pools[MAX_NUMNODES];
+static LIST_HEAD(mk_pool_chunks);
 static DEFINE_MUTEX(multikernel_mem_mutex);
 
+static struct gen_pool *mk_node_pool_get(int node)
+{
+	if (mk_node_pools[node])
+		return mk_node_pools[node];
+
+	mk_node_pools[node] = gen_pool_create(PAGE_SHIFT, node);
+	return mk_node_pools[node];
+}
+
 /**
- * multikernel_alloc() - Allocate memory from multikernel pool
+ * multikernel_alloc() - Allocate memory from the multikernel pool
  * @size: size to allocate
+ * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
  *
  * Returns physical address of allocated memory, or 0 on failure
  */
-phys_addr_t multikernel_alloc(size_t size)
+phys_addr_t multikernel_alloc(size_t size, int node)
 {
-	unsigned long addr;
-
-	if (!multikernel_pool)
-		return 0;
+	unsigned long addr = 0;
+	int nid;
 
 	mutex_lock(&multikernel_mem_mutex);
-	addr = gen_pool_alloc(multikernel_pool, size);
+	if (node != NUMA_NO_NODE) {
+		if (mk_node_pools[node])
+			addr = gen_pool_alloc(mk_node_pools[node], size);
+	} else {
+		for_each_online_node(nid) {
+			if (!mk_node_pools[nid])
+				continue;
+			addr = gen_pool_alloc(mk_node_pools[nid], size);
+			if (addr)
+				break;
+		}
+	}
 	mutex_unlock(&multikernel_mem_mutex);
 
 	return (phys_addr_t)addr;
 }
 
 /**
- * multikernel_free() - Free memory back to multikernel pool
+ * multikernel_free() - Free memory back to the multikernel pool
  * @addr: physical address to free
  * @size: size to free
  */
 void multikernel_free(phys_addr_t addr, size_t size)
 {
-	if (!multikernel_pool || !addr)
+	int nid;
+
+	if (!addr)
 		return;
 
 	mutex_lock(&multikernel_mem_mutex);
-	gen_pool_free(multikernel_pool, (unsigned long)addr, size);
+	for_each_online_node(nid) {
+		if (mk_node_pools[nid] &&
+		    gen_pool_has_addr(mk_node_pools[nid], addr, size)) {
+			gen_pool_free(mk_node_pools[nid], addr, size);
+			break;
+		}
+	}
 	mutex_unlock(&multikernel_mem_mutex);
+}
 
-	pr_debug("Multikernel freed %zu bytes at %pa\n", size, &addr);
+static struct mk_pool_chunk *mk_pool_chunk_find(phys_addr_t addr)
+{
+	struct mk_pool_chunk *chunk;
+
+	lockdep_assert_held(&multikernel_mem_mutex);
+	list_for_each_entry(chunk, &mk_pool_chunks, list)
+		if (addr >= chunk->res.start && addr <= chunk->res.end)
+			return chunk;
+	return NULL;
 }
 
 /**
- * multikernel_get_pool_resource() - Get the multikernel pool resource
+ * mk_pool_chunk_resource() - Find the pool chunk resource holding an address
+ * @addr: physical address inside the pool
  *
- * Returns pointer to the multikernel pool resource for memory walking
+ * Returns the chunk resource, usable as an insert_resource() parent, or
+ * NULL when @addr is outside the pool. The chunk cannot go away while it
+ * still has child allocations, so the caller holds no reference.
  */
-struct resource *multikernel_get_pool_resource(void)
+struct resource *mk_pool_chunk_resource(phys_addr_t addr)
 {
-	if (!multikernel_res.start)
-		return NULL;
+	struct mk_pool_chunk *chunk;
 
-	return &multikernel_res;
+	mutex_lock(&multikernel_mem_mutex);
+	chunk = mk_pool_chunk_find(addr);
+	mutex_unlock(&multikernel_mem_mutex);
+	return chunk ? &chunk->res : NULL;
+}
+
+/**
+ * mk_pool_contains() - Test whether a range lies inside one pool chunk
+ * @start: physical start address
+ * @size: size in bytes
+ */
+bool mk_pool_contains(phys_addr_t start, size_t size)
+{
+	struct mk_pool_chunk *chunk;
+	bool ret;
+
+	mutex_lock(&multikernel_mem_mutex);
+	chunk = mk_pool_chunk_find(start);
+	ret = chunk && start + size - 1 <= chunk->res.end;
+	mutex_unlock(&multikernel_mem_mutex);
+	return ret;
+}
+
+/**
+ * mk_pool_empty() - Test whether the pool holds no memory at all
+ */
+bool mk_pool_empty(void)
+{
+	bool empty;
+
+	mutex_lock(&multikernel_mem_mutex);
+	empty = list_empty(&mk_pool_chunks);
+	mutex_unlock(&multikernel_mem_mutex);
+	return empty;
+}
+
+/**
+ * mk_pool_total_bytes() - Total size of every chunk in the pool
+ */
+size_t mk_pool_total_bytes(void)
+{
+	struct mk_pool_chunk *chunk;
+	size_t total = 0;
+
+	mutex_lock(&multikernel_mem_mutex);
+	list_for_each_entry(chunk, &mk_pool_chunks, list)
+		total += resource_size(&chunk->res);
+	mutex_unlock(&multikernel_mem_mutex);
+	return total;
+}
+
+/**
+ * mk_pool_avail_bytes() - Unallocated bytes across every node pool
+ */
+size_t mk_pool_avail_bytes(void)
+{
+	size_t avail = 0;
+	int nid;
+
+	mutex_lock(&multikernel_mem_mutex);
+	for_each_online_node(nid)
+		if (mk_node_pools[nid])
+			avail += gen_pool_avail(mk_node_pools[nid]);
+	mutex_unlock(&multikernel_mem_mutex);
+	return avail;
+}
+
+/**
+ * mk_pool_for_each_chunk() - Run a callback over every pool chunk
+ * @fn: callback, stops the walk when it returns non-zero
+ * @data: opaque argument passed to @fn
+ *
+ * Returns 0 or the first non-zero callback return value.
+ */
+int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data)
+{
+	struct mk_pool_chunk *chunk;
+	int ret = 0;
+
+	mutex_lock(&multikernel_mem_mutex);
+	list_for_each_entry(chunk, &mk_pool_chunks, list) {
+		ret = fn(chunk, data);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&multikernel_mem_mutex);
+	return ret;
 }
 
 /**
@@ -105,7 +223,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 	phys_addr_t chunk_base;
 	int chunks_added = 0;
 
-	if (!multikernel_pool) {
+	if (mk_pool_empty()) {
 		pr_err("Multikernel main pool not available for instance %d\n", instance_id);
 		return NULL;
 	}
@@ -126,7 +244,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 	while (remaining_size > 0) {
 		/* Try to allocate the remaining size, but be flexible */
 		chunk_size = remaining_size;
-		chunk_base = multikernel_alloc(chunk_size);
+		chunk_base = multikernel_alloc(chunk_size, NUMA_NO_NODE);
 
 		if (!chunk_base) {
 			/*
@@ -138,7 +256,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 			       chunk_size > (1UL << min_alloc_order)) {
 				chunk_size = ALIGN_DOWN(chunk_size / 2,
 							1UL << min_alloc_order);
-				chunk_base = multikernel_alloc(chunk_size);
+				chunk_base = multikernel_alloc(chunk_size, NUMA_NO_NODE);
 			}
 
 			if (!chunk_base) {
@@ -275,10 +393,11 @@ size_t multikernel_instance_pool_avail(void *pool_handle)
 int mk_instance_add_memory_region(struct mk_instance *instance, size_t size)
 {
 	struct mk_memory_region *region;
+	struct resource *parent;
 	phys_addr_t phys_addr;
 	int ret;
 
-	phys_addr = multikernel_alloc(size);
+	phys_addr = multikernel_alloc(size, NUMA_NO_NODE);
 	if (!phys_addr) {
 		pr_err("Failed to allocate %zu bytes from multikernel pool for instance %d\n",
 		       size, instance->id);
@@ -304,7 +423,8 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size)
 	region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 	region->chunk = NULL;  /* For overlay-added regions */
 
-	ret = insert_resource(&multikernel_res, &region->res);
+	parent = mk_pool_chunk_resource(phys_addr);
+	ret = parent ? insert_resource(parent, &region->res) : -ENODEV;
 	if (ret) {
 		pr_err("Failed to insert resource for instance %d region %d: %d\n",
 		       instance->id, instance->region_count, ret);
@@ -410,81 +530,114 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
 }
 
 /**
- * multikernel_add_pool_memory() - Add memory to the multikernel pool at runtime
- * @start: physical start address, page aligned
- * @size: size in bytes, page aligned
+ * mk_pool_mem_grow() - Allocate a contiguous chunk and add it to the pool
+ * @size: chunk size in bytes, page aligned
+ * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
+ * @out_base: optional output for the physical base of the new chunk
  *
- * Adds a physically contiguous RAM range to the multikernel pool. Ownership
- * transfers to the pool: the range must stay allocated (never returned to
- * the buddy allocator) for the lifetime of the system, since spawn kernels
- * run out of it. Called when the baseline device tree is applied: userspace
- * allocates the memory at runtime (e.g. via lazy_cma) and describes it in
- * the baseline, and writing /sys/fs/multikernel/device_tree hands it over.
- *
- * The pool is modeled as a single contiguous region because instance memory
- * resources are inserted as children of multikernel_res, so a range must
- * either create the pool or extend it contiguously upward.
+ * The chunk is owned by the kernel until mk_pool_mem_shrink() returns it,
+ * and is never handed back to the buddy allocator behind the pool's back:
+ * spawn kernels execute out of it.
  *
  * Returns 0 on success, negative error code on failure.
  */
-int multikernel_add_pool_memory(phys_addr_t start, size_t size)
+int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 {
-	bool created_pool = false;
-	bool created_res = false;
+	struct mk_pool_chunk *chunk;
+	struct gen_pool *pool;
 	int ret;
 
-	if (!start || !size || !PAGE_ALIGNED(start) || !PAGE_ALIGNED(size))
+	if (!size || !PAGE_ALIGNED(size))
+		return -EINVAL;
+	if (node != NUMA_NO_NODE && (node < 0 || node >= MAX_NUMNODES ||
+				     !node_online(node)))
 		return -EINVAL;
 
+	chunk = kzalloc_obj(*chunk, GFP_KERNEL);
+	if (!chunk)
+		return -ENOMEM;
+
+	chunk->nr_pages = size >> PAGE_SHIFT;
+	chunk->pages = mk_alloc_contig_pages(chunk->nr_pages, node);
+	if (!chunk->pages) {
+		kfree(chunk);
+		return -ENOMEM;
+	}
+	chunk->node = page_to_nid(chunk->pages);
+	chunk->res.name = "Multikernel Memory Pool";
+	chunk->res.start = page_to_phys(chunk->pages);
+	chunk->res.end = chunk->res.start + size - 1;
+	chunk->res.flags = IORESOURCE_BUSY | IORESOURCE_MEM;
+	chunk->res.desc = IORES_DESC_RESERVED;
+
 	mutex_lock(&multikernel_mem_mutex);
-
-	if (!multikernel_pool) {
-		multikernel_pool = gen_pool_create(PAGE_SHIFT, -1);
-		if (!multikernel_pool) {
-			ret = -ENOMEM;
-			goto out;
-		}
-		created_pool = true;
+	pool = mk_node_pool_get(chunk->node);
+	if (!pool) {
+		ret = -ENOMEM;
+		goto err_unlock;
 	}
-
-	if (!multikernel_res.start) {
-		multikernel_res.start = start;
-		multikernel_res.end = start + size - 1;
-		if (insert_resource(&iomem_resource, &multikernel_res))
-			pr_warn("Multikernel pool: failed to register in /proc/iomem\n");
-		created_res = true;
-	} else if (start == multikernel_res.end + 1) {
-		ret = adjust_resource(&multikernel_res, multikernel_res.start,
-				      resource_size(&multikernel_res) + size);
-		if (ret)
-			goto out;
-	} else {
-		pr_err("Multikernel pool: range %pa+%zx is not contiguous with pool ending at %pa\n",
-		       &start, size, &multikernel_res.end);
-		ret = -EBUSY;
-		goto out;
-	}
-
-	ret = gen_pool_add(multikernel_pool, start, size, -1);
-	if (ret) {
-		if (created_res) {
-			remove_resource(&multikernel_res);
-			multikernel_res.start = 0;
-			multikernel_res.end = 0;
-		} else {
-			adjust_resource(&multikernel_res, multikernel_res.start,
-					resource_size(&multikernel_res) - size);
-		}
-		goto out;
-	}
-
-	pr_info("Multikernel pool: added %pa-%pa (%zu MB)\n",
-		&start, &multikernel_res.end, size >> 20);
-out:
-	if (ret && created_pool) {
-		gen_pool_destroy(multikernel_pool);
-		multikernel_pool = NULL;
-	}
+	ret = gen_pool_add(pool, chunk->res.start, size, chunk->node);
+	if (ret)
+		goto err_unlock;
+	if (insert_resource(&iomem_resource, &chunk->res))
+		pr_warn("Multikernel pool: chunk %pa not registered in /proc/iomem\n",
+			&chunk->res.start);
+	list_add_tail(&chunk->list, &mk_pool_chunks);
 	mutex_unlock(&multikernel_mem_mutex);
+
+	ret = mk_arch_pool_chunk_added(chunk->res.start, size);
+	if (ret) {
+		mk_pool_mem_shrink(chunk->res.start, size);
+		return ret;
+	}
+
+	pr_info("Multikernel pool: added %pa-%pa (%zu MB) on node %d\n",
+		&chunk->res.start, &chunk->res.end, size >> 20, chunk->node);
+	if (out_base)
+		*out_base = chunk->res.start;
+	return 0;
+
+err_unlock:
+	mutex_unlock(&multikernel_mem_mutex);
+	mk_free_contig_pages(chunk->pages, chunk->nr_pages);
+	kfree(chunk);
 	return ret;
+}
+
+/**
+ * mk_pool_mem_shrink() - Remove a pool chunk and return it to the kernel
+ * @start: physical base of the chunk, exactly as reported by the grow
+ * @size: chunk size in bytes
+ *
+ * Returns 0 on success, -ENOENT when no chunk matches @start and @size,
+ * -EBUSY when the chunk still has outstanding allocations.
+ */
+int mk_pool_mem_shrink(phys_addr_t start, size_t size)
+{
+	struct mk_pool_chunk *chunk;
+	int ret;
+
+	mutex_lock(&multikernel_mem_mutex);
+	chunk = mk_pool_chunk_find(start);
+	if (!chunk || chunk->res.start != start ||
+	    resource_size(&chunk->res) != size) {
+		mutex_unlock(&multikernel_mem_mutex);
+		return -ENOENT;
+	}
+	ret = gen_pool_remove_chunk(mk_node_pools[chunk->node], start, size);
+	if (ret) {
+		mutex_unlock(&multikernel_mem_mutex);
+		return ret;
+	}
+	list_del(&chunk->list);
+	mutex_unlock(&multikernel_mem_mutex);
+
+	if (chunk->res.parent)
+		remove_resource(&chunk->res);
+	/* The host park identity table keeps the stale mapping; nothing walks it. */
+	mk_free_contig_pages(chunk->pages, chunk->nr_pages);
+	pr_info("Multikernel pool: removed %pa-%pa (%zu MB)\n",
+		&chunk->res.start, &chunk->res.end, size >> 20);
+	kfree(chunk);
+	return 0;
 }

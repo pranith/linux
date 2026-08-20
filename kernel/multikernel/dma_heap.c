@@ -204,7 +204,7 @@ static struct dma_buf *mk_heap_allocate(struct dma_heap *heap,
 	len = PAGE_ALIGN(len);
 
 	/* Allocate from multikernel pool */
-	phys = multikernel_alloc(len);
+	phys = multikernel_alloc(len, NUMA_NO_NODE);
 	if (!phys)
 		return ERR_PTR(-ENOMEM);
 
@@ -242,7 +242,7 @@ static struct dma_buf *mk_heap_allocate(struct dma_heap *heap,
 
 	buffer->res = kzalloc(sizeof(*buffer->res), GFP_KERNEL);
 	if (buffer->res) {
-		struct resource *parent = multikernel_get_pool_resource();
+		struct resource *parent = mk_pool_chunk_resource(phys);
 
 		buffer->res->start = phys;
 		buffer->res->end = phys + len - 1;

@@ -151,9 +151,9 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
 /* Identity page table and trampoline setup */
-struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
-						    unsigned long start,
-						    unsigned long end);
+struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance);
+int mk_ident_map_range(struct mk_ident_pgtable *pgt, unsigned long start,
+		       unsigned long end);
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
 unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
 void *mk_setup_trampoline(struct mk_instance *instance,

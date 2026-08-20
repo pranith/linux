@@ -79,50 +79,24 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node)
 static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 				    struct mk_instance *instance)
 {
-	struct resource *pool_res = multikernel_get_pool_resource();
 	const fdt32_t *prop;
 	struct mk_memory_region *region;
 	u64 memory_base, memory_size;
 	int len;
 
-	/*
-	 * memory-base and memory-bytes are optional: pool memory is donated
-	 * to the kernel at runtime (multikernel_add_pool_memory()) before
-	 * the baseline is written, so by default the baseline simply uses
-	 * the donated pool as is. Explicit properties can still restrict
-	 * the baseline to part of the pool.
-	 */
 	prop = fdt_getprop(fdt, resources_node, "memory-base", &len);
-	if (prop) {
-		if (len != 8) {
-			pr_err("Invalid 'memory-base' length: %d (must be 8)\n",
-			       len);
-			return -EINVAL;
-		}
-		memory_base = fdt64_to_cpu(*(const fdt64_t *)prop);
-	} else if (pool_res) {
-		memory_base = pool_res->start;
-	} else {
-		pr_err("No 'memory-base' in baseline and no memory donated to the pool\n");
-		return -ENODEV;
+	if (!prop || len != 8) {
+		pr_err("Baseline needs a valid 'memory-base' property\n");
+		return -EINVAL;
 	}
+	memory_base = fdt64_to_cpu(*(const fdt64_t *)prop);
 
 	prop = fdt_getprop(fdt, resources_node, "memory-bytes", &len);
-	if (prop) {
-		if (len != 8) {
-			pr_err("Invalid 'memory-bytes' length: %d (must be 8)\n",
-			       len);
-			return -EINVAL;
-		}
-		memory_size = fdt64_to_cpu(*(const fdt64_t *)prop);
-	} else if (pool_res && memory_base >= pool_res->start &&
-		   memory_base <= pool_res->end) {
-		memory_size = pool_res->end - memory_base + 1;
-	} else {
-		pr_err("No 'memory-bytes' in baseline and no donated pool covering base 0x%llx\n",
-		       memory_base);
-		return -ENODEV;
+	if (!prop || len != 8) {
+		pr_err("Baseline needs a valid 'memory-bytes' property\n");
+		return -EINVAL;
 	}
+	memory_size = fdt64_to_cpu(*(const fdt64_t *)prop);
 
 	if (memory_size == 0) {
 		pr_err("Invalid memory size 0 in baseline\n");
@@ -364,46 +338,24 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 	return 0;
 }
 
-/*
- * Hand the baseline memory to the multikernel allocator. The pool memory
- * is allocated by userspace at runtime (e.g. via lazy_cma) and described
- * through the baseline device tree, so applying the baseline is what
- * transfers the memory to the pool. A pool from an earlier baseline write
- * is kept as is; validation then checks the new regions against it.
- */
 static int mk_baseline_setup_pool(const struct mk_instance *instance)
 {
-	struct mk_memory_region *region;
-	int ret;
-
-	if (multikernel_get_pool_resource())
+	if (!mk_pool_empty())
 		return 0;
 
-	list_for_each_entry(region, &instance->memory_regions, list) {
-		ret = multikernel_add_pool_memory(region->res.start,
-						  resource_size(&region->res));
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	pr_err("baseline memory donation is replaced by memory@N allocation\n");
+	return -EOPNOTSUPP;
 }
 
 static int mk_baseline_validate_memory(const struct mk_instance *instance)
 {
-	struct resource *pool_res;
 	struct mk_memory_region *region;
-	u64 pool_start, pool_end;
 	u64 total_size = 0;
 
-	pool_res = multikernel_get_pool_resource();
-	if (!pool_res) {
-		pr_err("No multikernel pool configured (no memory donated to the pool)\n");
+	if (mk_pool_empty()) {
+		pr_err("No multikernel pool configured\n");
 		return -ENODEV;
 	}
-
-	pool_start = pool_res->start;
-	pool_end = pool_res->end;
 
 	if (list_empty(&instance->memory_regions)) {
 		pr_err("No memory regions in baseline\n");
@@ -413,19 +365,18 @@ static int mk_baseline_validate_memory(const struct mk_instance *instance)
 	list_for_each_entry(region, &instance->memory_regions, list) {
 		u64 region_size = resource_size(&region->res);
 
-		if (region->res.start < pool_start || region->res.end > pool_end) {
-			pr_err("Baseline memory (0x%llx-0x%llx) outside multikernel pool (0x%llx-0x%llx)\n",
-			       (u64)region->res.start, (u64)region->res.end,
-			       pool_start, pool_end);
+		if (!mk_pool_contains(region->res.start, region_size)) {
+			pr_err("Baseline memory (0x%llx-0x%llx) outside the multikernel pool\n",
+			       (u64)region->res.start, (u64)region->res.end);
 			return -EINVAL;
 		}
 
 		total_size += region_size;
 	}
 
-	if (total_size > (pool_end - pool_start + 1)) {
-		pr_err("Baseline memory size (0x%llx) exceeds pool size (0x%llx)\n",
-		       total_size, pool_end - pool_start + 1);
+	if (total_size > mk_pool_total_bytes()) {
+		pr_err("Baseline memory size (0x%llx) exceeds pool size (0x%zx)\n",
+		       total_size, mk_pool_total_bytes());
 		return -ERANGE;
 	}
 

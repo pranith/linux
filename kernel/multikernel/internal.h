@@ -1,4 +1,3 @@
-extern struct resource multikernel_res;
 extern struct mutex mk_instance_mutex;
 extern struct mutex mk_host_dtb_mutex;
 extern struct idr mk_instance_idr;
@@ -32,9 +31,6 @@ int mk_arm_force_halt(struct mk_instance *instance);
 int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);
 int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
-
-/* mem.c */
-int multikernel_add_pool_memory(phys_addr_t start, size_t size);
 
 /* contig.c */
 struct page *mk_alloc_contig_pages(unsigned long nr_pages, int node);

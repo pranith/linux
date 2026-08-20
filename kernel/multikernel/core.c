@@ -753,6 +753,7 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size)
 	struct gen_pool *pool;
 	struct gen_pool_chunk *chunk;
 	struct mk_memory_region *region;
+	struct resource *parent;
 	int ret = 0;
 	int region_num = 0;
 
@@ -815,7 +816,8 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size)
 		region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 		region->chunk = chunk;
 
-		ret = insert_resource(&multikernel_res, &region->res);
+		parent = mk_pool_chunk_resource(chunk->start_addr);
+		ret = parent ? insert_resource(parent, &region->res) : -ENODEV;
 		if (ret) {
 			pr_err("Failed to insert resource for instance %d region %d: %d\n",
 			       instance->id, region_num, ret);
@@ -945,7 +947,7 @@ void mk_instance_free_memory(struct mk_instance *instance)
  * @config: Device tree configuration with memory regions and CPU assignment
  *
  * Reserves all memory regions specified in the device tree configuration,
- * makes them children of the main multikernel_res, and copies CPU assignment.
+ * makes them children of their pool chunks, and copies CPU assignment.
  *
  * Returns 0 on success, negative error code on failure.
  */

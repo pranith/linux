@@ -656,11 +656,9 @@ int mk_dt_validate(const struct mk_dt_config *config)
  */
 static int mk_dt_validate_memory(const struct mk_dt_config *config)
 {
-	struct resource *pool_res;
+	size_t pool_size = mk_pool_total_bytes();
 
-	/* Get multikernel pool resource for validation */
-	pool_res = multikernel_get_pool_resource();
-	if (!pool_res && config->memory_size > 0) {
+	if (!pool_size && config->memory_size > 0) {
 		pr_err("No multikernel pool available for memory allocation\n");
 		return -ENODEV;
 	}
@@ -677,14 +675,10 @@ static int mk_dt_validate_memory(const struct mk_dt_config *config)
 			pr_warn("Large memory size requested: %zu bytes\n", config->memory_size);
 		}
 
-		/* Check if size fits within multikernel pool */
-		if (pool_res) {
-			resource_size_t pool_size = resource_size(pool_res);
-			if (config->memory_size > pool_size) {
-				pr_err("Requested memory size %zu bytes exceeds pool size %llu bytes\n",
-				       config->memory_size, pool_size);
-				return -ERANGE;
-			}
+		if (config->memory_size > pool_size) {
+			pr_err("Requested memory size %zu bytes exceeds pool size %zu bytes\n",
+			       config->memory_size, pool_size);
+			return -ERANGE;
 		}
 	}
 
@@ -736,26 +730,22 @@ static int mk_dt_validate_cpus(const struct mk_dt_config *config)
  */
 bool mk_dt_resources_available(const struct mk_dt_config *config)
 {
-	struct resource *pool_res;
+	size_t pool_size;
 
 	if (!config)
 		return false;
 
-	/* Check if multikernel pool is available */
-	pool_res = multikernel_get_pool_resource();
-	if (!pool_res) {
+	pool_size = mk_pool_total_bytes();
+	if (!pool_size && config->memory_size > 0) {
 		pr_debug("No multikernel pool available\n");
 		return false;
 	}
 
 	/* Check if requested memory size is available */
-	if (config->memory_size > 0) {
-		resource_size_t pool_size = resource_size(pool_res);
-		if (pool_size < config->memory_size) {
-			pr_debug("Pool too small: need %zu, have %llu\n",
-				 config->memory_size, pool_size);
-			return false;
-		}
+	if (config->memory_size > pool_size) {
+		pr_debug("Pool too small: need %zu, have %zu\n",
+			 config->memory_size, pool_size);
+		return false;
 	}
 
 	/* Check CPU availability - config->cpus contains physical CPU IDs */
