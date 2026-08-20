@@ -1043,9 +1043,13 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		 * If this kernel manages a pool, the CPU parked in its park
 		 * area and is assignable again.
 		 */
-		if (!ret && mk_cpu_pool && mk_cpu_set_add(mk_cpu_pool, cpu_id))
-			pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
-				cpu_id);
+		if (!ret && mk_cpu_pool) {
+			if (mk_cpu_set_add(mk_cpu_pool, cpu_id))
+				pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
+					cpu_id);
+			else
+				mk_cpu_set_del(root_instance->cpus, cpu_id);
+		}
 		return ret;
 	}
 
@@ -1147,6 +1151,11 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == root_instance->id) {
+		if (mk_cpu_pool && !mk_cpu_set_contains(mk_cpu_pool, cpu_id)) {
+			pr_err("Multikernel hotplug: CPU %llu is not free in the pool\n",
+			       cpu_id);
+			return -EBUSY;
+		}
 		ret = mk_do_cpu_add(cpu_id, numa_node, flags);
 		/*
 		 * If the CPU came out of this kernel's pool, it is an
@@ -1157,6 +1166,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 			if (cpu >= 0)
 				mk_set_pool_cpu(cpu, false);
+			mk_cpu_set_add(root_instance->cpus, cpu_id);
 		}
 		return ret;
 	}
@@ -1417,8 +1427,17 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
-	if (instance_id == root_instance->id)
-		return mk_do_device_add(domain, bus, devfn, driver_override, flags);
+	if (instance_id == root_instance->id) {
+		if (mk_cpu_pool && !mk_root_has_pci_device(domain, bus, devfn)) {
+			pr_err("Multikernel hotplug: device %04x:%02x:%02x.%x is not free in the pool\n",
+			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+			return -EBUSY;
+		}
+		ret = mk_do_device_add(domain, bus, devfn, driver_override, flags);
+		if (!ret && mk_cpu_pool)
+			mk_root_del_pci_device(domain, bus, devfn);
+		return ret;
+	}
 
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
@@ -1491,8 +1510,18 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	payload.driver_override[0] = '\0';
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
-	if (instance_id == root_instance->id)
-		return mk_do_device_remove(domain, bus, devfn);
+	if (instance_id == root_instance->id) {
+		ret = mk_do_device_remove(domain, bus, devfn);
+		if (!ret && mk_cpu_pool) {
+			int err = mk_root_add_pci_device(domain, bus, devfn);
+
+			if (err && err != -EEXIST)
+				pr_warn("Multikernel hotplug: device %04x:%02x:%02x.%x not tracked in pool: %d\n",
+					domain, bus, PCI_SLOT(devfn),
+					PCI_FUNC(devfn), err);
+		}
+		return ret;
+	}
 
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)

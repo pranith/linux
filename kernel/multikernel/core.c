@@ -745,6 +745,116 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 }
 
 /**
+ * mk_root_has_pci_device - Test whether a PCI device is free in the root pool
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ *
+ * Returns: true when the device is listed on the root instance
+ */
+bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *root_dev;
+	u8 slot = PCI_SLOT(devfn);
+	u8 func = PCI_FUNC(devfn);
+
+	if (!root_instance || !root_instance->pci_devices_valid)
+		return false;
+
+	list_for_each_entry(root_dev, &root_instance->pci_devices, list) {
+		if (root_dev->domain == domain &&
+		    root_dev->bus == bus &&
+		    root_dev->slot == slot &&
+		    root_dev->func == func)
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * mk_root_add_pci_device - List a PCI device as free in the root pool
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ *
+ * Returns: 0 on success, -EEXIST if already listed, -ENODEV if the device
+ * does not exist, -ENOMEM on allocation failure
+ */
+int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *root_dev;
+	struct pci_dev *pdev;
+
+	if (!root_instance)
+		return -EINVAL;
+
+	if (mk_root_has_pci_device(domain, bus, devfn))
+		return -EEXIST;
+
+	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+	if (!pdev)
+		return -ENODEV;
+
+	root_dev = kzalloc_obj(*root_dev, GFP_KERNEL);
+	if (!root_dev) {
+		pci_dev_put(pdev);
+		return -ENOMEM;
+	}
+
+	root_dev->domain = domain;
+	root_dev->bus = bus;
+	root_dev->slot = PCI_SLOT(devfn);
+	root_dev->func = PCI_FUNC(devfn);
+	root_dev->vendor = pdev->vendor;
+	root_dev->device = pdev->device;
+	snprintf(root_dev->name, sizeof(root_dev->name), "%s", pci_name(pdev));
+	INIT_LIST_HEAD(&root_dev->list);
+	pci_dev_put(pdev);
+
+	list_add_tail(&root_dev->list, &root_instance->pci_devices);
+	root_instance->pci_device_count++;
+	root_instance->pci_devices_valid = true;
+
+	pr_info("PCI device %04x:%04x@%04x:%02x:%02x.%x is free in the root pool\n",
+		root_dev->vendor, root_dev->device, domain, bus,
+		root_dev->slot, root_dev->func);
+	return 0;
+}
+
+/**
+ * mk_root_del_pci_device - Drop a PCI device from the root pool list
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ *
+ * Returns: 0 on success, -ENOENT if the device is not listed
+ */
+int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *root_dev, *tmp;
+	u8 slot = PCI_SLOT(devfn);
+	u8 func = PCI_FUNC(devfn);
+
+	if (!root_instance || !root_instance->pci_devices_valid)
+		return -ENOENT;
+
+	list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
+		if (root_dev->domain == domain &&
+		    root_dev->bus == bus &&
+		    root_dev->slot == slot &&
+		    root_dev->func == func) {
+			list_del(&root_dev->list);
+			kfree(root_dev);
+			root_instance->pci_device_count--;
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}
+
+/**
  * Memory management functions for instances
  */
 
