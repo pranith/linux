@@ -19,6 +19,7 @@
 #include <linux/ioport.h>
 #include <linux/sizes.h>
 #include <linux/cpumask.h>
+#include <linux/numa.h>
 #include <linux/multikernel.h>
 
 #include "internal.h"
@@ -46,6 +47,7 @@ void mk_dt_config_init(struct mk_dt_config *config)
 	memset(config, 0, sizeof(*config));
 	config->version = MK_DT_CONFIG_CURRENT;
 	config->memory_size = 0;
+	config->numa_node = NUMA_NO_NODE;
 
 	config->cpus = mk_cpu_set_alloc();
 	if (!config->cpus)
@@ -104,6 +106,8 @@ static int mk_dt_parse_memory(const void *fdt, int chosen_node,
 			      struct mk_dt_config *config);
 static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 			    struct mk_dt_config *config);
+static int mk_dt_parse_numa(const void *fdt, int chosen_node,
+			    struct mk_dt_config *config);
 static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 			       struct mk_dt_config *config);
 static int mk_dt_validate_memory(const struct mk_dt_config *config);
@@ -147,6 +151,42 @@ static int mk_dt_parse_memory(const void *fdt, int chosen_node,
 	config->memory_size = total_size;
 	pr_info("Successfully parsed memory size: %zu bytes (%zu MB)\n",
 		total_size, total_size >> 20);
+	return 0;
+}
+
+/**
+ * NUMA node parsing
+ *
+ * The instance grant comes from a single node pool, so of the nodes listed
+ * only the first one selects where the memory is taken from.
+ */
+static int mk_dt_parse_numa(const void *fdt, int chosen_node,
+			    struct mk_dt_config *config)
+{
+	const fdt32_t *prop;
+	u32 node;
+	int len;
+
+	prop = fdt_getprop(fdt, chosen_node, MK_DT_RESOURCE_NUMA, &len);
+	if (!prop) {
+		pr_debug("No %s property found\n", MK_DT_RESOURCE_NUMA);
+		return 0; /* Not an error - property is optional */
+	}
+
+	if (len < (int)sizeof(fdt32_t) || len % sizeof(fdt32_t) != 0) {
+		pr_err("Invalid %s property length: %d (must be an array of 32-bit node IDs)\n",
+		       MK_DT_RESOURCE_NUMA, len);
+		return -EINVAL;
+	}
+
+	node = fdt32_to_cpu(prop[0]);
+	if (node >= MAX_NUMNODES) {
+		pr_err("Invalid NUMA node %u in %s\n", node, MK_DT_RESOURCE_NUMA);
+		return -EINVAL;
+	}
+
+	config->numa_node = node;
+	pr_info("Successfully parsed NUMA node: %d\n", config->numa_node);
 	return 0;
 }
 
@@ -557,6 +597,13 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
+	ret = mk_dt_parse_numa(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse NUMA nodes: %d\n", ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
 	ret = mk_dt_parse_devices(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse device resources: %d\n", ret);
@@ -603,6 +650,13 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 	ret = mk_dt_parse_cpus(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse CPU resources for '%s': %d\n", instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	ret = mk_dt_parse_numa(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse NUMA nodes for '%s': %d\n", instance_name, ret);
 		mk_dt_config_free(config);
 		return ret;
 	}

@@ -412,7 +412,8 @@ static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 #endif
 
 /* Per-instance memory pool management */
-extern void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int min_alloc_order);
+extern void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
+					      int min_alloc_order, int node);
 extern void multikernel_destroy_instance_pool(void *pool_handle);
 extern phys_addr_t multikernel_instance_alloc(void *pool_handle, size_t size, size_t align);
 extern void multikernel_instance_free(void *pool_handle, phys_addr_t addr, size_t size);
@@ -500,6 +501,9 @@ struct mk_dt_config {
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of physical CPU IDs */
 
+	/* NUMA node the instance memory comes from, NUMA_NO_NODE if any */
+	int numa_node;
+
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
@@ -511,7 +515,7 @@ struct mk_dt_config {
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[7];                 /* Reduced due to added fields */
+	u32 reserved[6];                 /* Reduced due to added fields */
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -757,7 +761,8 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus);
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus);
-int mk_instance_add_memory_region(struct mk_instance *instance, size_t size);
+int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
+				  int node);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size);
 int mk_instance_add_pci_device(struct mk_instance *instance,
@@ -896,11 +901,13 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 #define MK_DT_RESOURCE_MEMORY   "memory-bytes"
 #define MK_DT_RESOURCE_CPUS     "cpus"
 #define MK_DT_RESOURCE_DEVICES  "devices"
+#define MK_DT_RESOURCE_NUMA     "numa-nodes"
 
 static const char * const mk_resource_properties[] = {
 	MK_DT_RESOURCE_MEMORY,
 	MK_DT_RESOURCE_CPUS,
 	MK_DT_RESOURCE_DEVICES,
+	MK_DT_RESOURCE_NUMA,
 	NULL  /* Sentinel */
 };
 

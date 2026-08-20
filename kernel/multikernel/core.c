@@ -748,7 +748,8 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
  * Memory management functions for instances
  */
 
-static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size)
+static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
+				       int node)
 {
 	struct gen_pool *pool;
 	struct gen_pool_chunk *chunk;
@@ -783,7 +784,8 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size)
 
 	instance->instance_pool = multikernel_create_instance_pool(instance->id,
 								   size,
-								   PAGE_SHIFT);
+								   PAGE_SHIFT,
+								   node);
 	if (!instance->instance_pool) {
 		pr_err("Failed to create instance pool for instance %d (%s)\n",
 		       instance->id, instance->name);
@@ -854,7 +856,8 @@ cleanup:
 static int mk_instance_reserve_memory(struct mk_instance *instance,
 				      const struct mk_dt_config *config)
 {
-	return mk_instance_transfer_memory(instance, config->memory_size);
+	return mk_instance_transfer_memory(instance, config->memory_size,
+					   config->numa_node);
 }
 
 /**

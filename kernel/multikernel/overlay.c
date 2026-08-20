@@ -19,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/libfdt.h>
+#include <linux/numa.h>
 #include <linux/pci.h>
 #include <linux/multikernel.h>
 #include "internal.h"
@@ -467,7 +468,7 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 			u64 nr_pages = size >> PAGE_SHIFT;
 
 			/* Get optional numa-node */
-			u32 numa_node = 0;
+			int numa_node = NUMA_NO_NODE;
 			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
 			if (numa && len >= 4)
 				numa_node = fdt32_to_cpu(*numa);
@@ -478,12 +479,12 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 			if (type && len >= 4)
 				mem_type = fdt32_to_cpu(*type);
 
-			pr_info("Overlay tx%d: +memory 0x%llx-0x%llx (%llu MB) numa=%u -> %s\n",
+			pr_info("Overlay tx%d: +memory 0x%llx-0x%llx (%llu MB) numa=%d -> %s\n",
 				tx->id, addr, addr + size - 1, size >> 20,
 				numa_node, add_instance->name);
 
 			ret = mk_send_mem_add(add_instance->id, start_pfn, nr_pages,
-					      numa_node, mem_type);
+					      (u32)numa_node, mem_type);
 			if (ret < 0) {
 				pr_err("Failed to send mem_add IPI: %d\n", ret);
 				return ret;
@@ -546,7 +547,7 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 				return ret;
 
 			/* Get optional numa-node */
-			u32 numa_node = 0;
+			int numa_node = NUMA_NO_NODE;
 			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
 			if (numa && len >= 4)
 				numa_node = fdt32_to_cpu(*numa);
@@ -557,10 +558,10 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 			if (flags_prop && len >= 4)
 				flags = fdt32_to_cpu(*flags_prop);
 
-			pr_info("Overlay tx%d: +cpu %llu numa=%u -> %s\n",
+			pr_info("Overlay tx%d: +cpu %llu numa=%d -> %s\n",
 				tx->id, cpu_id, numa_node, add_instance->name);
 
-			ret = mk_send_cpu_add(add_instance->id, cpu_id, numa_node, flags);
+			ret = mk_send_cpu_add(add_instance->id, cpu_id, (u32)numa_node, flags);
 			if (ret < 0) {
 				pr_err("Failed to send cpu_add IPI: %d\n", ret);
 				return ret;
@@ -948,7 +949,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 				return ret;
 
 			/* Get optional numa-node */
-			u32 numa_node = 0;
+			int numa_node = NUMA_NO_NODE;
 			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
 			if (numa && len >= 4)
 				numa_node = fdt32_to_cpu(*numa);
@@ -959,11 +960,12 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			if (flags_prop && len >= 4)
 				flags = fdt32_to_cpu(*flags_prop);
 
-			pr_info("Rollback tx%d: +cpu %llu numa=%u to %s\n",
+			pr_info("Rollback tx%d: +cpu %llu numa=%d to %s\n",
 				tx->id, cpu_id, numa_node, remove_instance->name);
 
 			/* Send add for what was removed */
-			ret = mk_send_cpu_add(remove_instance->id, cpu_id, numa_node, flags);
+			ret = mk_send_cpu_add(remove_instance->id, cpu_id,
+					      (u32)numa_node, flags);
 			if (ret < 0) {
 				pr_err("Failed to send cpu_add IPI for rollback: %d\n", ret);
 				return ret;
@@ -1045,7 +1047,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			u64 nr_pages = size >> PAGE_SHIFT;
 
 			/* Get optional numa-node */
-			u32 numa_node = 0;
+			int numa_node = NUMA_NO_NODE;
 			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
 			if (numa && len >= 4)
 				numa_node = fdt32_to_cpu(*numa);
@@ -1056,13 +1058,13 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			if (type && len >= 4)
 				mem_type = fdt32_to_cpu(*type);
 
-			pr_info("Rollback tx%d: +memory 0x%llx-0x%llx (%llu MB) numa=%u to %s\n",
+			pr_info("Rollback tx%d: +memory 0x%llx-0x%llx (%llu MB) numa=%d to %s\n",
 				tx->id, addr, addr + size - 1, size >> 20,
 				numa_node, remove_instance->name);
 
 			/* Send add for what was removed */
 			ret = mk_send_mem_add(remove_instance->id, start_pfn, nr_pages,
-					      numa_node, mem_type);
+					      (u32)numa_node, mem_type);
 			if (ret < 0) {
 				pr_err("Failed to send mem_add IPI for rollback: %d\n", ret);
 				return ret;

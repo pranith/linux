@@ -121,8 +121,8 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	int ret;
 	struct mk_hotplug_op *op;
 
-	pr_info("Multikernel hotplug: Adding CPU %llu (numa=%u, flags=0x%x)\n",
-		cpu_id, numa_node, flags);
+	pr_info("Multikernel hotplug: Adding CPU %llu (numa=%d, flags=0x%x)\n",
+		cpu_id, (int)numa_node, flags);
 
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
@@ -396,11 +396,19 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 
 	phys_addr = PFN_PHYS(start_pfn);
 	size = PFN_PHYS(nr_pages);
-	nid = numa_node;
 
-	pr_info("Multikernel hotplug: Adding memory 0x%llx-0x%llx (%llu MB) numa=%u type=0x%x\n",
+	/*
+	 * The payload carries the node as u32, so an unspecified node
+	 * arrives as (u32)NUMA_NO_NODE. Anything outside the node range
+	 * would index the node mask out of bounds below.
+	 */
+	nid = (int)numa_node;
+	if (nid < 0 || nid >= MAX_NUMNODES)
+		nid = 0;
+
+	pr_info("Multikernel hotplug: Adding memory 0x%llx-0x%llx (%llu MB) numa=%d type=0x%x\n",
 		phys_addr, phys_addr + size - 1, size >> 20,
-		numa_node, mem_type);
+		(int)numa_node, mem_type);
 
 	if (!IS_ALIGNED(phys_addr, memory_block_size_bytes())) {
 		pr_err("Multikernel hotplug: Memory address 0x%llx not aligned to block size 0x%lx\n",
@@ -1271,7 +1279,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		size_t size;
 
 		size = PFN_PHYS(nr_pages);
-		ret = mk_instance_add_memory_region(target_instance, size);
+		ret = mk_instance_add_memory_region(target_instance, size,
+						    (int)numa_node);
 		goto out;
 	}
 
@@ -1292,7 +1301,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	if (ret < 0)
 		goto out;
 
-	ret = mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages));
+	ret = mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages),
+					    (int)numa_node);
 out:
 	mk_instance_put(target_instance);
 	return ret;

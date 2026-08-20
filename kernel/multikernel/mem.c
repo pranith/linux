@@ -246,13 +246,15 @@ int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max)
  * @instance_id: Unique identifier for the instance
  * @pool_size: Total size of memory to allocate for this instance's pool
  * @min_alloc_order: Minimum allocation order (at least PAGE_SHIFT)
+ * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
  *
  * Allocates multiple chunks from the main multikernel pool to reach the target
  * pool_size and creates a gen_pool for the instance to manage smaller allocations.
  *
  * Returns opaque handle to the instance pool, or NULL on failure
  */
-void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int min_alloc_order)
+void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
+				       int min_alloc_order, int node)
 {
 	struct gen_pool *instance_pool;
 	size_t remaining_size = pool_size;
@@ -281,7 +283,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 	while (remaining_size > 0) {
 		/* Try to allocate the remaining size, but be flexible */
 		chunk_size = remaining_size;
-		chunk_base = multikernel_alloc(chunk_size, NUMA_NO_NODE);
+		chunk_base = multikernel_alloc(chunk_size, node);
 
 		if (!chunk_base) {
 			/*
@@ -293,7 +295,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size, int mi
 			       chunk_size > (1UL << min_alloc_order)) {
 				chunk_size = ALIGN_DOWN(chunk_size / 2,
 							1UL << min_alloc_order);
-				chunk_base = multikernel_alloc(chunk_size, NUMA_NO_NODE);
+				chunk_base = multikernel_alloc(chunk_size, node);
 			}
 
 			if (!chunk_base) {
@@ -419,6 +421,7 @@ size_t multikernel_instance_pool_avail(void *pool_handle)
  * mk_instance_add_memory_region() - Add a memory region to an instance
  * @instance: Target instance
  * @size: Size of the memory region to allocate
+ * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
  *
  * Allocates memory from the main multikernel pool and adds it to the
  * instance's memory_regions list. Used for non-running instances where
@@ -427,14 +430,15 @@ size_t multikernel_instance_pool_avail(void *pool_handle)
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_instance_add_memory_region(struct mk_instance *instance, size_t size)
+int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
+				  int node)
 {
 	struct mk_memory_region *region;
 	struct resource *parent;
 	phys_addr_t phys_addr;
 	int ret;
 
-	phys_addr = multikernel_alloc(size, NUMA_NO_NODE);
+	phys_addr = multikernel_alloc(size, node);
 	if (!phys_addr) {
 		pr_err("Failed to allocate %zu bytes from multikernel pool for instance %d\n",
 		       size, instance->id);
