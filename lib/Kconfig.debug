@@ -3485,6 +3485,19 @@ config GLOB_KUNIT_TEST
 
 	  If unsure, say N
 
+config GENALLOC_KUNIT_TEST
+	tristate "KUnit test for genalloc" if !KUNIT_ALL_TESTS
+	depends on KUNIT && GENERIC_ALLOCATOR
+	default KUNIT_ALL_TESTS
+	help
+	  This builds KUnit tests for gen_pool_remove_chunk().
+
+	  Covers removing a chunk that does not exist, removing a chunk
+	  with outstanding allocations, and removing one chunk while
+	  leaving the pool's other chunks intact.
+
+	  If unsure, say N
+
 endif # RUNTIME_TESTING_MENU
 
 config ARCH_USE_MEMTEST

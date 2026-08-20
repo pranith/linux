@@ -262,6 +262,53 @@ void gen_pool_destroy(struct gen_pool *pool)
 EXPORT_SYMBOL(gen_pool_destroy);
 
 /**
+ * gen_pool_remove_chunk - remove one chunk from the pool
+ * @pool: pool to remove the chunk from
+ * @start: start address of the chunk, as passed to gen_pool_add()
+ * @size: size of the chunk in bytes, as passed to gen_pool_add()
+ *
+ * The chunk must have no outstanding allocations. Unlike gen_pool_destroy()
+ * this is not fatal when it does: the caller gets -EBUSY and the pool is
+ * unchanged. Returns -ENOENT when no chunk matches @start and @size exactly.
+ *
+ * Callers must ensure no concurrent allocation targets the chunk.
+ */
+int gen_pool_remove_chunk(struct gen_pool *pool, unsigned long start,
+			  size_t size)
+{
+	struct gen_pool_chunk *chunk;
+	int order = pool->min_alloc_order;
+	unsigned long bit, end_bit;
+	int ret = -ENOENT;
+
+	spin_lock(&pool->lock);
+	list_for_each_entry(chunk, &pool->chunks, next_chunk) {
+		if (chunk->start_addr != start || chunk_size(chunk) != size)
+			continue;
+
+		end_bit = chunk_size(chunk) >> order;
+		bit = find_first_bit(chunk->bits, end_bit);
+		if (bit < end_bit) {
+			ret = -EBUSY;
+			break;
+		}
+
+		list_del_rcu(&chunk->next_chunk);
+		ret = 0;
+		break;
+	}
+	spin_unlock(&pool->lock);
+
+	if (ret)
+		return ret;
+
+	synchronize_rcu();
+	vfree(chunk);
+	return 0;
+}
+EXPORT_SYMBOL(gen_pool_remove_chunk);
+
+/**
  * gen_pool_alloc_algo_owner - allocate special memory from the pool
  * @pool: pool to allocate from
  * @size: number of bytes to allocate from the pool
