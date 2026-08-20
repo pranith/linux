@@ -778,8 +778,9 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  *
- * Returns: 0 on success, -EEXIST if already listed, -ENODEV if the device
- * does not exist, -ENOMEM on allocation failure
+ * Returns: 0 on success, -EINVAL if there is no root instance, -EEXIST if
+ * already listed, -ENODEV if the device does not exist, -ENOMEM on allocation
+ * failure
  */
 int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn)
 {
@@ -808,7 +809,8 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn)
 	root_dev->func = PCI_FUNC(devfn);
 	root_dev->vendor = pdev->vendor;
 	root_dev->device = pdev->device;
-	snprintf(root_dev->name, sizeof(root_dev->name), "%s", pci_name(pdev));
+	snprintf(root_dev->name, sizeof(root_dev->name), "pci_%04x_%02x_%02x_%x",
+		 domain, bus, root_dev->slot, root_dev->func);
 	INIT_LIST_HEAD(&root_dev->list);
 	pci_dev_put(pdev);
 

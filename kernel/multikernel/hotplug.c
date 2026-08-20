@@ -659,14 +659,19 @@ static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 		return -ENODEV;
 	}
 
-	if (pdev->dev.driver) {
-		strscpy(prev_driver, pdev->dev.driver->name, sizeof(prev_driver));
-		pr_info("Multikernel hotplug: Device currently bound to %s, unbinding\n",
-			prev_driver);
-		device_release_driver(&pdev->dev);
-	}
-
+	/*
+	 * A device coming back from the pool arrives driverless: adding it
+	 * has to bind the host driver, not unbind one. Only an explicit
+	 * override displaces a driver the host is already using.
+	 */
 	if (driver_override && driver_override[0]) {
+		if (pdev->dev.driver) {
+			strscpy(prev_driver, pdev->dev.driver->name, sizeof(prev_driver));
+			pr_info("Multikernel hotplug: Device currently bound to %s, unbinding\n",
+				prev_driver);
+			device_release_driver(&pdev->dev);
+		}
+
 		ret = driver_set_override(&pdev->dev, &pdev->driver_override,
 					  driver_override, strlen(driver_override));
 		if (ret < 0) {
@@ -692,6 +697,37 @@ static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 		}
 
 		pr_info("Multikernel hotplug: Successfully bound device to %s\n", driver_override);
+	} else if (pdev->dev.driver) {
+		strscpy(prev_driver, pdev->dev.driver->name, sizeof(prev_driver));
+		pr_info("Multikernel hotplug: Device already bound to %s\n", prev_driver);
+	} else {
+		/* An override left by an earlier move stops the default driver matching */
+		if (pdev->driver_override) {
+			ret = driver_set_override(&pdev->dev, &pdev->driver_override,
+						  "", 0);
+			if (ret < 0) {
+				pr_err("Multikernel hotplug: Failed to clear driver override: %d\n",
+				       ret);
+				pci_dev_put(pdev);
+				return ret;
+			}
+		}
+
+		/* device_attach() takes the device lock itself */
+		ret = device_attach(&pdev->dev);
+		if (ret < 0) {
+			pr_err("Multikernel hotplug: Failed to bind device %04x:%02x:%02x.%x: %d\n",
+			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
+			pci_dev_put(pdev);
+			return ret;
+		}
+
+		if (ret == 0)
+			pr_info("Multikernel hotplug: No driver matches device %04x:%02x:%02x.%x\n",
+				domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		else
+			pr_info("Multikernel hotplug: Bound device to %s\n",
+				pdev->dev.driver ? pdev->dev.driver->name : "its driver");
 	}
 
 	pci_dev_put(pdev);
@@ -1043,13 +1079,9 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		 * If this kernel manages a pool, the CPU parked in its park
 		 * area and is assignable again.
 		 */
-		if (!ret && mk_cpu_pool) {
-			if (mk_cpu_set_add(mk_cpu_pool, cpu_id))
-				pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
-					cpu_id);
-			else
-				mk_cpu_set_del(root_instance->cpus, cpu_id);
-		}
+		if (!ret && mk_cpu_pool && mk_cpu_set_add(mk_cpu_pool, cpu_id))
+			pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
+				cpu_id);
 		return ret;
 	}
 
@@ -1166,7 +1198,6 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 			if (cpu >= 0)
 				mk_set_pool_cpu(cpu, false);
-			mk_cpu_set_add(root_instance->cpus, cpu_id);
 		}
 		return ret;
 	}
@@ -1434,8 +1465,14 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 			return -EBUSY;
 		}
 		ret = mk_do_device_add(domain, bus, devfn, driver_override, flags);
-		if (!ret && mk_cpu_pool)
-			mk_root_del_pci_device(domain, bus, devfn);
+		if (!ret && mk_cpu_pool) {
+			int err = mk_root_del_pci_device(domain, bus, devfn);
+
+			if (err)
+				pr_warn("Multikernel hotplug: device %04x:%02x:%02x.%x not dropped from pool: %d\n",
+					domain, bus, PCI_SLOT(devfn),
+					PCI_FUNC(devfn), err);
+		}
 		return ret;
 	}
 
