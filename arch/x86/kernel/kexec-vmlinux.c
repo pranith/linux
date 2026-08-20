@@ -461,37 +461,8 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 		image->arch.mk_kernel_entry = entry_phys;
 		image->arch.mk_boot_params = bootparam_load_addr;
 
-		/*
-		 * Set pool bounds for page table isolation.
-		 * Use the instance's memory regions to determine the full range.
-		 * This ensures boot_params and other allocations are covered.
-		 */
-		if (image->mk_instance && !list_empty(&image->mk_instance->memory_regions)) {
-			struct mk_memory_region *region;
-			unsigned long min_addr = ULONG_MAX;
-			unsigned long max_addr = 0;
-
-			list_for_each_entry(region, &image->mk_instance->memory_regions, list) {
-				unsigned long start = region->res.start;
-				unsigned long end = region->res.end + 1; /* resource.end is inclusive */
-
-				if (start < min_addr)
-					min_addr = start;
-				if (end > max_addr)
-					max_addr = end;
-			}
-
-			image->arch.mk_pool_start = min_addr;
-			image->arch.mk_pool_end = max_addr;
-		} else {
-			/* Fallback: use kernel image bounds only */
-			image->arch.mk_pool_start = kernel_load_addr;
-			image->arch.mk_pool_end = kernel_load_addr + elf_info.load_size;
-		}
-
-		pr_info("Multikernel: entry=0x%lx boot_params=0x%lx pool=0x%lx-0x%lx\n",
-			entry_phys, bootparam_load_addr,
-			image->arch.mk_pool_start, image->arch.mk_pool_end);
+		pr_info("Multikernel: entry=0x%lx boot_params=0x%lx\n",
+			entry_phys, bootparam_load_addr);
 
 		image->start = bootparam_load_addr;
 	} else {

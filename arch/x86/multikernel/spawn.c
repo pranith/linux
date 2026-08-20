@@ -123,6 +123,9 @@ static struct {
 	unsigned long cr3;
 } mk_host_park;
 
+/* Nests outside the pool mutex: a growing pool maps itself in here */
+static DEFINE_MUTEX(mk_host_park_lock);
+
 struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
 						phys_addr_t *phys_out)
 {
@@ -368,6 +371,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 
 	if (!instance->ident_pgt) {
 		struct mk_ident_pgtable *pgt;
+		struct mk_memory_region *region;
 
 		pgt = mk_build_identity_pgtable(instance);
 		if (IS_ERR(pgt)) {
@@ -376,11 +380,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			return PTR_ERR(pgt);
 		}
 
-		ret = mk_ident_map_range(pgt, image->arch.mk_pool_start,
-					 image->arch.mk_pool_end);
-		if (ret) {
-			mk_free_identity_pgtable(pgt);
-			return ret;
+		list_for_each_entry(region, &instance->memory_regions, list) {
+			ret = mk_ident_map_range(pgt, region->res.start,
+						 region->res.end + 1);
+			if (ret) {
+				mk_free_identity_pgtable(pgt);
+				return ret;
+			}
 		}
 		instance->ident_pgt = pgt;
 	}
@@ -1354,6 +1360,8 @@ static int mk_host_park_map_pool(struct mk_ident_pgtable *pgt)
 
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 {
+	guard(mutex)(&mk_host_park_lock);
+
 	if (!mk_host_park.pgt)
 		return 0;
 
@@ -1375,6 +1383,8 @@ int mk_setup_host_park(void)
 	struct mk_ident_pgtable *pgt;
 	phys_addr_t phys;
 	int rc;
+
+	guard(mutex)(&mk_host_park_lock);
 
 	if (mk_host_park.slot)
 		return 0;

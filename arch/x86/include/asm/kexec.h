@@ -168,8 +168,6 @@ struct kimage_arch {
 	/* Multikernel spawn parameters, set by the loader */
 	unsigned long mk_kernel_entry;	/* Physical entry point */
 	unsigned long mk_boot_params;	/* Physical boot_params address */
-	unsigned long mk_pool_start;	/* Instance memory pool start */
-	unsigned long mk_pool_end;	/* Instance memory pool end */
 };
 #endif /* CONFIG_X86_32 */
 
