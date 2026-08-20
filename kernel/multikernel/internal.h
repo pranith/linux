@@ -36,6 +36,10 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 /* mem.c */
 int multikernel_add_pool_memory(phys_addr_t start, size_t size);
 
+/* contig.c */
+struct page *mk_alloc_contig_pages(unsigned long nr_pages, int node);
+void mk_free_contig_pages(struct page *pages, unsigned long nr_pages);
+
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 /*
