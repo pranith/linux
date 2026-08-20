@@ -350,6 +350,7 @@ static int mk_baseline_setup_pool(const struct mk_instance *instance)
 static int mk_baseline_validate_memory(const struct mk_instance *instance)
 {
 	struct mk_memory_region *region;
+	size_t pool_size = mk_pool_total_bytes();
 	u64 total_size = 0;
 
 	if (mk_pool_empty()) {
@@ -374,9 +375,9 @@ static int mk_baseline_validate_memory(const struct mk_instance *instance)
 		total_size += region_size;
 	}
 
-	if (total_size > mk_pool_total_bytes()) {
+	if (total_size > pool_size) {
 		pr_err("Baseline memory size (0x%llx) exceeds pool size (0x%zx)\n",
-		       total_size, mk_pool_total_bytes());
+		       total_size, pool_size);
 		return -ERANGE;
 	}
 

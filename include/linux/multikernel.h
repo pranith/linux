@@ -361,9 +361,6 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn);
 int __init mk_messaging_init(void);
 void mk_messaging_cleanup(void);
 
-struct resource;
-struct page;
-
 /**
  * struct mk_pool_chunk - one physically contiguous piece of the memory pool
  * @list: link in the global chunk list
@@ -390,6 +387,20 @@ size_t mk_pool_total_bytes(void);
 size_t mk_pool_avail_bytes(void);
 bool mk_pool_empty(void);
 int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
+
+/**
+ * struct mk_pool_chunk_range - a pool chunk copied out of the chunk list
+ * @start: physical base of the chunk
+ * @size: chunk size in bytes
+ * @node: NUMA node the chunk lives on
+ */
+struct mk_pool_chunk_range {
+	phys_addr_t start;
+	size_t size;
+	int node;
+};
+
+int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
 
 #ifdef CONFIG_X86
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);

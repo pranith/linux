@@ -1323,9 +1323,33 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 	return park_va;
 }
 
-static int mk_host_park_map_chunk(struct mk_pool_chunk *chunk, void *data)
+/*
+ * Map the whole pool from a snapshot rather than under mk_pool_for_each_chunk():
+ * mk_ident_map_range() allocates its page table pages from the pool, which
+ * would recurse into the pool mutex the callback runs under.
+ */
+static int mk_host_park_map_pool(struct mk_ident_pgtable *pgt)
 {
-	return mk_ident_map_range(data, chunk->res.start, chunk->res.end + 1);
+	struct mk_pool_chunk_range *snap = NULL;
+	int max = 0, n, i, rc = 0;
+
+	for (;;) {
+		n = mk_pool_snapshot_chunks(snap, max);
+		if (n <= max)
+			break;
+		kfree(snap);
+		max = n;
+		snap = kmalloc_array(max, sizeof(*snap), GFP_KERNEL);
+		if (!snap)
+			return -ENOMEM;
+	}
+
+	for (i = 0; i < n && !rc; i++)
+		rc = mk_ident_map_range(pgt, snap[i].start,
+					snap[i].start + snap[i].size);
+
+	kfree(snap);
+	return rc;
 }
 
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
@@ -1362,7 +1386,7 @@ int mk_setup_host_park(void)
 	if (IS_ERR(pgt))
 		return PTR_ERR(pgt);
 
-	rc = mk_pool_for_each_chunk(mk_host_park_map_chunk, pgt);
+	rc = mk_host_park_map_pool(pgt);
 	if (rc) {
 		mk_free_identity_pgtable(pgt);
 		return rc;

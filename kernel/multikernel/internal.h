@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+struct mk_dt_config;
+struct mk_cpu_resource_payload;
+
 extern struct mutex mk_instance_mutex;
 extern struct mutex mk_host_dtb_mutex;
 extern struct idr mk_instance_idr;
