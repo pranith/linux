@@ -21,6 +21,8 @@
 #include <linux/libfdt.h>
 #include <linux/numa.h>
 #include <linux/pci.h>
+#include <linux/sort.h>
+#include <linux/kstrtox.h>
 #include <linux/multikernel.h>
 #include "internal.h"
 
@@ -60,7 +62,7 @@ enum mk_overlay_tx_status {
 struct mk_overlay_tx {
 	int id;                          /* Transaction ID (user-facing) */
 	enum mk_overlay_tx_status status;
-	char instance_name[64];          /* Affected instance name (for display) */
+	char target_path[128];           /* Target path of the first fragment */
 	char resources[256];             /* Affected resources description */
 	void *dtbo_data;                 /* Copy of original overlay blob */
 	size_t dtbo_size;                /* Size of overlay blob */
@@ -132,7 +134,7 @@ static int tx_instance_seq_show(struct seq_file *sf, void *v)
 
 	if (!tx)
 		return -EINVAL;
-	seq_printf(sf, "%s\n", tx->instance_name);
+	seq_printf(sf, "%s\n", tx->target_path);
 	return 0;
 }
 
@@ -191,21 +193,151 @@ static struct kernfs_ops mk_overlay_new_ops = {
 	.write = mk_overlay_new_write,
 };
 
-/**
- * mk_overlay_parse_metadata - Extract metadata from overlay DTS
+/*
+ * Overlay format
  *
- * Looks for special properties in the overlay:
- * - mk,instance: affected instance name
- * - mk,resources: resource description string
+ * A transaction is a device tree overlay with any number of fragments.
+ * Each fragment names what it modifies with the standard target-path
+ * property and carries its operations under __overlay__:
+ *
+ *   fragment@0 {
+ *     target-path = "/resources";		the pool this kernel manages
+ *     __overlay__ {
+ *       memory-add    { memory@0 { size = <u64>; numa-node-id = <u32>; }; };
+ *       memory-remove { memory@0 { reg = <u64 base, u64 size>; }; };
+ *       cpu-add       { cpu@0 { reg = <u64 cpuid>; }; };
+ *       cpu-remove    { cpu@0 { reg = <u64 cpuid>; }; };
+ *       device-add    { pci@0 { pci-id = "DDDD:BB:SS.F"; }; };
+ *       device-remove { pci@0 { pci-id = "DDDD:BB:SS.F"; }; };
+ *     };
+ *   };
+ *
+ *   fragment@1 {
+ *     target-path = "/instances/db";		an existing instance
+ *     __overlay__ {
+ *       memory-add    { memory@0 { reg = <u64 base, u64 size>; numa-node-id = <u32>; }; };
+ *       memory-remove { memory@0 { reg = <u64 base, u64 size>; }; };
+ *       cpu-add       { cpu@0 { reg = <u64 cpuid>; numa-node-id = <u32>; }; };
+ *       cpu-remove    { cpu@0 { reg = <u64 cpuid>; }; };
+ *       device-add    { pci@0 { pci-id = "DDDD:BB:SS.F"; driver = "vfio-pci"; }; };
+ *       device-remove { pci@0 { pci-id = "DDDD:BB:SS.F"; }; };
+ *     };
+ *   };
+ *
+ *   fragment@2 {
+ *     target-path = "/instances";		the instance namespace
+ *     __overlay__ {
+ *       instance-create { instance-name = "db"; id = <N>; resources { ... }; };
+ *       instance-remove { instance-name = "db"; };
+ *     };
+ *   };
+ *
+ * Operation names read from the target's point of view: under /resources,
+ * cpu-add hands a CPU of this kernel to the pool and cpu-remove takes a
+ * free pool CPU back.
+ *
+ * Fragments are processed in ascending unit-address order. Within a
+ * fragment the order is instance-create, memory-remove, memory-add,
+ * cpu-remove, cpu-add, device-remove, device-add, instance-remove, so
+ * that a resource is released by its source before its destination
+ * acquires it. Rollback walks both orders in reverse.
+ */
+
+#define MK_OVERLAY_POOL_PATH		"/resources"
+#define MK_OVERLAY_INSTANCES_PATH	"/instances"
+#define MK_OVERLAY_INSTANCE_PREFIX	"/instances/"
+
+enum mk_overlay_target_kind {
+	MK_OVERLAY_TARGET_POOL,
+	MK_OVERLAY_TARGET_INSTANCE,
+	MK_OVERLAY_TARGET_INSTANCES,
+};
+
+struct mk_overlay_target {
+	enum mk_overlay_target_kind kind;
+	const char *path;
+	struct mk_instance *instance;
+};
+
+struct mk_overlay_fragment {
+	u32 unit;
+	int node;
+};
+
+static int mk_overlay_fragment_cmp(const void *a, const void *b)
+{
+	const struct mk_overlay_fragment *x = a;
+	const struct mk_overlay_fragment *y = b;
+
+	if (x->unit == y->unit)
+		return 0;
+
+	return x->unit < y->unit ? -1 : 1;
+}
+
+/**
+ * mk_overlay_collect_fragments - Gather fragment@N nodes in unit-address order
+ * @fdt: Overlay blob
+ * @out: Receives the caller-freed array of fragments
+ *
+ * Returns the number of fragments, or a negative error code.
+ */
+static int mk_overlay_collect_fragments(const void *fdt,
+					struct mk_overlay_fragment **out)
+{
+	struct mk_overlay_fragment *frags;
+	int node, n = 0;
+
+	fdt_for_each_subnode(node, fdt, 0) {
+		const char *name = fdt_get_name(fdt, node, NULL);
+
+		if (name && !strncmp(name, "fragment@", 9))
+			n++;
+	}
+
+	if (!n)
+		return -EINVAL;
+
+	frags = kcalloc(n, sizeof(*frags), GFP_KERNEL);
+	if (!frags)
+		return -ENOMEM;
+
+	n = 0;
+	fdt_for_each_subnode(node, fdt, 0) {
+		const char *name = fdt_get_name(fdt, node, NULL);
+
+		if (!name || strncmp(name, "fragment@", 9))
+			continue;
+
+		if (kstrtou32(name + 9, 16, &frags[n].unit)) {
+			pr_err("Overlay: '%s' has no valid unit address\n", name);
+			kfree(frags);
+			return -EINVAL;
+		}
+
+		frags[n].node = node;
+		n++;
+	}
+
+	sort(frags, n, sizeof(*frags), mk_overlay_fragment_cmp, NULL);
+	*out = frags;
+	return n;
+}
+
+/**
+ * mk_overlay_parse_metadata - Extract display metadata from an overlay
+ *
+ * The transaction is described by the target path of its first fragment
+ * and by the optional mk,resources string at the overlay root.
  */
 static void mk_overlay_parse_metadata(struct mk_overlay_tx *tx, const void *fdt)
 {
-	const char *instance_name = NULL;
-	int root_node, len;
+	struct mk_overlay_fragment *frags;
 	const char *prop;
+	int root_node, len, nr;
 
-	strcpy(tx->instance_name, "unknown");
-	strcpy(tx->resources, "unknown");
+	strscpy(tx->target_path, "unknown", sizeof(tx->target_path));
+	strscpy(tx->resources, "unknown", sizeof(tx->resources));
 
 	if (fdt_check_header(fdt) != 0) {
 		pr_warn("Invalid FDT header in overlay\n");
@@ -216,902 +348,898 @@ static void mk_overlay_parse_metadata(struct mk_overlay_tx *tx, const void *fdt)
 	if (root_node < 0)
 		return;
 
-	prop = fdt_getprop(fdt, root_node, "mk,instance", &len);
-	if (prop && len > 0)
-		instance_name = prop;
-
 	prop = fdt_getprop(fdt, root_node, "mk,resources", &len);
-	if (prop && len > 0) {
+	if (prop && len > 0)
 		strscpy(tx->resources, prop, sizeof(tx->resources));
+
+	nr = mk_overlay_collect_fragments(fdt, &frags);
+	if (nr < 0)
+		return;
+
+	prop = fdt_getprop(fdt, frags[0].node, "target-path", &len);
+	if (prop && len > 0)
+		strscpy(tx->target_path, prop, sizeof(tx->target_path));
+
+	kfree(frags);
+}
+
+static int mk_overlay_resolve_target(struct mk_overlay_tx *tx, const void *fdt,
+				     int fragment, struct mk_overlay_target *target)
+{
+	const char *path, *name;
+	int len;
+
+	path = fdt_getprop(fdt, fragment, "target-path", &len);
+	if (!path || len <= 0 || path[len - 1] != '\0') {
+		pr_err("Overlay tx%d: fragment without a valid target-path\n",
+		       tx->id);
+		return -EINVAL;
 	}
 
-	int fragment_node = fdt_subnode_offset(fdt, root_node, "fragment-0");
-	if (fragment_node >= 0) {
-		int overlay_node = fdt_subnode_offset(fdt, fragment_node, "__overlay__");
-		if (overlay_node >= 0) {
-			prop = fdt_getprop(fdt, overlay_node, "mk,instance", &len);
-			if (prop && len > 0)
-				instance_name = prop;
+	target->path = path;
+	target->instance = NULL;
 
-			prop = fdt_getprop(fdt, overlay_node, "mk,resources", &len);
-			if (prop && len > 0)
-				strscpy(tx->resources, prop, sizeof(tx->resources));
+	if (!strcmp(path, MK_OVERLAY_POOL_PATH)) {
+		if (!mk_cpu_pool) {
+			pr_err("Overlay tx%d: this kernel manages no pool, %s is not a valid target\n",
+			       tx->id, path);
+			return -EPERM;
+		}
+		target->kind = MK_OVERLAY_TARGET_POOL;
+		return 0;
+	}
+
+	if (!strcmp(path, MK_OVERLAY_INSTANCES_PATH)) {
+		target->kind = MK_OVERLAY_TARGET_INSTANCES;
+		return 0;
+	}
+
+	if (strncmp(path, MK_OVERLAY_INSTANCE_PREFIX,
+		    strlen(MK_OVERLAY_INSTANCE_PREFIX))) {
+		pr_err("Overlay tx%d: unsupported target-path '%s'\n",
+		       tx->id, path);
+		return -EINVAL;
+	}
+
+	name = path + strlen(MK_OVERLAY_INSTANCE_PREFIX);
+	if (!*name || strchr(name, '/')) {
+		pr_err("Overlay tx%d: '%s' does not name an instance\n",
+		       tx->id, path);
+		return -EINVAL;
+	}
+
+	mutex_lock(&mk_instance_mutex);
+	target->instance = mk_instance_find_by_name(name);
+	mutex_unlock(&mk_instance_mutex);
+
+	if (!target->instance) {
+		pr_err("Overlay tx%d: instance '%s' not found\n", tx->id, name);
+		return -ENOENT;
+	}
+
+	target->kind = MK_OVERLAY_TARGET_INSTANCE;
+	return 0;
+}
+
+static const char *mk_overlay_target_name(const struct mk_overlay_target *target)
+{
+	if (target->kind == MK_OVERLAY_TARGET_INSTANCE)
+		return target->instance->name;
+
+	return target->path;
+}
+
+static int mk_overlay_check_resource_target(struct mk_overlay_tx *tx,
+					    const struct mk_overlay_target *target,
+					    const char *op_name)
+{
+	if (target->kind == MK_OVERLAY_TARGET_INSTANCES) {
+		pr_err("Overlay tx%d: %s is not a resource holder, %s rejected\n",
+		       tx->id, target->path, op_name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int mk_overlay_check_namespace_target(struct mk_overlay_tx *tx,
+					     const struct mk_overlay_target *target,
+					     const char *op_name)
+{
+	if (target->kind != MK_OVERLAY_TARGET_INSTANCES) {
+		pr_err("Overlay tx%d: %s belongs under %s, not %s\n",
+		       tx->id, op_name, MK_OVERLAY_INSTANCES_PATH, target->path);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* reg = <u64 base, u64 size>, stored as four big-endian cells */
+static int mk_overlay_parse_mem_reg(const void *fdt, int item_node,
+				    const char *name, u64 *base, u64 *size)
+{
+	const fdt32_t *reg;
+	int len;
+
+	reg = fdt_getprop(fdt, item_node, "reg", &len);
+	if (!reg || len != 4 * (int)sizeof(fdt32_t)) {
+		pr_err("Invalid reg property in %s\n", name);
+		return -EINVAL;
+	}
+
+	*base = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
+	*size = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
+	return 0;
+}
+
+static int mk_overlay_parse_mem_size(const void *fdt, int item_node,
+				     const char *name, u64 *size)
+{
+	const fdt32_t *prop;
+	int len;
+
+	prop = fdt_getprop(fdt, item_node, "size", &len);
+	if (!prop || len != 2 * (int)sizeof(fdt32_t)) {
+		pr_err("Invalid size property in %s\n", name);
+		return -EINVAL;
+	}
+
+	*size = ((u64)fdt32_to_cpu(prop[0]) << 32) | fdt32_to_cpu(prop[1]);
+	if (!*size || !PAGE_ALIGNED(*size)) {
+		pr_err("%s: size 0x%llx is not a positive page multiple\n",
+		       name, *size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int mk_overlay_parse_numa(const void *fdt, int item_node,
+				 const char *name, int *node)
+{
+	const fdt32_t *prop;
+	int len;
+
+	*node = NUMA_NO_NODE;
+
+	prop = fdt_getprop(fdt, item_node, "numa-node-id", &len);
+	if (!prop)
+		return 0;
+
+	if (len != (int)sizeof(fdt32_t)) {
+		pr_err("Invalid numa-node-id property in %s\n", name);
+		return -EINVAL;
+	}
+
+	if (fdt32_to_cpu(*prop) >= MAX_NUMNODES) {
+		pr_err("%s: numa-node-id %u out of range\n", name,
+		       fdt32_to_cpu(*prop));
+		return -EINVAL;
+	}
+
+	*node = (int)fdt32_to_cpu(*prop);
+	return 0;
+}
+
+static u32 mk_overlay_parse_u32(const void *fdt, int item_node,
+				const char *prop_name)
+{
+	const fdt32_t *prop;
+	int len;
+
+	prop = fdt_getprop(fdt, item_node, prop_name, &len);
+	if (!prop || len != (int)sizeof(fdt32_t))
+		return 0;
+
+	return fdt32_to_cpu(*prop);
+}
+
+static int mk_overlay_parse_pci_id(const void *fdt, int item_node,
+				   const char *name, u16 *domain, u8 *bus,
+				   u8 *devfn)
+{
+	unsigned int d, b, slot, func;
+	const char *pci_id_str;
+	int len;
+
+	pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
+	if (!pci_id_str || len <= 0 || pci_id_str[len - 1] != '\0') {
+		pr_err("Invalid pci-id property in %s\n", name);
+		return -EINVAL;
+	}
+
+	if (sscanf(pci_id_str, "%x:%x:%x.%x", &d, &b, &slot, &func) != 4) {
+		pr_err("Invalid pci-id format '%s'\n", pci_id_str);
+		return -EINVAL;
+	}
+
+	*domain = (u16)d;
+	*bus = (u8)b;
+	*devfn = PCI_DEVFN(slot, func);
+	return 0;
+}
+
+/**
+ * mk_overlay_op_memory_add - Apply or undo a memory-add operation
+ * @undo: Send the inverse operation instead of the operation itself
+ *
+ * A pool item requests a size, since the pool picks the base; an
+ * instance item names the range explicitly.
+ */
+static int mk_overlay_op_memory_add(struct mk_overlay_tx *tx, const void *fdt,
+				    int op_node,
+				    const struct mk_overlay_target *target,
+				    bool undo)
+{
+	const char *verb = undo ? "Rollback" : "Overlay";
+	int item_node, ret;
+
+	ret = mk_overlay_check_resource_target(tx, target, "memory-add");
+	if (ret)
+		return ret;
+
+	fdt_for_each_subnode(item_node, fdt, op_node) {
+		const char *name = fdt_get_name(fdt, item_node, NULL);
+		u64 base, size;
+		int node, len;
+
+		if (!name || strncmp(name, "memory@", 7))
+			continue;
+
+		ret = mk_overlay_parse_numa(fdt, item_node, name, &node);
+		if (ret)
+			return ret;
+
+		if (target->kind == MK_OVERLAY_TARGET_POOL) {
+			if (fdt_getprop(fdt, item_node, "reg", &len)) {
+				pr_err("Overlay tx%d: %s adds pool memory by size, not by reg\n",
+				       tx->id, name);
+				return -EINVAL;
+			}
+
+			ret = mk_overlay_parse_mem_size(fdt, item_node, name,
+							&size);
+			if (ret)
+				return ret;
+
+			/*
+			 * The pool chose the base at grow time and the
+			 * overlay never recorded it, so the chunk cannot
+			 * be identified for a shrink.
+			 */
+			if (undo) {
+				pr_warn("Rollback tx%d: cannot release the %llu MB the pool grew by\n",
+					tx->id, size >> 20);
+				continue;
+			}
+
+			pr_info("Overlay tx%d: +memory %llu MB numa=%d -> %s\n",
+				tx->id, size >> 20, node, target->path);
+
+			ret = mk_pool_mem_grow(size, node, NULL);
+			if (ret) {
+				pr_err("Failed to grow the pool by %llu MB: %d\n",
+				       size >> 20, ret);
+				return ret;
+			}
+			continue;
+		}
+
+		ret = mk_overlay_parse_mem_reg(fdt, item_node, name, &base,
+					       &size);
+		if (ret)
+			return ret;
+
+		pr_info("%s tx%d: %cmemory 0x%llx-0x%llx (%llu MB) numa=%d %s %s\n",
+			verb, tx->id, undo ? '-' : '+', base, base + size - 1,
+			size >> 20, node, undo ? "from" : "->",
+			target->instance->name);
+
+		if (undo)
+			ret = mk_send_mem_remove(target->instance->id,
+						 base >> PAGE_SHIFT,
+						 size >> PAGE_SHIFT);
+		else
+			ret = mk_send_mem_add(target->instance->id,
+					      base >> PAGE_SHIFT,
+					      size >> PAGE_SHIFT, (u32)node,
+					      mk_overlay_parse_u32(fdt, item_node,
+								   "mem-type"));
+		if (ret < 0) {
+			pr_err("Failed to send memory IPI: %d\n", ret);
+			return ret;
 		}
 	}
 
-	if (instance_name)
-		strscpy(tx->instance_name, instance_name, sizeof(tx->instance_name));
+	return 0;
 }
 
-static struct mk_instance *mk_overlay_get_instance_for_operation(
-	int op_node, const void *fdt, const char *op_name, int tx_id)
+/**
+ * mk_overlay_op_memory_remove - Apply or undo a memory-remove operation
+ * @undo: Send the inverse operation instead of the operation itself
+ */
+static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt,
+				       int op_node,
+				       const struct mk_overlay_target *target,
+				       bool undo)
+{
+	const char *verb = undo ? "Rollback" : "Overlay";
+	int item_node, ret;
+
+	ret = mk_overlay_check_resource_target(tx, target, "memory-remove");
+	if (ret)
+		return ret;
+
+	fdt_for_each_subnode(item_node, fdt, op_node) {
+		const char *name = fdt_get_name(fdt, item_node, NULL);
+		u64 base, size;
+		int node;
+
+		if (!name || strncmp(name, "memory@", 7))
+			continue;
+
+		ret = mk_overlay_parse_mem_reg(fdt, item_node, name, &base,
+					       &size);
+		if (ret)
+			return ret;
+
+		ret = mk_overlay_parse_numa(fdt, item_node, name, &node);
+		if (ret)
+			return ret;
+
+		if (target->kind == MK_OVERLAY_TARGET_POOL) {
+			if (undo) {
+				/*
+				 * Only the capacity can be restored: the
+				 * kernel has since handed the old range
+				 * back to the buddy allocator.
+				 */
+				pr_info("Rollback tx%d: regrowing the pool by %llu MB\n",
+					tx->id, size >> 20);
+				ret = mk_pool_mem_grow(size, node, NULL);
+			} else {
+				pr_info("Overlay tx%d: -memory 0x%llx-0x%llx (%llu MB) from %s\n",
+					tx->id, base, base + size - 1,
+					size >> 20, target->path);
+				ret = mk_pool_mem_shrink(base, size);
+			}
+
+			if (ret) {
+				pr_err("Failed to resize the pool: %d\n", ret);
+				return ret;
+			}
+			continue;
+		}
+
+		pr_info("%s tx%d: %cmemory 0x%llx-0x%llx (%llu MB) %s %s\n",
+			verb, tx->id, undo ? '+' : '-', base, base + size - 1,
+			size >> 20, undo ? "->" : "from",
+			target->instance->name);
+
+		if (undo)
+			ret = mk_send_mem_add(target->instance->id,
+					      base >> PAGE_SHIFT,
+					      size >> PAGE_SHIFT, (u32)node,
+					      mk_overlay_parse_u32(fdt, item_node,
+								   "mem-type"));
+		else
+			ret = mk_send_mem_remove(target->instance->id,
+						 base >> PAGE_SHIFT,
+						 size >> PAGE_SHIFT);
+		if (ret < 0) {
+			pr_err("Failed to send memory IPI: %d\n", ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * mk_overlay_op_cpu - Move the CPUs listed under a cpu-add or cpu-remove node
+ * @give: True to hand the CPUs to the target, false to take them back
+ */
+static int mk_overlay_op_cpu(struct mk_overlay_tx *tx, const void *fdt,
+			     int op_node, const struct mk_overlay_target *target,
+			     bool give)
+{
+	int item_node, ret;
+
+	ret = mk_overlay_check_resource_target(tx, target, "cpu operation");
+	if (ret)
+		return ret;
+
+	fdt_for_each_subnode(item_node, fdt, op_node) {
+		const char *name = fdt_get_name(fdt, item_node, NULL);
+		mk_phys_cpu_t cpu_id;
+		int node;
+		u32 flags;
+
+		if (!name || strncmp(name, "cpu@", 4))
+			continue;
+
+		ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
+		if (ret)
+			return ret;
+
+		ret = mk_overlay_parse_numa(fdt, item_node, name, &node);
+		if (ret)
+			return ret;
+
+		flags = mk_overlay_parse_u32(fdt, item_node, "flags");
+
+		pr_info("Overlay tx%d: %ccpu %llu numa=%d %s %s\n",
+			tx->id, give ? '+' : '-', cpu_id, node,
+			give ? "->" : "from", mk_overlay_target_name(target));
+
+		if (target->kind == MK_OVERLAY_TARGET_POOL)
+			ret = give ? mk_pool_cpu_add(cpu_id) :
+				     mk_pool_cpu_remove(cpu_id, (u32)node, flags);
+		else if (give)
+			ret = mk_send_cpu_add(target->instance->id, cpu_id,
+					      (u32)node, flags);
+		else
+			ret = mk_send_cpu_remove(target->instance->id, cpu_id);
+
+		if (ret < 0) {
+			pr_err("Failed to move CPU %llu: %d\n", cpu_id, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * mk_overlay_op_device - Move the devices listed under a device-* node
+ * @give: True to hand the devices to the target, false to take them back
+ */
+static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
+				int op_node,
+				const struct mk_overlay_target *target,
+				bool give)
+{
+	int item_node, ret;
+
+	ret = mk_overlay_check_resource_target(tx, target, "device operation");
+	if (ret)
+		return ret;
+
+	fdt_for_each_subnode(item_node, fdt, op_node) {
+		const char *name = fdt_get_name(fdt, item_node, NULL);
+		const char *driver;
+		u16 domain;
+		u8 bus, devfn;
+		u32 flags;
+		int len;
+
+		if (!name || strncmp(name, "pci@", 4))
+			continue;
+
+		ret = mk_overlay_parse_pci_id(fdt, item_node, name, &domain,
+					      &bus, &devfn);
+		if (ret)
+			return ret;
+
+		driver = fdt_getprop(fdt, item_node, "driver", &len);
+		flags = mk_overlay_parse_u32(fdt, item_node, "flags");
+
+		pr_info("Overlay tx%d: %cdevice %04x:%02x:%02x.%x driver=%s %s %s\n",
+			tx->id, give ? '+' : '-', domain, bus, PCI_SLOT(devfn),
+			PCI_FUNC(devfn), driver ? driver : "none",
+			give ? "->" : "from", mk_overlay_target_name(target));
+
+		if (target->kind == MK_OVERLAY_TARGET_POOL)
+			ret = give ? mk_pool_device_add(domain, bus, devfn) :
+				     mk_pool_device_remove(domain, bus, devfn,
+							   NULL, 0);
+		else if (give)
+			ret = mk_send_device_add(target->instance->id, domain,
+						 bus, devfn, driver, flags);
+		else
+			ret = mk_send_device_remove(target->instance->id,
+						    domain, bus, devfn);
+
+		if (ret < 0) {
+			pr_err("Failed to move device %04x:%02x:%02x.%x: %d\n",
+			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+			       ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int mk_overlay_op_instance_create(struct mk_overlay_tx *tx,
+					 const void *fdt, int op_node,
+					 const struct mk_overlay_target *target)
+{
+	const char *instance_name;
+	const fdt32_t *id_prop;
+	int resources_node;
+	int instance_id;
+	int len, ret;
+
+	ret = mk_overlay_check_namespace_target(tx, target, "instance-create");
+	if (ret)
+		return ret;
+
+	instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
+	if (!instance_name || len <= 0) {
+		pr_err("Overlay tx%d: instance-create requires 'instance-name'\n",
+		       tx->id);
+		return -EINVAL;
+	}
+
+	if (strchr(instance_name, '/')) {
+		pr_err("Overlay tx%d: instance name '%s' must not contain '/'\n",
+		       tx->id, instance_name);
+		return -EINVAL;
+	}
+
+	id_prop = fdt_getprop(fdt, op_node, "id", &len);
+	instance_id = (id_prop && len == (int)sizeof(fdt32_t)) ?
+		      (int)fdt32_to_cpu(*id_prop) : -1;
+
+	resources_node = fdt_subnode_offset(fdt, op_node, "resources");
+	if (resources_node < 0) {
+		pr_err("Overlay tx%d: instance-create requires a 'resources' subnode\n",
+		       tx->id);
+		return -EINVAL;
+	}
+
+	mutex_lock(&mk_instance_mutex);
+
+	if (mk_instance_find_by_name(instance_name)) {
+		mutex_unlock(&mk_instance_mutex);
+		pr_err("Overlay tx%d: instance '%s' already exists\n",
+		       tx->id, instance_name);
+		return -EEXIST;
+	}
+
+	if (instance_id >= 0 && idr_find(&mk_instance_idr, instance_id)) {
+		mutex_unlock(&mk_instance_mutex);
+		pr_err("Overlay tx%d: instance ID %d is already in use\n",
+		       tx->id, instance_id);
+		return -EEXIST;
+	}
+
+	pr_info("Overlay tx%d: Creating instance '%s'\n", tx->id, instance_name);
+
+	ret = mk_create_instance_from_dtb(instance_name, instance_id, fdt,
+					  resources_node, tx->dtbo_size);
+	mutex_unlock(&mk_instance_mutex);
+
+	if (ret) {
+		pr_err("Overlay tx%d: Failed to create instance '%s': %d\n",
+		       tx->id, instance_name, ret);
+		return ret;
+	}
+
+	pr_info("Overlay tx%d: Instance '%s' created successfully\n",
+		tx->id, instance_name);
+	return 0;
+}
+
+static int mk_overlay_op_instance_remove(struct mk_overlay_tx *tx,
+					 const void *fdt, int op_node,
+					 const struct mk_overlay_target *target,
+					 bool undo)
 {
 	const char *instance_name;
 	struct mk_instance *instance;
-	int len;
+	int len, ret;
 
-	instance_name = fdt_getprop(fdt, op_node, "mk,instance", &len);
+	ret = mk_overlay_check_namespace_target(tx, target, "instance-remove");
+	if (ret)
+		return ret;
+
+	instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
 	if (!instance_name || len <= 0) {
-		pr_err("Overlay tx%d: %s requires mk,instance property\n",
-		       tx_id, op_name);
-		return NULL;
+		pr_err("Overlay tx%d: instance-remove requires 'instance-name'\n",
+		       tx->id);
+		return -EINVAL;
+	}
+
+	/*
+	 * Restoring a destroyed instance would need its whole configuration
+	 * kept alive somewhere; user space re-creates it with a new overlay.
+	 */
+	if (undo) {
+		pr_warn("Rollback tx%d: cannot restore removed instance '%s', apply an instance-create overlay\n",
+			tx->id, instance_name);
+		return 0;
 	}
 
 	mutex_lock(&mk_instance_mutex);
 	instance = mk_instance_find_by_name(instance_name);
-	mutex_unlock(&mk_instance_mutex);
-
 	if (!instance) {
-		pr_err("Overlay tx%d: %s instance '%s' not found\n",
-		       tx_id, op_name, instance_name);
-		return NULL;
+		mutex_unlock(&mk_instance_mutex);
+		pr_err("Overlay tx%d: instance '%s' not found\n",
+		       tx->id, instance_name);
+		return -ENOENT;
 	}
 
-	return instance;
+	pr_info("Overlay tx%d: Removing instance '%s' (ID: %d)\n",
+		tx->id, instance_name, instance->id);
+
+	ret = mk_instance_destroy(instance);
+	mutex_unlock(&mk_instance_mutex);
+
+	if (ret < 0) {
+		pr_err("Overlay tx%d: Failed to remove instance '%s': %d\n",
+		       tx->id, instance_name, ret);
+		return ret;
+	}
+
+	pr_info("Overlay tx%d: Instance '%s' removed successfully\n",
+		tx->id, instance_name);
+	return 0;
+}
+
+/* Undo of instance-create: destroy what the transaction created */
+static int mk_overlay_undo_instance_create(struct mk_overlay_tx *tx,
+					   const void *fdt, int op_node,
+					   const struct mk_overlay_target *target)
+{
+	const char *instance_name;
+	struct mk_instance *instance;
+	int len, ret;
+
+	ret = mk_overlay_check_namespace_target(tx, target, "instance-create");
+	if (ret)
+		return ret;
+
+	instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
+	if (!instance_name || len <= 0) {
+		pr_err("Rollback tx%d: instance-create requires 'instance-name'\n",
+		       tx->id);
+		return -EINVAL;
+	}
+
+	mutex_lock(&mk_instance_mutex);
+	instance = mk_instance_find_by_name(instance_name);
+	if (!instance) {
+		mutex_unlock(&mk_instance_mutex);
+		pr_warn("Rollback tx%d: instance '%s' is already gone\n",
+			tx->id, instance_name);
+		return 0;
+	}
+
+	pr_info("Rollback tx%d: Removing instance '%s' (ID: %d)\n",
+		tx->id, instance_name, instance->id);
+	ret = mk_instance_destroy(instance);
+	mutex_unlock(&mk_instance_mutex);
+
+	if (ret < 0)
+		pr_err("Rollback tx%d: Failed to destroy instance '%s': %d\n",
+		       tx->id, instance_name, ret);
+
+	return ret;
+}
+
+static int mk_overlay_fragment_overlay_node(struct mk_overlay_tx *tx,
+					    const void *fdt, int fragment,
+					    const struct mk_overlay_target *target)
+{
+	int overlay_node;
+
+	overlay_node = fdt_subnode_offset(fdt, fragment, "__overlay__");
+	if (overlay_node < 0)
+		pr_err("Overlay tx%d: fragment for %s has no __overlay__ node\n",
+		       tx->id, target->path);
+
+	return overlay_node;
+}
+
+static int mk_overlay_apply_fragment(struct mk_overlay_tx *tx, const void *fdt,
+				     int fragment)
+{
+	struct mk_overlay_target target;
+	int overlay_node, op_node, ret;
+
+	ret = mk_overlay_resolve_target(tx, fdt, fragment, &target);
+	if (ret)
+		return ret;
+
+	overlay_node = mk_overlay_fragment_overlay_node(tx, fdt, fragment,
+							&target);
+	if (overlay_node < 0)
+		return -EINVAL;
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_instance_create(tx, fdt, op_node, &target);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_memory_remove(tx, fdt, op_node, &target,
+						  false);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_memory_add(tx, fdt, op_node, &target, false);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, false);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_device(tx, fdt, op_node, &target, false);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_device(tx, fdt, op_node, &target, true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_instance_remove(tx, fdt, op_node, &target,
+						    false);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int mk_overlay_rollback_fragment(struct mk_overlay_tx *tx,
+					const void *fdt, int fragment)
+{
+	struct mk_overlay_target target;
+	int overlay_node, op_node, ret;
+
+	ret = mk_overlay_resolve_target(tx, fdt, fragment, &target);
+	if (ret)
+		return ret;
+
+	overlay_node = mk_overlay_fragment_overlay_node(tx, fdt, fragment,
+							&target);
+	if (overlay_node < 0)
+		return -EINVAL;
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_instance_remove(tx, fdt, op_node, &target,
+						    true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_device(tx, fdt, op_node, &target, false);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_device(tx, fdt, op_node, &target, true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, false);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_memory_add(tx, fdt, op_node, &target, true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
+	if (op_node >= 0) {
+		ret = mk_overlay_op_memory_remove(tx, fdt, op_node, &target,
+						  true);
+		if (ret)
+			return ret;
+	}
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");
+	if (op_node >= 0) {
+		ret = mk_overlay_undo_instance_create(tx, fdt, op_node, &target);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 /**
- * mk_overlay_parse_and_apply - Parse overlay and send resource changes via IPI
- *
- * This function parses the Device Tree overlay and translates resource changes
- * into IPI messages sent to the target instances. The overlay is always applied
- * by the host/root kernel, which then sends IPIs to the appropriate instances
- * (including itself) based on mk,instance properties in each operation section.
- *
- * Instance Creation:
- *   - instance-create operation creates a new kernel instance from DTB definition
- *   - Must be processed first before any resource operations
- *   - Requires 'name' and 'id' properties, plus /instances/<name> node in overlay
- *
- * Each resource operation section MUST specify mk,instance to indicate which
- * kernel instance the operation targets.
- *
- * Operation Ordering (Create-Remove-Modify-Add-Destroy):
- * Operations are processed in this order to ensure clean resource migration:
- *   0. instance-create - Create new instance first (if specified)
- *   1. memory-remove   - Remove memory from source instance first
- *   2. memory-add      - Then add memory to destination instance
- *   3. cpu-remove      - Remove CPU from source instance first
- *   4. cpu-add         - Then add CPU to destination instance
- *   5. device-remove   - Remove PCI device from source instance first
- *   6. device-add      - Then add PCI device to destination instance
- *   7. instance-remove - Remove instance last (after all resources transferred)
- *
- * This ordering prevents race conditions where a resource could be owned by
- * two instances simultaneously. The source instance must cleanly release the
- * resource before the destination instance can acquire it.
- *
- * Overlay format:
- *   fragment@0/__overlay__/
- *     ├── instance-create { instance-name = "<name>"; id = <N>; resources { ... }; }
- *     ├── instance-remove { instance-name = "<name>"; }
- *     ├── memory-remove { mk,instance = "source"; region@N { reg = <addr size>; }; }
- *     ├── memory-add { mk,instance = "target"; region@N { reg = <addr size>; }; }
- *     ├── cpu-remove { mk,instance = "source"; cpu@N { reg = <cpuid>; }; }
- *     ├── cpu-add { mk,instance = "target"; cpu@N { reg = <cpuid>; numa-node = <N>; }; }
- *     ├── device-remove { mk,instance = "source"; pci@N { pci-id = "DDDD:BB:SS.F"; }; }
- *     └── device-add { mk,instance = "target"; pci@N { pci-id = "DDDD:BB:SS.F"; driver = "vfio-pci"; }; }
+ * mk_overlay_parse_and_apply - Apply every fragment of a transaction
  *
  * Returns 0 on success, negative error code on failure.
  */
-static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
-				       const void *fdt)
+static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx, const void *fdt)
 {
-	int ret = 0;
-	int fragment_node, overlay_node;
-	int op_node, item_node;
-	const fdt32_t *reg;
-	const fdt32_t *numa;
-	int len;
+	struct mk_overlay_fragment *frags;
+	int i, nr, ret = 0;
 
-	/* Find fragment@0 */
-	fragment_node = fdt_subnode_offset(fdt, 0, "fragment@0");
-	if (fragment_node < 0) {
-		pr_err("No fragment@0 found in overlay\n");
-		return -EINVAL;
+	nr = mk_overlay_collect_fragments(fdt, &frags);
+	if (nr < 0) {
+		pr_err("Overlay tx%d: no usable fragment@N node\n", tx->id);
+		return nr;
 	}
 
-	/* Find __overlay__ */
-	overlay_node = fdt_subnode_offset(fdt, fragment_node, "__overlay__");
-	if (overlay_node < 0) {
-		pr_err("No __overlay__ found in fragment\n");
-		return -EINVAL;
+	for (i = 0; i < nr; i++) {
+		ret = mk_overlay_apply_fragment(tx, fdt, frags[i].node);
+		if (ret)
+			break;
 	}
 
-	/* Process instance-create operations first (must happen before any resource operations) */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");
-	if (op_node >= 0) {
-		const fdt32_t *id_prop;
-		const char *instance_name;
-		int resources_node;
-		u32 instance_id;
-
-		instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
-		if (!instance_name || len <= 0) {
-			pr_err("Overlay tx%d: instance-create requires 'instance-name' property\n", tx->id);
-			return -EINVAL;
-		}
-
-		id_prop = fdt_getprop(fdt, op_node, "id", &len);
-		if (id_prop && len >= 4) {
-			instance_id = fdt32_to_cpu(*id_prop);
-		} else {
-			instance_id = -1;
-		}
-
-		resources_node = fdt_subnode_offset(fdt, op_node, "resources");
-		if (resources_node < 0) {
-			pr_err("Overlay tx%d: instance-create requires 'resources' subnode\n", tx->id);
-			return -EINVAL;
-		}
-
-		mutex_lock(&mk_instance_mutex);
-
-		if (mk_instance_find_by_name(instance_name)) {
-			mutex_unlock(&mk_instance_mutex);
-			pr_err("Overlay tx%d: instance '%s' already exists\n", tx->id, instance_name);
-			return -EEXIST;
-		}
-
-		if (instance_id >= 0 && idr_find(&mk_instance_idr, instance_id)) {
-			mutex_unlock(&mk_instance_mutex);
-			pr_err("Overlay tx%d: instance ID %u is already in use\n", tx->id, instance_id);
-			pr_err("Overlay tx%d: Use a different ID or omit the 'id' property for auto-allocation\n", tx->id);
-			return -EEXIST;
-		}
-
-		if (instance_id >= 0) {
-			pr_info("Overlay tx%d: Creating instance '%s' (ID: %u)\n",
-				tx->id, instance_name, instance_id);
-		} else {
-			pr_info("Overlay tx%d: Creating instance '%s' (ID: auto-allocated)\n",
-				tx->id, instance_name);
-		}
-
-		ret = mk_create_instance_from_dtb(instance_name, instance_id,
-						  fdt, resources_node, tx->dtbo_size);
-		mutex_unlock(&mk_instance_mutex);
-
-		if (ret) {
-			pr_err("Overlay tx%d: Failed to create instance '%s': %d\n",
-			       tx->id, instance_name, ret);
-			return ret;
-		}
-
-		pr_info("Overlay tx%d: Instance '%s' created successfully\n",
-			tx->id, instance_name);
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
-	if (op_node >= 0) {
-		struct mk_instance *remove_instance;
-
-		remove_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "memory-remove", tx->id);
-		if (!remove_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "region@", 7) != 0)
-				continue;
-
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 16) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
-
-			u64 addr = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
-			u64 size = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
-			u64 start_pfn = addr >> PAGE_SHIFT;
-			u64 nr_pages = size >> PAGE_SHIFT;
-
-			pr_info("Overlay tx%d: -memory 0x%llx-0x%llx (%llu MB) from %s\n",
-				tx->id, addr, addr + size - 1, size >> 20,
-				remove_instance->name);
-
-			ret = mk_send_mem_remove(remove_instance->id, start_pfn, nr_pages);
-			if (ret < 0) {
-				pr_err("Failed to send mem_remove IPI: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
-	if (op_node >= 0) {
-		struct mk_instance *add_instance;
-
-		add_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "memory-add", tx->id);
-		if (!add_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "region@", 7) != 0)
-				continue;
-
-			/* Get memory region: reg = <addr-hi addr-lo size-hi size-lo> */
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 16) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
-
-			u64 addr = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
-			u64 size = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
-			u64 start_pfn = addr >> PAGE_SHIFT;
-			u64 nr_pages = size >> PAGE_SHIFT;
-
-			/* Get optional numa-node */
-			int numa_node = NUMA_NO_NODE;
-			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
-			if (numa && len >= 4)
-				numa_node = fdt32_to_cpu(*numa);
-
-			/* Get optional mem-type */
-			u32 mem_type = 0;
-			const fdt32_t *type = fdt_getprop(fdt, item_node, "mem-type", &len);
-			if (type && len >= 4)
-				mem_type = fdt32_to_cpu(*type);
-
-			pr_info("Overlay tx%d: +memory 0x%llx-0x%llx (%llu MB) numa=%d -> %s\n",
-				tx->id, addr, addr + size - 1, size >> 20,
-				numa_node, add_instance->name);
-
-			ret = mk_send_mem_add(add_instance->id, start_pfn, nr_pages,
-					      (u32)numa_node, mem_type);
-			if (ret < 0) {
-				pr_err("Failed to send mem_add IPI: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
-	if (op_node >= 0) {
-		struct mk_instance *remove_instance;
-
-		remove_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "cpu-remove", tx->id);
-		if (!remove_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "cpu@", 4) != 0)
-				continue;
-
-			mk_phys_cpu_t cpu_id;
-
-			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
-			if (ret)
-				return ret;
-
-			pr_info("Overlay tx%d: -cpu %llu from %s\n",
-				tx->id, cpu_id, remove_instance->name);
-
-			ret = mk_send_cpu_remove(remove_instance->id, cpu_id);
-			if (ret < 0) {
-				pr_err("Failed to send cpu_remove IPI: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
-	if (op_node >= 0) {
-		struct mk_instance *add_instance;
-
-		add_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "cpu-add", tx->id);
-		if (!add_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "cpu@", 4) != 0)
-				continue;
-
-			/* Get CPU ID: reg = <cpuid> */
-			mk_phys_cpu_t cpu_id;
-
-			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
-			if (ret)
-				return ret;
-
-			/* Get optional numa-node */
-			int numa_node = NUMA_NO_NODE;
-			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
-			if (numa && len >= 4)
-				numa_node = fdt32_to_cpu(*numa);
-
-			/* Get optional flags */
-			u32 flags = 0;
-			const fdt32_t *flags_prop = fdt_getprop(fdt, item_node, "flags", &len);
-			if (flags_prop && len >= 4)
-				flags = fdt32_to_cpu(*flags_prop);
-
-			pr_info("Overlay tx%d: +cpu %llu numa=%d -> %s\n",
-				tx->id, cpu_id, numa_node, add_instance->name);
-
-			ret = mk_send_cpu_add(add_instance->id, cpu_id, (u32)numa_node, flags);
-			if (ret < 0) {
-				pr_err("Failed to send cpu_add IPI: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/* Process device-remove operations */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
-	if (op_node >= 0) {
-		struct mk_instance *remove_instance;
-
-		remove_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "device-remove", tx->id);
-		if (!remove_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-			const char *pci_id_str;
-			unsigned int domain, bus, slot, func;
-
-			if (strncmp(name, "pci@", 4) != 0)
-				continue;
-
-			/* Get PCI ID: pci-id = "DDDD:BB:SS.F" */
-			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
-			if (!pci_id_str) {
-				pr_err("Invalid pci-id property in %s\n", name);
-				return -EINVAL;
-			}
-
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
-			}
-
-			pr_info("Overlay tx%d: -device %04x:%02x:%02x.%x from %s\n",
-				tx->id, domain, bus, slot, func, remove_instance->name);
-
-			ret = mk_send_device_remove(remove_instance->id, domain, bus,
-						    PCI_DEVFN(slot, func));
-			if (ret < 0) {
-				pr_err("Failed to send device_remove IPI: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/* Process device-add operations */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
-	if (op_node >= 0) {
-		struct mk_instance *add_instance;
-
-		add_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "device-add", tx->id);
-		if (!add_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-			const char *pci_id_str;
-			const char *driver_name = NULL;
-			unsigned int domain, bus, slot, func;
-			u32 flags = 0;
-
-			if (strncmp(name, "pci@", 4) != 0)
-				continue;
-
-			/* Get PCI ID: pci-id = "DDDD:BB:SS.F" */
-			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
-			if (!pci_id_str) {
-				pr_err("Invalid pci-id property in %s\n", name);
-				return -EINVAL;
-			}
-
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
-			}
-
-			/* Get optional driver override */
-			driver_name = fdt_getprop(fdt, item_node, "driver", &len);
-
-			/* Get optional flags */
-			const fdt32_t *flags_prop = fdt_getprop(fdt, item_node, "flags", &len);
-			if (flags_prop && len >= 4)
-				flags = fdt32_to_cpu(*flags_prop);
-
-			pr_info("Overlay tx%d: +device %04x:%02x:%02x.%x driver=%s -> %s\n",
-				tx->id, domain, bus, slot, func,
-				driver_name ? driver_name : "none",
-				add_instance->name);
-
-			ret = mk_send_device_add(add_instance->id, domain, bus,
-						 PCI_DEVFN(slot, func), driver_name, flags);
-			if (ret < 0) {
-				pr_err("Failed to send device_add IPI: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/* Process instance-remove operations last (after all resources have been migrated) */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
-	if (op_node >= 0) {
-		const char *instance_name;
-		struct mk_instance *instance;
-
-		instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
-		if (!instance_name || len <= 0) {
-			pr_err("Overlay tx%d: instance-remove requires 'instance-name' property\n", tx->id);
-			return -EINVAL;
-		}
-
-		mutex_lock(&mk_instance_mutex);
-		instance = mk_instance_find_by_name(instance_name);
-		if (!instance) {
-			mutex_unlock(&mk_instance_mutex);
-			pr_err("Overlay tx%d: instance '%s' not found\n", tx->id, instance_name);
-			return -ENOENT;
-		}
-
-		pr_info("Overlay tx%d: Removing instance '%s' (ID: %d)\n",
-			tx->id, instance_name, instance->id);
-
-		ret = mk_instance_destroy(instance);
-		mutex_unlock(&mk_instance_mutex);
-
-		if (ret < 0) {
-			pr_err("Overlay tx%d: Failed to remove instance '%s': %d\n",
-			       tx->id, instance_name, ret);
-			return ret;
-		}
-
-		pr_info("Overlay tx%d: Instance '%s' removed successfully\n",
-			tx->id, instance_name);
-	}
-
-	return 0;
+	kfree(frags);
+	return ret;
 }
 
 /**
- * mk_overlay_parse_and_rollback - Parse overlay and send reverse IPI operations
+ * mk_overlay_parse_and_rollback - Undo every fragment of a transaction
  *
- * This function rolls back an applied overlay by sending reverse operations
- * in REVERSE ORDER to maintain symmetry with the apply path.
+ * Fragments and the operations inside them are walked in reverse of the
+ * apply order, so a resource is released before it is handed back.
  *
- * Normal apply order (Create-Remove-Modify-Add-Destroy):
- *   0. instance-create - Create new instance
- *   1. memory-remove from source
- *   2. memory-add to destination
- *   3. cpu-remove from source
- *   4. cpu-add to destination
- *   5. device-remove from source
- *   6. device-add to destination
- *   7. instance-remove - Remove instance
- *
- * Rollback order (must be exact reverse - Restore-Add-Modify-Remove-Destroy):
- *   1. instance-remove → re-create instance (undo instance-remove, restore instance)
- *   2. device-add → device-remove (undo device-add, remove from destination)
- *   3. device-remove → device-add (undo device-remove, add back to source)
- *   4. cpu-add → cpu-remove (undo cpu-add, remove from destination)
- *   5. cpu-remove → cpu-add (undo cpu-remove, add back to source)
- *   6. memory-add → memory-remove (undo memory-add, remove from destination)
- *   7. memory-remove → memory-add (undo memory-remove, add back to source)
- *   8. instance-create → destroy instance (undo instance-create, remove instance)
- *
- * This ordering ensures clean resource migration in reverse, preventing
- * race conditions and maintaining the same safety guarantees as the forward path.
- * Instance removal is done LAST to ensure all resources are returned first.
- * Instance re-creation is done FIRST to ensure the instance exists before resources are added back.
- *
- * Each operation section must have mk,instance property for rollback to work.
+ * Returns 0 on success, negative error code on failure.
  */
 static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
-					  const void *fdt)
+					 const void *fdt)
 {
-	int ret = 0;
-	int fragment_node, overlay_node;
-	int op_node, item_node;
-	const fdt32_t *reg;
-	const fdt32_t *numa;
-	int len;
+	struct mk_overlay_fragment *frags;
+	int i, nr, ret = 0;
 
-	fragment_node = fdt_subnode_offset(fdt, 0, "fragment@0");
-	if (fragment_node < 0) {
-		pr_err("No fragment@0 found in overlay\n");
-		return -EINVAL;
+	nr = mk_overlay_collect_fragments(fdt, &frags);
+	if (nr < 0) {
+		pr_err("Rollback tx%d: no usable fragment@N node\n", tx->id);
+		return nr;
 	}
 
-	overlay_node = fdt_subnode_offset(fdt, fragment_node, "__overlay__");
-	if (overlay_node < 0) {
-		pr_err("No __overlay__ found in fragment\n");
-		return -EINVAL;
+	for (i = nr - 1; i >= 0; i--) {
+		ret = mk_overlay_rollback_fragment(tx, fdt, frags[i].node);
+		if (ret)
+			break;
 	}
 
-	/*
-	 * STEP 1: Rollback instance-remove → re-create instance
-	 * (Reverse of last operation in apply path)
-	 * NOTE: Full rollback of instance-remove would require storing the instance's
-	 * original configuration, which is complex. For now, we log a warning.
-	 * The proper way to restore a removed instance is to apply a new overlay
-	 * with instance-create that recreates it with the desired resources.
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
-	if (op_node >= 0) {
-		const char *instance_name;
-
-		instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
-		if (!instance_name || len <= 0) {
-			pr_err("Rollback tx%d: instance-remove requires 'instance-name' property\n", tx->id);
-			return -EINVAL;
-		}
-
-		pr_warn("Rollback tx%d: Cannot automatically restore removed instance '%s'\n",
-			tx->id, instance_name);
-		pr_warn("Rollback tx%d: To restore instance '%s', apply a new overlay with instance-create\n",
-			tx->id, instance_name);
-		/* Not a fatal error - continue with other rollback operations */
-	}
-
-	/*
-	 * STEP 2: Rollback device-add → send device-remove
-	 * (Reverse of sixth operation in apply path)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
-	if (op_node >= 0) {
-		struct mk_instance *add_instance;
-
-		add_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "device-add", tx->id);
-		if (!add_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-			const char *pci_id_str;
-			unsigned int domain, bus, slot, func;
-
-			if (strncmp(name, "pci@", 4) != 0)
-				continue;
-
-			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
-			if (!pci_id_str) {
-				pr_err("Invalid pci-id property in %s\n", name);
-				return -EINVAL;
-			}
-
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
-			}
-
-			pr_info("Rollback tx%d: -device %04x:%02x:%02x.%x from %s\n",
-				tx->id, domain, bus, slot, func, add_instance->name);
-
-			/* Send remove for what was added */
-			ret = mk_send_device_remove(add_instance->id, domain, bus,
-						    PCI_DEVFN(slot, func));
-			if (ret < 0) {
-				pr_err("Failed to send device_remove IPI for rollback: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/*
-	 * STEP 3: Rollback device-remove → send device-add
-	 * (Reverse of fifth operation in apply path)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
-	if (op_node >= 0) {
-		struct mk_instance *remove_instance;
-
-		remove_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "device-remove", tx->id);
-		if (!remove_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-			const char *pci_id_str;
-			const char *driver_name = NULL;
-			unsigned int domain, bus, slot, func;
-			u32 flags = 0;
-
-			if (strncmp(name, "pci@", 4) != 0)
-				continue;
-
-			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
-			if (!pci_id_str) {
-				pr_err("Invalid pci-id property in %s\n", name);
-				return -EINVAL;
-			}
-
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
-			}
-
-			/* Get optional driver override */
-			driver_name = fdt_getprop(fdt, item_node, "driver", &len);
-
-			/* Get optional flags */
-			const fdt32_t *flags_prop = fdt_getprop(fdt, item_node, "flags", &len);
-			if (flags_prop && len >= 4)
-				flags = fdt32_to_cpu(*flags_prop);
-
-			pr_info("Rollback tx%d: +device %04x:%02x:%02x.%x driver=%s to %s\n",
-				tx->id, domain, bus, slot, func,
-				driver_name ? driver_name : "none",
-				remove_instance->name);
-
-			/* Send add for what was removed */
-			ret = mk_send_device_add(remove_instance->id, domain, bus,
-						 PCI_DEVFN(slot, func), driver_name, flags);
-			if (ret < 0) {
-				pr_err("Failed to send device_add IPI for rollback: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/*
-	 * STEP 4: Rollback cpu-add → send cpu-remove
-	 * (Reverse of fourth operation in apply path)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
-	if (op_node >= 0) {
-		struct mk_instance *add_instance;
-
-		add_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "cpu-add", tx->id);
-		if (!add_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "cpu@", 4) != 0)
-				continue;
-
-			mk_phys_cpu_t cpu_id;
-
-			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
-			if (ret)
-				return ret;
-
-			pr_info("Rollback tx%d: -cpu %llu from %s\n",
-				tx->id, cpu_id, add_instance->name);
-
-			/* Send remove for what was added */
-			ret = mk_send_cpu_remove(add_instance->id, cpu_id);
-			if (ret < 0) {
-				pr_err("Failed to send cpu_remove IPI for rollback: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/*
-	 * STEP 5: Rollback cpu-remove → send cpu-add
-	 * (Reverse of third operation in apply path)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
-	if (op_node >= 0) {
-		struct mk_instance *remove_instance;
-
-		remove_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "cpu-remove", tx->id);
-		if (!remove_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "cpu@", 4) != 0)
-				continue;
-
-			mk_phys_cpu_t cpu_id;
-
-			ret = mk_overlay_parse_cpu_reg(fdt, item_node, name, &cpu_id);
-			if (ret)
-				return ret;
-
-			/* Get optional numa-node */
-			int numa_node = NUMA_NO_NODE;
-			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
-			if (numa && len >= 4)
-				numa_node = fdt32_to_cpu(*numa);
-
-			/* Get optional flags */
-			u32 flags = 0;
-			const fdt32_t *flags_prop = fdt_getprop(fdt, item_node, "flags", &len);
-			if (flags_prop && len >= 4)
-				flags = fdt32_to_cpu(*flags_prop);
-
-			pr_info("Rollback tx%d: +cpu %llu numa=%d to %s\n",
-				tx->id, cpu_id, numa_node, remove_instance->name);
-
-			/* Send add for what was removed */
-			ret = mk_send_cpu_add(remove_instance->id, cpu_id,
-					      (u32)numa_node, flags);
-			if (ret < 0) {
-				pr_err("Failed to send cpu_add IPI for rollback: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/*
-	 * STEP 6: Rollback memory-add → send memory-remove
-	 * (Reverse of second operation in apply path)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
-	if (op_node >= 0) {
-		struct mk_instance *add_instance;
-
-		add_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "memory-add", tx->id);
-		if (!add_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "region@", 7) != 0)
-				continue;
-
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 16) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
-
-			u64 addr = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
-			u64 size = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
-			u64 start_pfn = addr >> PAGE_SHIFT;
-			u64 nr_pages = size >> PAGE_SHIFT;
-
-			pr_info("Rollback tx%d: -memory 0x%llx-0x%llx (%llu MB) from %s\n",
-				tx->id, addr, addr + size - 1, size >> 20,
-				add_instance->name);
-
-			/* Send remove for what was added */
-			ret = mk_send_mem_remove(add_instance->id, start_pfn, nr_pages);
-			if (ret < 0) {
-				pr_err("Failed to send mem_remove IPI for rollback: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/*
-	 * STEP 7: Rollback memory-remove → send memory-add
-	 * (Reverse of first operation in apply path)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
-	if (op_node >= 0) {
-		struct mk_instance *remove_instance;
-
-		remove_instance = mk_overlay_get_instance_for_operation(
-			op_node, fdt, "memory-remove", tx->id);
-		if (!remove_instance)
-			return -EINVAL;
-
-		fdt_for_each_subnode(item_node, fdt, op_node) {
-			const char *name = fdt_get_name(fdt, item_node, NULL);
-
-			if (strncmp(name, "region@", 7) != 0)
-				continue;
-
-			reg = fdt_getprop(fdt, item_node, "reg", &len);
-			if (!reg || len < 16) {
-				pr_err("Invalid reg property in %s\n", name);
-				return -EINVAL;
-			}
-
-			u64 addr = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
-			u64 size = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
-			u64 start_pfn = addr >> PAGE_SHIFT;
-			u64 nr_pages = size >> PAGE_SHIFT;
-
-			/* Get optional numa-node */
-			int numa_node = NUMA_NO_NODE;
-			numa = fdt_getprop(fdt, item_node, "numa-node", &len);
-			if (numa && len >= 4)
-				numa_node = fdt32_to_cpu(*numa);
-
-			/* Get optional mem-type */
-			u32 mem_type = 0;
-			const fdt32_t *type = fdt_getprop(fdt, item_node, "mem-type", &len);
-			if (type && len >= 4)
-				mem_type = fdt32_to_cpu(*type);
-
-			pr_info("Rollback tx%d: +memory 0x%llx-0x%llx (%llu MB) numa=%d to %s\n",
-				tx->id, addr, addr + size - 1, size >> 20,
-				numa_node, remove_instance->name);
-
-			/* Send add for what was removed */
-			ret = mk_send_mem_add(remove_instance->id, start_pfn, nr_pages,
-					      (u32)numa_node, mem_type);
-			if (ret < 0) {
-				pr_err("Failed to send mem_add IPI for rollback: %d\n", ret);
-				return ret;
-			}
-		}
-	}
-
-	/*
-	 * STEP 8: Rollback instance-create → remove the instance
-	 * (Reverse of zeroth operation in apply path - must be LAST)
-	 */
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");
-	if (op_node >= 0) {
-		const char *instance_name;
-		struct mk_instance *instance;
-
-		instance_name = fdt_getprop(fdt, op_node, "instance-name", &len);
-		if (!instance_name || len <= 0) {
-			pr_err("Rollback tx%d: instance-create requires 'instance-name' property\n", tx->id);
-			return -EINVAL;
-		}
-
-		mutex_lock(&mk_instance_mutex);
-		instance = mk_instance_find_by_name(instance_name);
-		if (!instance) {
-			mutex_unlock(&mk_instance_mutex);
-			pr_warn("Rollback tx%d: instance '%s' not found (may have been removed already)\n",
-				tx->id, instance_name);
-			return 0; /* Not a fatal error - instance already gone */
-		}
-
-		pr_info("Rollback tx%d: Removing instance '%s' (ID: %d)\n",
-			tx->id, instance_name, instance->id);
-		ret = mk_instance_destroy(instance);
-		mutex_unlock(&mk_instance_mutex);
-
-		if (ret < 0) {
-			pr_err("Rollback tx%d: Failed to destroy instance '%s': %d\n",
-			       tx->id, instance_name, ret);
-			return ret;
-		}
-
-		pr_info("Rollback tx%d: Instance '%s' removed successfully\n",
-			tx->id, instance_name);
-	}
-
-	return 0;
+	kfree(frags);
+	return ret;
 }
 
 static int mk_overlay_create_tx_files(struct mk_overlay_tx *tx)
@@ -1175,8 +1303,8 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 
 	mk_overlay_parse_metadata(tx, dtbo_data);
 
-	pr_info("Applying overlay transaction %d (metadata: instance=%s, resources=%s)\n",
-		tx->id, tx->instance_name, tx->resources);
+	pr_info("Applying overlay transaction %d (target=%s, resources=%s)\n",
+		tx->id, tx->target_path, tx->resources);
 
 	ret = mk_overlay_parse_and_apply(tx, dtbo_data);
 

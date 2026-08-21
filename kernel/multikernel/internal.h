@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include <linux/multikernel.h>
+
 struct mk_dt_config;
 struct mk_cpu_resource_payload;
 
@@ -35,6 +37,16 @@ int mk_arm_force_halt(struct mk_instance *instance);
 int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);
 int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
+
+/*
+ * Move primitives between this kernel and the pool it manages. Valid
+ * only while mk_cpu_pool is non-NULL.
+ */
+int mk_pool_cpu_add(mk_phys_cpu_t cpu_id);
+int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
+int mk_pool_device_add(u16 domain, u8 bus, u8 devfn);
+int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
+			  const char *driver_override, u32 flags);
 
 /* Root pool bookkeeping for PCI devices, see core.c */
 bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn);
