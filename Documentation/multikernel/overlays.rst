@@ -106,14 +106,22 @@ Operation Sections
     Subnodes:
       - ``resources``: initial allocation for the instance
 
+    ``resources`` properties:
+      - ``memory-bytes``: amount of pool memory to give the instance (u64)
+      - ``cpus``: physical CPU IDs to give the instance (array of u64)
+      - ``numa-nodes``: NUMA nodes to allocate the memory from (array of u32,
+        optional). Only the first entry is used; the memory comes from that
+        node's pool chunks, or from any node when the property is absent.
+
     Example::
 
         instance-create {
             instance-name = "my-kernel";
             id = <1>;
             resources {
-                memory-bytes = <0x40000000>;    /* 1GB */
-                cpus = <4 5 6>;
+                memory-bytes = <0x0 0x40000000>;    /* 1GB */
+                cpus = <0x0 0x4  0x0 0x5  0x0 0x6>;
+                numa-nodes = <0>;
             };
         };
 
@@ -148,7 +156,7 @@ Operation Sections
 **cpu-add**, **cpu-remove**
     Subnodes are ``cpu@N`` items:
 
-      - ``reg``: physical CPU ID (u64, or u32 for older overlays)
+      - ``reg``: physical CPU ID (u64, or a single u32 cell)
       - ``numa-node-id``: NUMA node (u32, optional)
       - ``flags``: CPU flags (u32, optional)
 
@@ -335,8 +343,8 @@ second fragment refers to it::
                     instance-name = "compute";
                     id = <3>;
                     resources {
-                        memory-bytes = <0x10000000>;    /* 256MB */
-                        cpus = <8>;
+                        memory-bytes = <0x0 0x10000000>;    /* 256MB */
+                        cpus = <0x0 0x8>;
                     };
                 };
             };

@@ -381,7 +381,6 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
 extern phys_addr_t multikernel_alloc(size_t size, int node);
 extern void multikernel_free(phys_addr_t addr, size_t size);
-bool mk_pool_contains(phys_addr_t start, size_t size);
 struct resource *mk_pool_chunk_resource(phys_addr_t addr);
 size_t mk_pool_total_bytes(void);
 size_t mk_pool_avail_bytes(void);
@@ -915,28 +914,6 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 #define MK_DT_RESOURCE_CPUS     "cpus"
 #define MK_DT_RESOURCE_DEVICES  "devices"
 #define MK_DT_RESOURCE_NUMA     "numa-nodes"
-
-static const char * const mk_resource_properties[] = {
-	MK_DT_RESOURCE_MEMORY,
-	MK_DT_RESOURCE_CPUS,
-	MK_DT_RESOURCE_DEVICES,
-	MK_DT_RESOURCE_NUMA,
-	NULL  /* Sentinel */
-};
-
-static inline bool mk_is_resource_property(const char *prop_name)
-{
-	const char * const *prop;
-
-	if (!prop_name)
-		return false;
-
-	for (prop = mk_resource_properties; *prop; prop++) {
-		if (strcmp(prop_name, *prop) == 0)
-			return true;
-	}
-	return false;
-}
 
 /**
  * Manifest Integration Functions

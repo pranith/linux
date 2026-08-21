@@ -118,23 +118,6 @@ struct resource *mk_pool_chunk_resource(phys_addr_t addr)
 }
 
 /**
- * mk_pool_contains() - Test whether a range lies inside one pool chunk
- * @start: physical start address
- * @size: size in bytes
- */
-bool mk_pool_contains(phys_addr_t start, size_t size)
-{
-	struct mk_pool_chunk *chunk;
-	bool ret;
-
-	mutex_lock(&multikernel_mem_mutex);
-	chunk = mk_pool_chunk_find(start);
-	ret = chunk && start + size - 1 <= chunk->res.end;
-	mutex_unlock(&multikernel_mem_mutex);
-	return ret;
-}
-
-/**
  * mk_pool_empty() - Test whether the pool holds no memory at all
  */
 bool mk_pool_empty(void)

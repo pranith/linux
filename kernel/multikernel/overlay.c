@@ -27,8 +27,8 @@
 #include "internal.h"
 
 /*
- * Parse a cpu@N node's reg property into a physical CPU ID. Accepts one
- * 64-bit cell or, for compatibility with older overlays, one 32-bit cell.
+ * Parse a cpu@N node's reg property into a physical CPU ID. Accepts either
+ * one 64-bit cell or one 32-bit cell.
  */
 static int mk_overlay_parse_cpu_reg(const void *fdt, int item_node,
 				    const char *name, mk_phys_cpu_t *cpu_id)
@@ -901,11 +901,18 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 		driver = fdt_getprop(fdt, item_node, "driver", &len);
 		flags = mk_overlay_parse_u32(fdt, item_node, "flags");
 
-		pr_info("%s tx%d: %cdevice %04x:%02x:%02x.%x driver=%s %s %s\n",
-			verb, tx->id, give ? '+' : '-', domain, bus,
-			PCI_SLOT(devfn), PCI_FUNC(devfn),
-			driver ? driver : "none", give ? "->" : "from",
-			mk_overlay_target_name(target));
+		if (target->kind == MK_OVERLAY_TARGET_POOL)
+			pr_info("%s tx%d: %cdevice %04x:%02x:%02x.%x %s %s\n",
+				verb, tx->id, give ? '+' : '-', domain, bus,
+				PCI_SLOT(devfn), PCI_FUNC(devfn),
+				give ? "->" : "from",
+				mk_overlay_target_name(target));
+		else
+			pr_info("%s tx%d: %cdevice %04x:%02x:%02x.%x driver=%s %s %s\n",
+				verb, tx->id, give ? '+' : '-', domain, bus,
+				PCI_SLOT(devfn), PCI_FUNC(devfn),
+				driver ? driver : "none", give ? "->" : "from",
+				mk_overlay_target_name(target));
 
 		if (target->kind == MK_OVERLAY_TARGET_POOL)
 			ret = give ? mk_pool_device_add(domain, bus, devfn) :

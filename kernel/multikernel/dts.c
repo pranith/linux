@@ -186,7 +186,7 @@ static int mk_dt_parse_numa(const void *fdt, int chosen_node,
 	}
 
 	config->numa_node = node;
-	pr_info("Successfully parsed NUMA node: %d\n", config->numa_node);
+	pr_debug("Successfully parsed NUMA node: %d\n", config->numa_node);
 	return 0;
 }
 
@@ -971,14 +971,11 @@ static int mk_dt_emit_pool_members(void *fdt)
 	/*
 	 * The root device tree is only generated from kernfs reads, which
 	 * hold no instance lock; instance creation generates a device tree
-	 * for the new instance, never for the root.
+	 * for the new instance, never for the root. mk_cpu_pool itself is
+	 * mutated under no lock, so a concurrent move can still make this
+	 * snapshot stale.
 	 */
 	lockdep_assert_not_held(&mk_instance_mutex);
-
-	/*
-	 * mk_cpu_pool is mutated under no lock at all by the pool move
-	 * primitives, so a concurrent move can make this snapshot stale.
-	 */
 
 	mutex_lock(&mk_instance_mutex);
 	ret = mk_cpu_set_copy(members, mk_cpu_pool);

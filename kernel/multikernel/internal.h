@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef _KERNEL_MULTIKERNEL_INTERNAL_H
+#define _KERNEL_MULTIKERNEL_INTERNAL_H
+
 #include <linux/multikernel.h>
 
 struct mk_dt_config;
@@ -70,3 +73,5 @@ extern struct mk_cpu_set *mk_cpu_pool;
 
 /* manifest.c */
 phys_addr_t mk_manifest_phys(void);
+
+#endif /* _KERNEL_MULTIKERNEL_INTERNAL_H */
