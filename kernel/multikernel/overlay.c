@@ -72,7 +72,12 @@ struct mk_overlay_tx {
 
 struct kernfs_node *mk_overlay_root_kn;          /* /sys/fs/multikernel/overlays */
 static LIST_HEAD(mk_overlay_tx_list);            /* List of all transactions */
-static DEFINE_MUTEX(mk_overlay_mutex);           /* Protects transaction list */
+/*
+ * Serializes every user-driven reconfiguration of this kernel's resources:
+ * the transaction list, overlay application and rollback, and the baseline
+ * write in kernfs.c. Two writers would otherwise run pool moves at once.
+ */
+DEFINE_MUTEX(mk_overlay_mutex);
 static atomic_t mk_overlay_next_id = ATOMIC_INIT(1); /* Next transaction ID */
 
 /* Forward declarations */
@@ -699,6 +704,10 @@ static int mk_overlay_pool_mem_remove(struct mk_overlay_tx *tx, u64 base,
 	ret = mk_pool_mem_shrink(base, size);
 	if (ret) {
 		pr_err("Failed to resize the pool: %d\n", ret);
+		/* The chunk stayed, so the pool must get its park area back */
+		if (mk_setup_host_park())
+			pr_err("Overlay tx%d: the host park area could not be rebuilt; a memory-add will retry\n",
+			       tx->id);
 		return ret;
 	}
 
@@ -1376,6 +1385,8 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 	pr_info("Applying overlay transaction %d (target=%s, resources=%s)\n",
 		tx->id, tx->target_path, tx->resources);
 
+	guard(mutex)(&mk_overlay_mutex);
+
 	ret = mk_overlay_parse_and_apply(tx, dtbo_data);
 
 	if (ret < 0) {
@@ -1410,9 +1421,7 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 
 	kernfs_activate(tx->dir_kn);
 
-	mutex_lock(&mk_overlay_mutex);
 	list_add_tail(&tx->list, &mk_overlay_tx_list);
-	mutex_unlock(&mk_overlay_mutex);
 
 	return tx->id;
 }
@@ -1437,8 +1446,7 @@ static int mk_overlay_remove_tx(struct mk_overlay_tx *tx)
 	tx->status = MK_OVERLAY_TX_REMOVED;
 
 	list_del(&tx->list);
-	/* Don't call kernfs_remove() here - the kernfs layer handles directory
-	 * removal automatically after rmdir callback returns success */
+	/* The whole overlays directory goes away with the caller */
 	kfree(tx->dtbo_data);
 	kfree(tx);
 
@@ -1490,31 +1498,59 @@ static ssize_t mk_overlay_new_write(struct kernfs_open_file *of, char *buf,
 }
 
 /**
- * mk_overlay_rmdir - Handle rmdir on transaction directories
+ * mk_overlay_rmdir - Roll a transaction back on rmdir of its directory
+ * @kn: Directory the user is removing
  *
- * Called when user does: rmdir /sys/fs/multikernel/overlays/tx_XXX
+ * Called for every rmdir under /sys/fs/multikernel/; only the transaction
+ * directories are removable, everything else keeps returning -EPERM.
+ *
+ * A rollback that fails leaves the transaction in place with status
+ * "failed", so the user can see what happened and retry.
  */
 int mk_overlay_rmdir(struct kernfs_node *kn)
 {
 	struct mk_overlay_tx *tx = kn->priv;
+	struct kernfs_node *parent;
+	bool is_tx;
 	int ret;
 
-	if (!tx) {
-		pr_err("No transaction data found for kernfs node\n");
-		return -EINVAL;
+	parent = kernfs_get_parent(kn);
+	is_tx = parent && parent == mk_overlay_root_kn;
+	kernfs_put(parent);
+
+	if (!is_tx || !tx)
+		return -EPERM;
+
+	scoped_guard(mutex, &mk_overlay_mutex) {
+		if (list_empty(&tx->list))
+			return -ENOENT;
+
+		pr_info("Removing overlay transaction %d\n", tx->id);
+
+		ret = mk_overlay_parse_and_rollback(tx, tx->dtbo_data);
+		if (ret < 0) {
+			pr_err("Failed to rollback overlay transaction %d: %d\n",
+			       tx->id, ret);
+			tx->status = MK_OVERLAY_TX_FAILED;
+			return ret;
+		}
+
+		pr_info("Overlay transaction %d rolled back successfully\n",
+			tx->id);
+		tx->status = MK_OVERLAY_TX_REMOVED;
+		list_del_init(&tx->list);
 	}
 
-	mutex_lock(&mk_overlay_mutex);
+	/*
+	 * Removes the directory this call runs from, which plain
+	 * kernfs_remove() cannot do, and drains readers of the transaction's
+	 * files before the transaction they point at goes away.
+	 */
+	kernfs_remove_self(kn);
+	kfree(tx->dtbo_data);
+	kfree(tx);
 
-	if (list_empty(&tx->list)) {
-		mutex_unlock(&mk_overlay_mutex);
-		return -ENOENT;
-	}
-	ret = mk_overlay_remove_tx(tx);
-
-	mutex_unlock(&mk_overlay_mutex);
-
-	return ret;
+	return 0;
 }
 
 int mk_overlay_init(void)

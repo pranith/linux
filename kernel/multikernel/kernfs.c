@@ -205,7 +205,10 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 		}
 	}
 
+	/* Baseline and overlays both drive the pool moves; one at a time */
+	mutex_lock(&mk_overlay_mutex);
 	ret = mk_baseline_validate_and_initialize(fdt, count);
+	mutex_unlock(&mk_overlay_mutex);
 	if (ret) {
 		pr_err("Baseline validation and initialization failed: %d\n", ret);
 		return ret;
@@ -415,7 +418,7 @@ static int mk_kernfs_mkdir(struct kernfs_node *parent, const char *name, umode_t
 
 static int mk_kernfs_rmdir(struct kernfs_node *kn)
 {
-	return -EPERM;
+	return mk_overlay_rmdir(kn);
 }
 
 /**
