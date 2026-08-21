@@ -403,8 +403,12 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 	 * would index the node mask out of bounds below.
 	 */
 	nid = (int)numa_node;
-	if (nid < 0 || nid >= MAX_NUMNODES)
+	if (nid < 0 || nid >= MAX_NUMNODES) {
+		if (numa_node != (u32)NUMA_NO_NODE)
+			pr_warn("Multikernel hotplug: NUMA node %u out of range, using node 0\n",
+				numa_node);
 		nid = 0;
+	}
 
 	pr_info("Multikernel hotplug: Adding memory 0x%llx-0x%llx (%llu MB) numa=%d type=0x%x\n",
 		phys_addr, phys_addr + size - 1, size >> 20,
@@ -1058,7 +1062,19 @@ void mk_hotplug_cleanup(void)
  */
 int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 {
+	int logical_cpu;
 	int ret;
+
+	/*
+	 * An offline CPU never reaches the park loop, so the pool would
+	 * record a CPU nothing can ever wake.
+	 */
+	logical_cpu = mk_cpu_to_logical(cpu_id);
+	if (logical_cpu < 0 || !cpu_online(logical_cpu)) {
+		pr_err("Multikernel hotplug: CPU %llu must be online to join the pool\n",
+		       cpu_id);
+		return -EINVAL;
+	}
 
 	/*
 	 * The pool set is the record of which CPUs are parked, so the add
@@ -1129,9 +1145,15 @@ int mk_pool_device_add(u16 domain, u8 bus, u8 devfn)
 		return ret;
 
 	ret = mk_root_add_pci_device(domain, bus, devfn);
-	if (ret && ret != -EEXIST)
-		pr_warn("Multikernel hotplug: device %04x:%02x:%02x.%x not tracked in pool: %d\n",
-			domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
+	if (ret && ret != -EEXIST) {
+		/* Untracked, the device would belong to neither side */
+		pr_err("Multikernel hotplug: device %04x:%02x:%02x.%x not tracked in pool: %d\n",
+		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
+		if (mk_do_device_add(domain, bus, devfn, NULL, 0))
+			pr_err("Multikernel hotplug: device %04x:%02x:%02x.%x could not be rebound to this kernel\n",
+			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		return ret;
+	}
 
 	return 0;
 }
