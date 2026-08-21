@@ -367,6 +367,8 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu)
 {
 	struct boot_params *src_bp;
+	unsigned long park_phys;
+	void *park_va;
 	int ret;
 
 	if (!instance->ident_pgt) {
@@ -415,18 +417,17 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	memcpy(instance->trampoline_va, multikernel_relocate_kernel_start,
 	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
 
-	if (!instance->park_va) {
-		unsigned long phys;
-		void *va;
-
-		va = mk_setup_park_page(instance, &phys);
-		if (IS_ERR(va)) {
-			pr_err("Failed to set up pool park page: %ld\n",
-			       PTR_ERR(va));
-			return PTR_ERR(va);
-		}
-		instance->park_va = va;
+	/*
+	 * Unconditional: the page itself survives a re-spawn, but the host
+	 * park table it must be mapped in may have been rebuilt since.
+	 */
+	park_va = mk_setup_park_page(instance, &park_phys);
+	if (IS_ERR(park_va)) {
+		pr_err("Failed to set up pool park page: %ld\n",
+		       PTR_ERR(park_va));
+		return PTR_ERR(park_va);
 	}
+	instance->park_va = park_va;
 
 	if (!instance->spawn_ctx) {
 		struct mk_spawn_context *ctx;
@@ -470,7 +471,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			     image->arch.mk_kernel_entry,
 			     (unsigned long)instance->trampoline_va,
 			     virt_to_phys(instance->trampoline_va),
-			     virt_to_phys(instance->park_va));
+			     park_phys);
 
 	return mk_spawn_cpu(instance, cpu, instance->spawn_ctx);
 }
@@ -1293,31 +1294,39 @@ void *mk_setup_trampoline(struct mk_instance *instance,
  */
 void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 {
-	void *park_va;
-	unsigned long park_phys;
 	size_t size = mk_pool_park_end - mk_pool_park_start;
+	unsigned long park_phys;
+	void *park_va;
 	int rc;
+
+	/* Runs under kexec_lock, which nothing takes under this mutex */
+	guard(mutex)(&mk_host_park_lock);
 
 	if (!mk_host_park.pgt)
 		return ERR_PTR(-ENODEV);
 
-	park_va = mk_instance_ctrl_alloc(instance, PAGE_SIZE, PAGE_SIZE);
-	if (!park_va)
-		return ERR_PTR(-ENOMEM);
+	park_va = instance->park_va;
+	if (!park_va) {
+		park_va = mk_instance_ctrl_alloc(instance, PAGE_SIZE, PAGE_SIZE);
+		if (!park_va)
+			return ERR_PTR(-ENOMEM);
+
+		memcpy(park_va, mk_pool_park_start, size);
+
+		rc = set_memory_x((unsigned long)park_va, 1);
+		if (rc)
+			return ERR_PTR(rc);
+	}
 
 	park_phys = virt_to_phys(park_va);
-
-	memcpy(park_va, mk_pool_park_start, size);
-
-	rc = set_memory_x((unsigned long)park_va, 1);
-	if (rc)
-		return ERR_PTR(rc);
 
 	/*
 	 * A dying spawn kernel enters the park page through its own direct
 	 * map at the default base; the first instructions run at that VA
 	 * until the CR3 switch, so it must be mapped in the pool park page
 	 * table. The identity mapping is covered by the per-chunk build.
+	 * A page table rebuilt since the last spawn carries no such mapping,
+	 * so install it on every spawn rather than only on the first.
 	 */
 	rc = mk_add_trampoline_mapping(mk_host_park.pgt,
 				       mk_default_page_offset() + park_phys,
