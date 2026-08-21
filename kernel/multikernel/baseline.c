@@ -4,9 +4,10 @@
  *
  * Multikernel baseline DTB validation and initialization
  *
- * This module handles the baseline device tree that defines the multikernel
- * resource pool. The baseline specifies which CPUs, memory, and devices are
- * available for assignment to multikernel instances.
+ * The baseline device tree is a set of allocation requests: memory sizes
+ * per NUMA node, physical CPU IDs, and devices this kernel hands to the
+ * multikernel pool. It is applied exactly once, through the same move
+ * primitives user space drives later through overlays.
  */
 
 #include <linux/kernel.h>
@@ -14,11 +15,20 @@
 #include <linux/libfdt.h>
 #include <linux/slab.h>
 #include <linux/cpumask.h>
+#include <linux/mm.h>
+#include <linux/numa.h>
 #include <linux/multikernel.h>
 #include <linux/ioport.h>
 #include <linux/pci.h>
 
 #include "internal.h"
+
+#define MK_BASELINE_MAX_MEM_REQS MAX_NUMNODES
+
+struct mk_baseline_mem_req {
+	u64 size;
+	int node;
+};
 
 /*
  * Parked CPUs this kernel can assign to child instances. The baseline
@@ -29,7 +39,8 @@
  */
 struct mk_cpu_set *mk_cpu_pool;
 
-static int mk_baseline_parse_cpus(const void *fdt, int resources_node)
+static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
+				  struct mk_cpu_set *requested)
 {
 	const fdt64_t *prop;
 	int len, i, cpu_count;
@@ -53,92 +64,70 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node)
 		return -EINVAL;
 	}
 
-	if (!mk_cpu_pool) {
-		mk_cpu_pool = mk_cpu_set_alloc();
-		if (!mk_cpu_pool)
-			return -ENOMEM;
-	}
-
-	mk_cpu_set_clear(mk_cpu_pool);
-
 	for (i = 0; i < cpu_count; i++) {
 		mk_phys_cpu_t cpu_id = fdt64_to_cpu(prop[i]);
-		int ret = mk_cpu_set_add(mk_cpu_pool, cpu_id);
+		int ret = mk_cpu_set_add(requested, cpu_id);
 
 		if (ret)
 			return ret;
-		pr_debug("Baseline CPU pool: added physical CPU %llu\n", cpu_id);
 	}
 
-	mk_cpu_set_format(buf, sizeof(buf), mk_cpu_pool);
-	pr_info("Baseline CPU pool: %d CPUs specified: %s\n", cpu_count, buf);
+	mk_cpu_set_format(buf, sizeof(buf), requested);
+	pr_info("Baseline CPU pool: %d CPUs requested: %s\n", cpu_count, buf);
 
 	return 0;
 }
 
 static int mk_baseline_parse_memory(const void *fdt, int resources_node,
-				    struct mk_instance *instance)
+				    struct mk_baseline_mem_req *reqs, int max)
 {
-	const fdt32_t *prop;
-	struct mk_memory_region *region;
-	u64 memory_base, memory_size;
-	int len;
+	int node, n = 0, len;
 
-	prop = fdt_getprop(fdt, resources_node, "memory-base", &len);
-	if (!prop || len != 8) {
-		pr_err("Baseline needs a valid 'memory-base' property\n");
-		return -EINVAL;
-	}
-	memory_base = fdt64_to_cpu(*(const fdt64_t *)prop);
+	fdt_for_each_subnode(node, fdt, resources_node) {
+		const char *name = fdt_get_name(fdt, node, NULL);
+		const fdt64_t *size;
+		const fdt32_t *nid;
 
-	prop = fdt_getprop(fdt, resources_node, "memory-bytes", &len);
-	if (!prop || len != 8) {
-		pr_err("Baseline needs a valid 'memory-bytes' property\n");
-		return -EINVAL;
-	}
-	memory_size = fdt64_to_cpu(*(const fdt64_t *)prop);
+		if (!name || strncmp(name, "memory@", 7))
+			continue;
 
-	if (memory_size == 0) {
-		pr_err("Invalid memory size 0 in baseline\n");
-		return -EINVAL;
-	}
+		if (n == max) {
+			pr_err("Baseline: more than %d memory@ nodes\n", max);
+			return -E2BIG;
+		}
 
-	if (memory_size & (PAGE_SIZE - 1)) {
-		pr_err("Memory size 0x%llx not page-aligned\n", memory_size);
-		return -EINVAL;
-	}
+		size = fdt_getprop(fdt, node, "size", &len);
+		if (!size || len != 8) {
+			pr_err("Baseline %s: missing or invalid 'size'\n", name);
+			return -EINVAL;
+		}
 
-	if (memory_base & (PAGE_SIZE - 1)) {
-		pr_err("Memory base 0x%llx not page-aligned\n", memory_base);
-		return -EINVAL;
-	}
+		reqs[n].size = fdt64_to_cpu(*size);
+		if (!reqs[n].size || !PAGE_ALIGNED(reqs[n].size)) {
+			pr_err("Baseline %s: size 0x%llx not a positive page multiple\n",
+			       name, reqs[n].size);
+			return -EINVAL;
+		}
 
-	/* Create memory region for root instance pool */
-	region = kzalloc(sizeof(*region), GFP_KERNEL);
-	if (!region) {
-		pr_err("Failed to allocate memory region for baseline pool\n");
-		return -ENOMEM;
+		nid = fdt_getprop(fdt, node, "numa-node", &len);
+		reqs[n].node = (nid && len == 4) ? (int)fdt32_to_cpu(*nid) : NUMA_NO_NODE;
+		n++;
 	}
 
-	region->res.name = kasprintf(GFP_KERNEL, "mk_pool");
-	if (!region->res.name) {
-		kfree(region);
-		return -ENOMEM;
+	if (!n && fdt_getprop(fdt, resources_node, "memory-bytes", &len))
+		pr_err("Baseline: memory-base/memory-bytes are no longer accepted; use memory@N { size; numa-node; }\n");
+
+	return n;
+}
+
+static void mk_baseline_free_pci_list(struct list_head *pci_list)
+{
+	struct mk_pci_device *pci_dev, *tmp;
+
+	list_for_each_entry_safe(pci_dev, tmp, pci_list, list) {
+		list_del(&pci_dev->list);
+		kfree(pci_dev);
 	}
-
-	region->res.start = memory_base;
-	region->res.end = memory_base + memory_size - 1;
-	region->res.flags = IORESOURCE_MEM;
-	INIT_LIST_HEAD(&region->list);
-
-	list_add_tail(&region->list, &instance->memory_regions);
-
-	pr_info("Baseline memory pool: 0x%llx-0x%llx (%llu MB)\n",
-		memory_base,
-		memory_base + memory_size - 1,
-		memory_size >> 20);
-
-	return 0;
 }
 
 static void mk_baseline_clear_resources(struct mk_instance *instance)
@@ -150,7 +139,6 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 		return;
 
 	mk_instance_free_memory(instance);
-	mk_cpu_set_clear(mk_cpu_pool);
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
 		list_del(&pci_dev->list);
 		kfree(pci_dev);
@@ -166,14 +154,14 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	instance->platform_devices_valid = false;
 }
 
-static int mk_baseline_validate_cpus(void)
+static int mk_baseline_validate_cpus(const struct mk_cpu_set *requested)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
 	int logical_cpu;
 	int validated = 0;
 
-	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
+	mk_cpu_set_for_each(i, phys_cpu_id, requested) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0) {
 			pr_err("Baseline CPU %llu not found in system (not present)\n",
@@ -203,19 +191,13 @@ static int mk_baseline_validate_cpus(void)
 }
 
 static int mk_baseline_parse_devices(const void *fdt, int resources_node,
-				     struct mk_instance *instance)
+				     struct mk_instance *instance,
+				     struct list_head *pci_list)
 {
 	int devices_node, dev_node;
 	const char *dev_name, *device_type;
+	int pci_count = 0;
 	int len;
-
-	INIT_LIST_HEAD(&instance->pci_devices);
-	instance->pci_device_count = 0;
-	instance->pci_devices_valid = false;
-
-	INIT_LIST_HEAD(&instance->platform_devices);
-	instance->platform_device_count = 0;
-	instance->platform_devices_valid = false;
 
 	devices_node = fdt_subnode_offset(fdt, resources_node, "devices");
 	if (devices_node < 0) {
@@ -270,14 +252,13 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				return -EINVAL;
 			}
 
-			pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
+			pci_dev = kzalloc_obj(*pci_dev, GFP_KERNEL);
 			if (!pci_dev) {
 				pr_err("Failed to allocate memory for PCI device\n");
 				return -ENOMEM;
 			}
 
-			strncpy(pci_dev->name, dev_name, sizeof(pci_dev->name) - 1);
-			pci_dev->name[sizeof(pci_dev->name) - 1] = '\0';
+			strscpy(pci_dev->name, dev_name, sizeof(pci_dev->name));
 			pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
 			pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
 			pci_dev->domain = (u16)domain;
@@ -285,10 +266,10 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			pci_dev->slot = (u8)slot;
 			pci_dev->func = (u8)func;
 
-			list_add_tail(&pci_dev->list, &instance->pci_devices);
-			instance->pci_device_count++;
+			list_add_tail(&pci_dev->list, pci_list);
+			pci_count++;
 
-			pr_debug("Baseline device pool: added PCI device '%s' %04x:%04x@%04x:%02x:%02x.%x\n",
+			pr_debug("Baseline device pool: requested PCI device '%s' %04x:%04x@%04x:%02x:%02x.%x\n",
 				 dev_name, pci_dev->vendor, pci_dev->device,
 				 pci_dev->domain, pci_dev->bus, pci_dev->slot,
 				 pci_dev->func);
@@ -296,21 +277,18 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			struct mk_platform_device *plat_dev;
 			const char *device_name_str;
 
-			plat_dev = kzalloc(sizeof(*plat_dev), GFP_KERNEL);
+			plat_dev = kzalloc_obj(*plat_dev, GFP_KERNEL);
 			if (!plat_dev) {
 				pr_err("Failed to allocate memory for platform device\n");
 				return -ENOMEM;
 			}
 
-			strncpy(plat_dev->name, dev_name, sizeof(plat_dev->name) - 1);
-			plat_dev->name[sizeof(plat_dev->name) - 1] = '\0';
+			strscpy(plat_dev->name, dev_name, sizeof(plat_dev->name));
 
 			device_name_str = fdt_getprop(fdt, dev_node, "device-name", &len);
-			if (device_name_str) {
-				strncpy(plat_dev->name, device_name_str,
-					sizeof(plat_dev->name) - 1);
-				plat_dev->name[sizeof(plat_dev->name) - 1] = '\0';
-			}
+			if (device_name_str)
+				strscpy(plat_dev->name, device_name_str,
+					sizeof(plat_dev->name));
 
 			list_add_tail(&plat_dev->list, &instance->platform_devices);
 			instance->platform_device_count++;
@@ -323,11 +301,8 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 		}
 	}
 
-	if (instance->pci_device_count > 0) {
-		instance->pci_devices_valid = true;
-		pr_info("Baseline device pool: %d PCI devices specified\n",
-			instance->pci_device_count);
-	}
+	if (pci_count > 0)
+		pr_info("Baseline device pool: %d PCI devices requested\n", pci_count);
 
 	if (instance->platform_device_count > 0) {
 		instance->platform_devices_valid = true;
@@ -338,176 +313,93 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 	return 0;
 }
 
-static int mk_baseline_setup_pool(const struct mk_instance *instance)
+static int mk_baseline_grow_pool(const struct mk_baseline_mem_req *reqs, int n)
 {
-	if (!mk_pool_empty())
-		return 0;
+	int i, ret;
 
-	pr_err("baseline memory donation is replaced by memory@N allocation\n");
-	return -EOPNOTSUPP;
-}
-
-static int mk_baseline_validate_memory(const struct mk_instance *instance)
-{
-	struct mk_memory_region *region;
-	size_t pool_size = mk_pool_total_bytes();
-	u64 total_size = 0;
-
-	if (mk_pool_empty()) {
-		pr_err("No multikernel pool configured\n");
-		return -ENODEV;
-	}
-
-	if (list_empty(&instance->memory_regions)) {
-		pr_err("No memory regions in baseline\n");
-		return -EINVAL;
-	}
-
-	list_for_each_entry(region, &instance->memory_regions, list) {
-		u64 region_size = resource_size(&region->res);
-
-		if (!mk_pool_contains(region->res.start, region_size)) {
-			pr_err("Baseline memory (0x%llx-0x%llx) outside the multikernel pool\n",
-			       (u64)region->res.start, (u64)region->res.end);
-			return -EINVAL;
+	for (i = 0; i < n; i++) {
+		ret = mk_pool_mem_grow(reqs[i].size, reqs[i].node, NULL);
+		if (ret) {
+			pr_err("Baseline: failed to allocate %llu MB on node %d: %d\n",
+			       reqs[i].size >> 20, reqs[i].node, ret);
+			return ret;
 		}
-
-		total_size += region_size;
 	}
-
-	if (total_size > pool_size) {
-		pr_err("Baseline memory size (0x%llx) exceeds pool size (0x%zx)\n",
-		       total_size, pool_size);
-		return -ERANGE;
-	}
-
-	pr_info("Baseline memory validated: using 0x%llx bytes from pool\n",
-		total_size);
 
 	return 0;
 }
 
-static int mk_baseline_initialize_cpus(void)
+static int mk_baseline_initialize_cpus(const struct mk_cpu_set *requested)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
-	int logical_cpu;
-	int ret, failed = 0, offlined = 0;
-	unsigned int cpu_count = mk_cpu_set_count(mk_cpu_pool);
+	int ret, failed = 0, moved = 0;
 
-	pr_info("Offlining %u CPUs for multikernel pool\n", cpu_count);
+	pr_info("Moving %u CPUs into the multikernel pool\n",
+		mk_cpu_set_count(requested));
 
-	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
-		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
-		if (logical_cpu < 0)
-			continue;
-
-		if (!cpu_online(logical_cpu)) {
-			pr_debug("CPU %llu (logical %d) already offline\n",
-				 phys_cpu_id, logical_cpu);
-			offlined++;
-			continue;
-		}
-
-		if (logical_cpu == 0) {
-			pr_err("Cannot offline boot CPU for multikernel pool\n");
-			failed++;
-			continue;
-		}
-
-		mk_set_pool_cpu(logical_cpu, true);
-
-		ret = remove_cpu(logical_cpu);
+	mk_cpu_set_for_each(i, phys_cpu_id, requested) {
+		ret = mk_send_cpu_remove(root_instance->id, phys_cpu_id);
 		if (ret) {
-			pr_err("Failed to offline CPU %llu (logical %d): %d\n",
-			       phys_cpu_id, logical_cpu, ret);
-			mk_set_pool_cpu(logical_cpu, false);
+			pr_err("Failed to move CPU %llu into the pool: %d\n",
+			       phys_cpu_id, ret);
 			failed++;
-		} else {
-			pr_info("Offlined CPU %llu (logical %d) for multikernel pool\n",
-				phys_cpu_id, logical_cpu);
-			offlined++;
+			continue;
 		}
+
+		moved++;
 	}
 
 	if (failed > 0) {
-		pr_err("Failed to offline %d CPUs - baseline initialization incomplete\n",
+		pr_err("Failed to move %d CPUs - baseline initialization incomplete\n",
 		       failed);
 		return -EBUSY;
 	}
 
-	pr_info("Successfully offlined %d CPUs for multikernel pool\n", offlined);
-
-	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
-		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
-		if (logical_cpu > 0 && !cpu_online(logical_cpu))
-			set_cpu_present(logical_cpu, false);
-
-		/* Donated to the pool: this kernel no longer owns it */
-		mk_cpu_set_del(root_instance->cpus, phys_cpu_id);
-	}
+	pr_info("Moved %d CPUs into the multikernel pool\n", moved);
 
 	return 0;
 }
 
-static int mk_baseline_initialize_devices(const struct mk_instance *instance)
+static int mk_baseline_initialize_devices(struct list_head *pci_list)
 {
 	struct mk_pci_device *pci_dev;
-	struct pci_dev *dev;
-	int failed = 0, unbound = 0;
+	int ret, failed = 0, moved = 0;
 
-	if (instance->pci_device_count == 0) {
-		pr_debug("No PCI devices in baseline to unbind\n");
+	if (list_empty(pci_list)) {
+		pr_debug("No PCI devices in baseline to move into the pool\n");
 		return 0;
 	}
 
-	pr_info("Unbinding %d PCI devices for multikernel pool\n",
-		instance->pci_device_count);
-
-	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-		dev = pci_get_domain_bus_and_slot(pci_dev->domain, pci_dev->bus,
-						  PCI_DEVFN(pci_dev->slot, pci_dev->func));
-		if (!dev) {
-			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not found in system\n",
+	list_for_each_entry(pci_dev, pci_list, list) {
+		ret = mk_send_device_remove(root_instance->id, pci_dev->domain,
+					    pci_dev->bus,
+					    PCI_DEVFN(pci_dev->slot, pci_dev->func));
+		if (ret) {
+			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not moved into the pool: %d\n",
 				pci_dev->vendor, pci_dev->device, pci_dev->domain,
-				pci_dev->bus, pci_dev->slot, pci_dev->func);
+				pci_dev->bus, pci_dev->slot, pci_dev->func, ret);
 			failed++;
 			continue;
 		}
 
-		if (!dev->driver) {
-			pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x already unbound\n",
-				 pci_dev->vendor, pci_dev->device, pci_dev->domain,
-				 pci_dev->bus, pci_dev->slot, pci_dev->func);
-			pci_dev_put(dev);
-			unbound++;
-			continue;
-		}
-
-		const char *driver_name = dev->driver->name;
-
-		device_release_driver(&dev->dev);
-
-		pr_info("Unbound PCI device %04x:%04x@%04x:%02x:%02x.%x (was: %s) for multikernel pool\n",
-			pci_dev->vendor, pci_dev->device, pci_dev->domain,
-			pci_dev->bus, pci_dev->slot, pci_dev->func,
-			driver_name);
-
-		pci_dev_put(dev);
-		unbound++;
+		moved++;
 	}
 
-	if (failed > 0) {
-		pr_warn("Failed to find %d PCI devices in system\n", failed);
-	}
+	if (failed > 0)
+		pr_warn("Failed to move %d PCI devices into the pool\n", failed);
 
-	pr_info("Successfully unbound %d PCI devices for multikernel pool\n", unbound);
+	pr_info("Moved %d PCI devices into the multikernel pool\n", moved);
+
 	return 0;
 }
 
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 {
-	int resources_node;
+	struct mk_baseline_mem_req reqs[MK_BASELINE_MAX_MEM_REQS];
+	struct mk_cpu_set *requested;
+	LIST_HEAD(pci_list);
+	int resources_node, nr_reqs;
 	int ret;
 
 	if (!fdt || fdt_size == 0) {
@@ -523,6 +415,12 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 	if (!root_instance->cpus) {
 		pr_err("root_instance CPUs bitmap not allocated\n");
 		return -ENOMEM;
+	}
+
+	if (!mk_pool_empty() || (mk_cpu_pool && !mk_cpu_set_empty(mk_cpu_pool)) ||
+	    root_instance->pci_device_count) {
+		pr_err("Baseline already applied; change the pool with an overlay targeting \"host\"\n");
+		return -EBUSY;
 	}
 
 	ret = fdt_check_header(fdt);
@@ -543,76 +441,101 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -EINVAL;
 	}
 
+	requested = mk_cpu_set_alloc();
+	if (!requested)
+		return -ENOMEM;
+
 	mk_baseline_clear_resources(root_instance);
 
-	ret = mk_baseline_parse_cpus(fdt, resources_node);
+	ret = mk_baseline_parse_cpus(fdt, resources_node, requested);
 	if (ret) {
 		pr_err("Failed to parse baseline CPUs: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
-	ret = mk_baseline_parse_memory(fdt, resources_node, root_instance);
-	if (ret) {
+	nr_reqs = mk_baseline_parse_memory(fdt, resources_node, reqs,
+					   MK_BASELINE_MAX_MEM_REQS);
+	if (nr_reqs < 0) {
+		ret = nr_reqs;
 		pr_err("Failed to parse baseline memory: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
-	ret = mk_baseline_parse_devices(fdt, resources_node, root_instance);
+	if (nr_reqs == 0) {
+		pr_err("Baseline has no memory@N node; the pool needs memory\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = mk_baseline_parse_devices(fdt, resources_node, root_instance,
+					&pci_list);
 	if (ret) {
 		pr_err("Failed to parse baseline devices: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
-	ret = mk_baseline_validate_cpus();
+	ret = mk_baseline_validate_cpus(requested);
 	if (ret) {
 		pr_err("Baseline CPU validation failed: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
-	ret = mk_baseline_setup_pool(root_instance);
+	/*
+	 * The move primitives only track a resource in the pool once the
+	 * pool set exists, so it has to be there before the first move.
+	 */
+	if (!mk_cpu_pool) {
+		mk_cpu_pool = mk_cpu_set_alloc();
+		if (!mk_cpu_pool) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+
+	ret = mk_baseline_grow_pool(reqs, nr_reqs);
 	if (ret) {
-		pr_err("Baseline pool setup failed: %d\n", ret);
-		return ret;
+		pr_err("Baseline pool allocation failed: %d\n", ret);
+		goto out;
 	}
 
 	ret = mk_setup_host_park();
 	if (ret) {
 		pr_err("Baseline host park setup failed: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
-	ret = mk_baseline_validate_memory(root_instance);
-	if (ret) {
-		pr_err("Baseline memory validation failed: %d\n", ret);
-		return ret;
-	}
-
-	ret = mk_baseline_initialize_cpus();
+	ret = mk_baseline_initialize_cpus(requested);
 	if (ret) {
 		pr_err("Baseline CPU initialization failed: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
-	ret = mk_baseline_initialize_devices(root_instance);
+	ret = mk_baseline_initialize_devices(&pci_list);
 	if (ret) {
 		pr_err("Baseline device initialization failed: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
 	if (root_instance->dtb_data) {
-		pr_info("Replacing existing DTB (%zu bytes) with baseline DTB\n", root_instance->dtb_size);
+		pr_info("Replacing existing DTB (%zu bytes) with baseline DTB\n",
+			root_instance->dtb_size);
 		kfree(root_instance->dtb_data);
 	}
 
 	root_instance->dtb_data = kmalloc(fdt_size, GFP_KERNEL);
-	if (root_instance->dtb_data) {
-		memcpy(root_instance->dtb_data, fdt, fdt_size);
-		root_instance->dtb_size = fdt_size;
-	} else {
+	if (!root_instance->dtb_data) {
 		pr_err("Failed to allocate memory for baseline DTB\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	pr_info("Multikernel baseline initialized successfully:\n");
-	return 0;
+	memcpy(root_instance->dtb_data, fdt, fdt_size);
+	root_instance->dtb_size = fdt_size;
+
+	pr_info("Multikernel baseline initialized successfully\n");
+	ret = 0;
+out:
+	mk_baseline_free_pci_list(&pci_list);
+	mk_cpu_set_free(requested);
+	return ret;
 }
