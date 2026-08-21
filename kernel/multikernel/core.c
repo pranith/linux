@@ -448,7 +448,10 @@ int mk_instance_return_cpus(struct mk_instance *instance,
  *
  * True when the pool holds no free CPU and no instance owns one, so
  * nothing can be sitting in a park loop. Pool memory that parked CPUs
- * execute from may only be freed once this holds.
+ * execute from may only be freed once this holds. The answer is only as
+ * good as the invariant that a CPU is recorded in the pool set or in an
+ * instance's set before it parks, which is why the move paths reserve
+ * room in the destination set up front.
  */
 bool mk_pool_cpus_returned(void)
 {

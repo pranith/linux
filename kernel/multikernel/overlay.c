@@ -705,9 +705,9 @@ static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt
 				/*
 				 * Only the capacity can be restored: the
 				 * kernel has since handed the old range
-				 * back to the buddy allocator, and a host
-				 * park area torn down below is rebuilt by
-				 * the next baseline, not from here.
+				 * back to the buddy allocator. A host park
+				 * area torn down below is rebuilt inside
+				 * the new chunk by the grow itself.
 				 */
 				pr_info("Rollback tx%d: regrowing the pool by %llu MB\n",
 					tx->id, size >> 20);
@@ -717,16 +717,23 @@ static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt
 					tx->id, base, base + size - 1,
 					size >> 20, target->path);
 
-				if (mk_host_park_uses(base, size)) {
+				/*
+				 * Only a chunk the park area is pinning gets
+				 * a teardown, so a range that matches no
+				 * chunk at all never costs the pool its park
+				 * area.
+				 */
+				ret = mk_pool_mem_shrink(base, size);
+				if (ret == -EBUSY &&
+				    mk_host_park_uses(base, size)) {
 					ret = mk_teardown_host_park();
 					if (ret) {
 						pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the host park area; return every pool CPU first (%d)\n",
 						       tx->id, base, size, ret);
 						return ret;
 					}
+					ret = mk_pool_mem_shrink(base, size);
 				}
-
-				ret = mk_pool_mem_shrink(base, size);
 			}
 
 			if (ret) {

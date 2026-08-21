@@ -1358,33 +1358,14 @@ static int mk_host_park_map_pool(struct mk_ident_pgtable *pgt)
 	return rc;
 }
 
-int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
-{
-	guard(mutex)(&mk_host_park_lock);
-
-	if (!mk_host_park.pgt)
-		return 0;
-
-	return mk_ident_map_range(mk_host_park.pgt, start, start + size);
-}
-
-/**
- * mk_setup_host_park() - Set up the host pool park area
- *
- * Called when the baseline is applied, once the memory pool exists.
- * Builds the pool-wide identity page table every parked CPU runs on,
- * the host park page, and the host wake slot that unassigned pool CPUs
- * watch. All of it is host-owned pool memory, alive for the lifetime of
- * the pool.
- */
-int mk_setup_host_park(void)
+static int __mk_setup_host_park(void)
 {
 	size_t size = mk_pool_park_end - mk_pool_park_start;
 	struct mk_ident_pgtable *pgt;
 	phys_addr_t phys;
 	int rc;
 
-	guard(mutex)(&mk_host_park_lock);
+	lockdep_assert_held(&mk_host_park_lock);
 
 	if (mk_host_park.slot)
 		return 0;
@@ -1449,6 +1430,37 @@ err_pgt:
 	mk_host_park.pgt = NULL;
 	mk_host_park.cr3 = 0;
 	return rc;
+}
+
+int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
+{
+	guard(mutex)(&mk_host_park_lock);
+
+	/*
+	 * A pool emptied of memory has no park area, so the chunk that
+	 * refills it has to bring one back: a CPU handed to a pool with
+	 * nowhere to park would halt permanently.
+	 */
+	if (!mk_host_park.pgt)
+		return __mk_setup_host_park();
+
+	return mk_ident_map_range(mk_host_park.pgt, start, start + size);
+}
+
+/**
+ * mk_setup_host_park() - Set up the host pool park area
+ *
+ * Called when the baseline is applied, once the memory pool exists.
+ * Builds the pool-wide identity page table every parked CPU runs on,
+ * the host park page, and the host wake slot that unassigned pool CPUs
+ * watch. All of it is host-owned pool memory, alive for as long as the
+ * pool has memory.
+ */
+int mk_setup_host_park(void)
+{
+	guard(mutex)(&mk_host_park_lock);
+
+	return __mk_setup_host_park();
 }
 
 static bool mk_phys_in_range(phys_addr_t addr, phys_addr_t start, size_t size)
@@ -1521,7 +1533,7 @@ int mk_teardown_host_park(void)
 	mk_host_park.slot_phys = 0;
 
 	/* Hand the page back as ordinary pool memory, not as code */
-	set_memory_nx((unsigned long)mk_host_park.park_va, 1);
+	WARN_ON_ONCE(set_memory_nx((unsigned long)mk_host_park.park_va, 1));
 	multikernel_free(mk_host_park.park_phys, PAGE_SIZE);
 	mk_host_park.park_va = NULL;
 	mk_host_park.park_phys = 0;

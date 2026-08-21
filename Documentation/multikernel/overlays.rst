@@ -193,7 +193,8 @@ memory, and the kernel can only release it once those CPUs have come back.
 Taking the CPUs first lets a single fragment return every CPU and remove
 every chunk, which empties the pool and allows a new baseline to be
 applied. A ``memory-remove`` that would strand parked CPUs fails with
-``-EBUSY``.
+``-EBUSY``. The area is built again by whichever chunk next gives the pool
+memory, so a pool that has memory can always park a CPU.
 
 Rollback (``rmdir`` on the transaction directory) walks both orders in
 reverse and sends the inverse of each operation.
@@ -208,8 +209,8 @@ failing the rollback:
 
 Rolling back ``/resources memory-remove`` regrows the pool by the same size.
 The new chunk has a different base, because the old range went back to the
-page allocator. A host park area released along the way is not rebuilt by
-the rollback either; the next baseline builds it again.
+page allocator. A host park area released along the way is rebuilt inside
+the new chunk, so the restored pool can park CPUs again.
 
 Root Device Tree Read-back
 ==========================

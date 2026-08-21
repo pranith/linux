@@ -1060,14 +1060,21 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 {
 	int ret;
 
+	/*
+	 * The pool set is the record of which CPUs are parked, so the add
+	 * below must not be able to fail: grow it while the CPU is still
+	 * ours to keep.
+	 */
+	ret = mk_cpu_set_reserve(mk_cpu_pool, 1);
+	if (ret)
+		return ret;
+
 	ret = mk_do_cpu_remove(cpu_id);
 	if (ret)
 		return ret;
 
 	/* The CPU parked in the host park area and is assignable again */
-	if (mk_cpu_set_add(mk_cpu_pool, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
-			cpu_id);
+	mk_cpu_set_add(mk_cpu_pool, cpu_id);
 
 	return 0;
 }
@@ -1220,6 +1227,16 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		goto out;
 	}
 
+	/* The pool set must be able to take the CPU once it parks */
+	if (!mk_cpu_pool) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	ret = mk_cpu_set_reserve(mk_cpu_pool, 1);
+	if (ret)
+		goto out;
+
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, cpu_id);
 	if (!pending) {
 		ret = -ENOMEM;
@@ -1253,9 +1270,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	}
 
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
-	if (!mk_cpu_pool || mk_cpu_set_add(mk_cpu_pool, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
-			cpu_id);
+	mk_cpu_set_add(mk_cpu_pool, cpu_id);
 
 	ret = 0;
 out:
