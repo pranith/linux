@@ -443,6 +443,37 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	return 0;
 }
 
+/**
+ * mk_pool_cpus_returned() - Is every pool CPU back in this kernel?
+ *
+ * True when the pool holds no free CPU and no instance owns one, so
+ * nothing can be sitting in a park loop. Pool memory that parked CPUs
+ * execute from may only be freed once this holds.
+ */
+bool mk_pool_cpus_returned(void)
+{
+	struct mk_instance *instance;
+	bool returned = true;
+
+	if (mk_cpu_pool && !mk_cpu_set_empty(mk_cpu_pool))
+		return false;
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		if (instance == root_instance)
+			continue;
+
+		if (!mk_cpu_set_empty(instance->cpus) ||
+		    !mk_cpu_set_empty(instance->cpus_on_slot)) {
+			returned = false;
+			break;
+		}
+	}
+	mutex_unlock(&mk_instance_mutex);
+
+	return returned;
+}
+
 static int mk_instance_reserve_cpus(struct mk_instance *instance,
 				    const struct mk_dt_config *config)
 {

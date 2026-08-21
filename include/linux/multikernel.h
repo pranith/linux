@@ -387,6 +387,7 @@ size_t mk_pool_total_bytes(void);
 size_t mk_pool_avail_bytes(void);
 bool mk_pool_empty(void);
 int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
+bool mk_pool_cpus_returned(void);
 
 /**
  * struct mk_pool_chunk_range - a pool chunk copied out of the chunk list
@@ -404,8 +405,20 @@ int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
 
 #ifdef CONFIG_X86
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
+bool mk_host_park_uses(phys_addr_t start, size_t size);
+int mk_teardown_host_park(void);
 #else
 static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
+{
+	return 0;
+}
+
+static inline bool mk_host_park_uses(phys_addr_t start, size_t size)
+{
+	return false;
+}
+
+static inline int mk_teardown_host_park(void)
 {
 	return 0;
 }

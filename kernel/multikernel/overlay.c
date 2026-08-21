@@ -240,7 +240,13 @@ static struct kernfs_ops mk_overlay_new_ops = {
  * fragment the order is instance-create, memory-remove, memory-add,
  * cpu-remove, cpu-add, device-remove, device-add, instance-remove, so
  * that a resource is released by its source before its destination
- * acquires it. Rollback walks both orders in reverse.
+ * acquires it. A /resources fragment moves memory-remove after
+ * cpu-remove and device-remove instead, so resources leave the pool as
+ * CPU, device, memory and join it as memory, CPU, device: the host park
+ * area lives in pool memory and cannot be released until the pool CPUs
+ * that run on it have come back, so a single fragment that returns the
+ * CPUs and removes the last chunk has to do the CPUs first. Rollback
+ * walks both orders in reverse.
  */
 
 #define MK_OVERLAY_POOL_PATH		"/resources"
@@ -699,7 +705,9 @@ static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt
 				/*
 				 * Only the capacity can be restored: the
 				 * kernel has since handed the old range
-				 * back to the buddy allocator.
+				 * back to the buddy allocator, and a host
+				 * park area torn down below is rebuilt by
+				 * the next baseline, not from here.
 				 */
 				pr_info("Rollback tx%d: regrowing the pool by %llu MB\n",
 					tx->id, size >> 20);
@@ -708,6 +716,16 @@ static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt
 				pr_info("Overlay tx%d: -memory 0x%llx-0x%llx (%llu MB) from %s\n",
 					tx->id, base, base + size - 1,
 					size >> 20, target->path);
+
+				if (mk_host_park_uses(base, size)) {
+					ret = mk_teardown_host_park();
+					if (ret) {
+						pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the host park area; return every pool CPU first (%d)\n",
+						       tx->id, base, size, ret);
+						return ret;
+					}
+				}
+
 				ret = mk_pool_mem_shrink(base, size);
 			}
 
@@ -1062,11 +1080,103 @@ static int mk_overlay_fragment_overlay_node(struct mk_overlay_tx *tx,
 	return overlay_node;
 }
 
-static int mk_overlay_apply_fragment(struct mk_overlay_tx *tx, const void *fdt,
-				     int fragment)
+enum mk_overlay_op {
+	MK_OVERLAY_OP_INSTANCE_CREATE,
+	MK_OVERLAY_OP_MEMORY_REMOVE,
+	MK_OVERLAY_OP_MEMORY_ADD,
+	MK_OVERLAY_OP_CPU_REMOVE,
+	MK_OVERLAY_OP_CPU_ADD,
+	MK_OVERLAY_OP_DEVICE_REMOVE,
+	MK_OVERLAY_OP_DEVICE_ADD,
+	MK_OVERLAY_OP_INSTANCE_REMOVE,
+	MK_OVERLAY_OP_COUNT,
+};
+
+static const char * const mk_overlay_op_names[MK_OVERLAY_OP_COUNT] = {
+	[MK_OVERLAY_OP_INSTANCE_CREATE]	= "instance-create",
+	[MK_OVERLAY_OP_MEMORY_REMOVE]	= "memory-remove",
+	[MK_OVERLAY_OP_MEMORY_ADD]	= "memory-add",
+	[MK_OVERLAY_OP_CPU_REMOVE]	= "cpu-remove",
+	[MK_OVERLAY_OP_CPU_ADD]		= "cpu-add",
+	[MK_OVERLAY_OP_DEVICE_REMOVE]	= "device-remove",
+	[MK_OVERLAY_OP_DEVICE_ADD]	= "device-add",
+	[MK_OVERLAY_OP_INSTANCE_REMOVE]	= "instance-remove",
+};
+
+/* A resource is released by its source before its destination acquires it */
+static const u8 mk_overlay_order[MK_OVERLAY_OP_COUNT] = {
+	MK_OVERLAY_OP_INSTANCE_CREATE,
+	MK_OVERLAY_OP_MEMORY_REMOVE,
+	MK_OVERLAY_OP_MEMORY_ADD,
+	MK_OVERLAY_OP_CPU_REMOVE,
+	MK_OVERLAY_OP_CPU_ADD,
+	MK_OVERLAY_OP_DEVICE_REMOVE,
+	MK_OVERLAY_OP_DEVICE_ADD,
+	MK_OVERLAY_OP_INSTANCE_REMOVE,
+};
+
+/*
+ * The pool takes its memory back last: the host park area every pool CPU
+ * runs on is pool memory, and it can only be released once the CPUs have
+ * come home, so one fragment can empty the pool completely.
+ */
+static const u8 mk_overlay_pool_order[MK_OVERLAY_OP_COUNT] = {
+	MK_OVERLAY_OP_INSTANCE_CREATE,
+	MK_OVERLAY_OP_CPU_REMOVE,
+	MK_OVERLAY_OP_DEVICE_REMOVE,
+	MK_OVERLAY_OP_MEMORY_REMOVE,
+	MK_OVERLAY_OP_MEMORY_ADD,
+	MK_OVERLAY_OP_CPU_ADD,
+	MK_OVERLAY_OP_DEVICE_ADD,
+	MK_OVERLAY_OP_INSTANCE_REMOVE,
+};
+
+static int mk_overlay_run_op(struct mk_overlay_tx *tx, const void *fdt,
+			     int overlay_node,
+			     const struct mk_overlay_target *target,
+			     enum mk_overlay_op op, bool undo)
+{
+	int op_node;
+
+	op_node = fdt_subnode_offset(fdt, overlay_node, mk_overlay_op_names[op]);
+	if (op_node < 0)
+		return 0;
+
+	switch (op) {
+	case MK_OVERLAY_OP_INSTANCE_CREATE:
+		if (undo)
+			return mk_overlay_undo_instance_create(tx, fdt, op_node,
+							       target);
+		return mk_overlay_op_instance_create(tx, fdt, op_node, target);
+	case MK_OVERLAY_OP_MEMORY_REMOVE:
+		return mk_overlay_op_memory_remove(tx, fdt, op_node, target,
+						   undo);
+	case MK_OVERLAY_OP_MEMORY_ADD:
+		return mk_overlay_op_memory_add(tx, fdt, op_node, target, undo);
+	case MK_OVERLAY_OP_CPU_REMOVE:
+		return mk_overlay_op_cpu(tx, fdt, op_node, target, undo, undo);
+	case MK_OVERLAY_OP_CPU_ADD:
+		return mk_overlay_op_cpu(tx, fdt, op_node, target, !undo, undo);
+	case MK_OVERLAY_OP_DEVICE_REMOVE:
+		return mk_overlay_op_device(tx, fdt, op_node, target, undo,
+					    undo);
+	case MK_OVERLAY_OP_DEVICE_ADD:
+		return mk_overlay_op_device(tx, fdt, op_node, target, !undo,
+					    undo);
+	case MK_OVERLAY_OP_INSTANCE_REMOVE:
+		return mk_overlay_op_instance_remove(tx, fdt, op_node, target,
+						     undo);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int mk_overlay_walk_fragment(struct mk_overlay_tx *tx, const void *fdt,
+				    int fragment, bool undo)
 {
 	struct mk_overlay_target target;
-	int overlay_node, op_node, ret;
+	const u8 *order;
+	int overlay_node, i, ret;
 
 	ret = mk_overlay_resolve_target(tx, fdt, fragment, &target);
 	if (ret)
@@ -1077,64 +1187,15 @@ static int mk_overlay_apply_fragment(struct mk_overlay_tx *tx, const void *fdt,
 	if (overlay_node < 0)
 		return -EINVAL;
 
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_instance_create(tx, fdt, op_node, &target);
-		if (ret)
-			return ret;
-	}
+	order = target.kind == MK_OVERLAY_TARGET_POOL ? mk_overlay_pool_order
+						      : mk_overlay_order;
 
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_memory_remove(tx, fdt, op_node, &target,
-						  false);
-		if (ret)
-			return ret;
-	}
+	for (i = 0; i < MK_OVERLAY_OP_COUNT; i++) {
+		enum mk_overlay_op op = undo ? order[MK_OVERLAY_OP_COUNT - 1 - i]
+					     : order[i];
 
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_memory_add(tx, fdt, op_node, &target, false);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, false,
-					false);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, true,
-					false);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_device(tx, fdt, op_node, &target, false,
-					   false);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_device(tx, fdt, op_node, &target, true,
-					   false);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_instance_remove(tx, fdt, op_node, &target,
-						    false);
+		ret = mk_overlay_run_op(tx, fdt, overlay_node, &target, op,
+					undo);
 		if (ret)
 			return ret;
 	}
@@ -1142,84 +1203,16 @@ static int mk_overlay_apply_fragment(struct mk_overlay_tx *tx, const void *fdt,
 	return 0;
 }
 
+static int mk_overlay_apply_fragment(struct mk_overlay_tx *tx, const void *fdt,
+				     int fragment)
+{
+	return mk_overlay_walk_fragment(tx, fdt, fragment, false);
+}
+
 static int mk_overlay_rollback_fragment(struct mk_overlay_tx *tx,
 					const void *fdt, int fragment)
 {
-	struct mk_overlay_target target;
-	int overlay_node, op_node, ret;
-
-	ret = mk_overlay_resolve_target(tx, fdt, fragment, &target);
-	if (ret)
-		return ret;
-
-	overlay_node = mk_overlay_fragment_overlay_node(tx, fdt, fragment,
-							&target);
-	if (overlay_node < 0)
-		return -EINVAL;
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_instance_remove(tx, fdt, op_node, &target,
-						    true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_device(tx, fdt, op_node, &target, false,
-					   true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_device(tx, fdt, op_node, &target, true,
-					   true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, false,
-					true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_cpu(tx, fdt, op_node, &target, true,
-					true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_memory_add(tx, fdt, op_node, &target, true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
-	if (op_node >= 0) {
-		ret = mk_overlay_op_memory_remove(tx, fdt, op_node, &target,
-						  true);
-		if (ret)
-			return ret;
-	}
-
-	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");
-	if (op_node >= 0) {
-		ret = mk_overlay_undo_instance_create(tx, fdt, op_node, &target);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return mk_overlay_walk_fragment(tx, fdt, fragment, true);
 }
 
 /**

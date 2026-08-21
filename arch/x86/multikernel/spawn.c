@@ -1451,6 +1451,89 @@ err_pgt:
 	return rc;
 }
 
+static bool mk_phys_in_range(phys_addr_t addr, phys_addr_t start, size_t size)
+{
+	return addr >= start && addr - start < size;
+}
+
+static bool mk_ident_pgtable_in_range(struct mk_ident_pgtable *pgt,
+				      phys_addr_t start, size_t size)
+{
+	int i;
+
+	if (!pgt)
+		return false;
+
+	for (i = 0; i < pgt->next_page; i++) {
+		if (pgt->pages[i] &&
+		    mk_phys_in_range(virt_to_phys(pgt->pages[i]), start, size))
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * mk_host_park_uses() - Does the host park area live in this range?
+ * @start: Physical base of the range
+ * @size: Size of the range in bytes
+ *
+ * Covers the park page, the host wake slot and every page of the
+ * pool-wide identity table.
+ */
+bool mk_host_park_uses(phys_addr_t start, size_t size)
+{
+	guard(mutex)(&mk_host_park_lock);
+
+	if (!mk_host_park.slot)
+		return false;
+
+	return mk_phys_in_range(mk_host_park.park_phys, start, size) ||
+	       mk_phys_in_range(mk_host_park.slot_phys, start, size) ||
+	       mk_ident_pgtable_in_range(mk_host_park.pgt, start, size);
+}
+
+/**
+ * mk_teardown_host_park() - Return the host park area to the pool
+ *
+ * The area is pool memory, so the chunk holding it cannot be removed
+ * while it exists. Every parked CPU executes the park page and runs on
+ * the identity table, whether it watches the host slot or an instance
+ * context, so the area may only go back while no CPU is in the pool at
+ * all. The next baseline builds it again, possibly elsewhere.
+ *
+ * Returns 0 if there was nothing to tear down, -EBUSY if the pool still
+ * has CPUs.
+ */
+int mk_teardown_host_park(void)
+{
+	guard(mutex)(&mk_host_park_lock);
+
+	if (!mk_host_park.slot)
+		return 0;
+
+	if (!mk_pool_cpus_returned())
+		return -EBUSY;
+
+	multikernel_free(mk_host_park.slot_phys,
+			 ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
+	mk_host_park.slot = NULL;
+	mk_host_park.slot_phys = 0;
+
+	/* Hand the page back as ordinary pool memory, not as code */
+	set_memory_nx((unsigned long)mk_host_park.park_va, 1);
+	multikernel_free(mk_host_park.park_phys, PAGE_SIZE);
+	mk_host_park.park_va = NULL;
+	mk_host_park.park_phys = 0;
+
+	mk_free_identity_pgtable(mk_host_park.pgt);
+	mk_host_park.pgt = NULL;
+	mk_host_park.cr3 = 0;
+
+	pr_info("mk_spawn: released the host pool park area\n");
+	return 0;
+}
+
 /*
  * Park this offlined pool CPU. On the host, wait in the host park area
  * watching the host slot; on a spawn kernel returning a CPU to the
