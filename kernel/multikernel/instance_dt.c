@@ -28,8 +28,8 @@
  *   - For host kernels (no manifest): Created with id=0, name="/"
  *   - For spawn kernels: Restored from the manifest's instance DTB
  *
- * The root instance is used by overlay operations to specify the host/current
- * kernel as a source or target for resource transfers (e.g., mk,instance="/").
+ * Overlay operations reach this kernel through an /instances/<name> fragment
+ * naming it, or through an /resources fragment when it manages a pool.
  */
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);

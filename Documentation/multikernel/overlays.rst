@@ -1,47 +1,39 @@
 .. SPDX-License-Identifier: GPL-2.0
 
-====================================
+================================
 Multikernel Device Tree Overlays
-====================================
+================================
 
 Overview
 ========
 
-The Device Tree overlay subsystem enables dynamic resource adjustments for
-multikernel instances at runtime without requiring system reboot. Changes are
-applied through standard Device Tree overlays and can be rolled back safely.
+The device tree overlay subsystem adjusts multikernel resources at runtime
+without a reboot. Each overlay is a transaction that can be applied and rolled
+back as a unit.
 
-Overlays can be used to:
+Overlays can:
 
-* **Create new instances**: Define and instantiate new kernel instances
-* **Adjust memory**: Add or remove memory regions from instances
-* **Adjust CPUs**: Migrate CPUs between instances
-* **Combine operations**: Perform multiple changes atomically
-
-Key Features
-------------
-
-* **Transaction-based**: Each overlay is tracked as an independent transaction
-* **Atomic updates**: Overlays are applied as single atomic operations
-* **Reversible**: Any overlay can be removed by deleting its transaction directory
-* **Safe**: Failed overlays don't affect system stability
-* **Ordered execution**: Operations execute in a predictable order
+* **Resize the pool**: move memory, CPUs and PCI devices between the kernel
+  that manages the pool and the pool itself
+* **Create and destroy instances**
+* **Move resources**: hand pool resources to an instance and take them back
+* **Combine operations**: several fragments in one transaction
 
 Filesystem Layout
 =================
 
-The overlay subsystem is accessible at ``/sys/fs/multikernel/overlays/``::
+The overlay subsystem lives at ``/sys/fs/multikernel/overlays/``::
 
     /sys/fs/multikernel/
-     ├── device_tree                 # Baseline system configuration
+     ├── device_tree                 # This kernel's pool, see Read-back below
      ├── instances/                  # Runtime kernel instances
      └── overlays/                   # Overlay subsystem
           ├── new                    # Control file: write DTBO here
           ├── tx_101/                # Applied overlay transaction
           │    ├── id                # Transaction ID: "101"
           │    ├── status            # "applied" | "failed" | "removed"
-          │    ├── instance          # Affected instance name
-          │    ├── resources         # Affected resources
+          │    ├── instance          # Target path of the first fragment
+          │    ├── resources         # Optional mk,resources description
           │    └── dtbo              # Original overlay blob (binary)
           └── tx_102/
                └── ...
@@ -49,52 +41,70 @@ The overlay subsystem is accessible at ``/sys/fs/multikernel/overlays/``::
 Overlay Format
 ==============
 
-Multikernel overlays follow a specific structure with operation sections that
-describe resource changes. The overlay format includes:
+Fragments and Targets
+---------------------
 
-Basic Structure
----------------
+A transaction is a device tree overlay holding any number of fragments. Every
+fragment names what it modifies with the standard ``target-path`` property and
+carries its operations under ``__overlay__``:
 
-A multikernel overlay consists of::
+``target-path = "/resources"``
+    The pool this kernel manages. Accepted only by a kernel that has been
+    given a baseline; any other kernel rejects the fragment with ``-EPERM``.
 
-    /multikernel-v1/;
+``target-path = "/instances/<name>"``
+    An existing instance, looked up by name. The name must not be empty and
+    must not contain ``/``. A spawn kernel modifies itself through its own
+    name here.
 
-    / {
-        fragment@0 {
-            target-path = "/";
-            __overlay__ {
-                instance-create {
-                    instance-name = "<instance-name>";
-                    id = <instance-id>;
-                    resources {
-                        memory-bytes = <size>;
-                        cpus = <cpu-list>;
-                    };
-                };
-                memory-add { ... };
-                cpu-add { ... };
-                /* ... other operations ... */
-            };
-        };
-    };
+``target-path = "/instances"``
+    The instance namespace: ``instance-create`` and ``instance-remove``.
+
+Any other target path is rejected with ``-EINVAL``.
+
+Operations Read From the Target
+-------------------------------
+
+Operation names describe what happens to the target, so the same name means
+different work depending on the fragment it sits in:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Operation
+     - Under ``/resources``
+     - Under ``/instances/<name>``
+   * - ``memory-add``
+     - Grow the pool by a new chunk
+     - Give an existing range to the instance
+   * - ``memory-remove``
+     - Shrink the pool, returning a chunk to this kernel
+     - Take a range back from the instance
+   * - ``cpu-add``
+     - Move a CPU of this kernel into the pool
+     - Give a free pool CPU to the instance
+   * - ``cpu-remove``
+     - Return a free pool CPU to this kernel
+     - Take a CPU back from the instance
+   * - ``device-add``
+     - Move a PCI device of this kernel into the pool
+     - Give a free pool device to the instance
+   * - ``device-remove``
+     - Return a free pool device to this kernel
+     - Take a device back from the instance
 
 Operation Sections
 ------------------
 
-Operations are placed directly inside the ``__overlay__`` node. Each operation
-section describes a specific type of resource change.
-
-**instance-create**
-    Creates a new kernel instance. Contains all instance configuration directly.
+**instance-create** (under ``/instances``)
+    Creates a new kernel instance.
 
     Properties:
-      - ``instance-name``: Instance name (string)
-      - ``id``: Instance ID (u32)
+      - ``instance-name``: instance name (string, no ``/``)
+      - ``id``: instance ID (u32, optional, auto-allocated when absent)
 
     Subnodes:
-      - ``resources``: Resource allocation for the instance
-          - ``memory-bytes``: Initial memory size (u32)
-          - ``cpus``: Initial CPU list (array of u32)
+      - ``resources``: initial allocation for the instance
 
     Example::
 
@@ -102,451 +112,274 @@ section describes a specific type of resource change.
             instance-name = "my-kernel";
             id = <1>;
             resources {
-                memory-bytes = <0x40000000>;  /* 1GB */
+                memory-bytes = <0x40000000>;    /* 1GB */
                 cpus = <4 5 6>;
             };
         };
 
-**memory-add**
-    Adds memory regions to an instance.
+**instance-remove** (under ``/instances``)
+    Destroys an instance.
 
     Properties:
-      - ``mk,instance``: Target instance name (string)
+      - ``instance-name``: instance name (string)
 
-    Subnodes:
-      - ``region@N``: Memory region definition
-          - ``reg``: <addr-hi addr-lo size-hi size-lo> (u64 address + u64 size)
-          - ``numa-node``: NUMA node ID (u32, optional)
-          - ``mem-type``: Memory type (u32, optional)
+**memory-add**
+    Subnodes are ``memory@N`` items. Under ``/resources`` an item is a
+    request, since the pool picks the base:
 
-    Example::
+      - ``size``: chunk size in bytes (u64, non-zero, page aligned)
+      - ``numa-node-id``: NUMA node (u32, optional, any node when absent)
+      - ``reg`` is rejected here
 
-        memory-add {
-            mk,instance = "database";
-            region@0 {
-                reg = <0x0 0x80000000  0x0 0x40000000>;  /* 1GB at 2GB */
-                numa-node = <0>;
-            };
-        };
+    Under ``/instances/<name>`` an item names an existing range:
+
+      - ``reg``: <addr-hi addr-lo size-hi size-lo> (u64 address, u64 size)
+      - ``numa-node-id``: NUMA node (u32, optional)
+      - ``mem-type``: memory type (u32, optional)
 
 **memory-remove**
-    Removes memory regions from an instance.
+    Subnodes are ``memory@N`` items naming an existing range in both cases:
 
-    Properties:
-      - ``mk,instance``: Target instance name (string)
+      - ``reg``: <addr-hi addr-lo size-hi size-lo>
 
-    Subnodes:
-      - ``region@N``: Memory region to remove
-          - ``reg``: <addr-hi addr-lo size-hi size-lo>
+    Under ``/resources`` the base and size must match a whole pool chunk as
+    reported by the root ``device_tree``.
 
-    Example::
+**cpu-add**, **cpu-remove**
+    Subnodes are ``cpu@N`` items:
 
-        memory-remove {
-            mk,instance = "database";
-            region@0 {
-                reg = <0x0 0x80000000  0x0 0x40000000>;  /* Remove 1GB */
-            };
-        };
+      - ``reg``: physical CPU ID (u64, or u32 for older overlays)
+      - ``numa-node-id``: NUMA node (u32, optional)
+      - ``flags``: CPU flags (u32, optional)
 
-**cpu-add**
-    Adds CPUs to an instance.
+**device-add**, **device-remove**
+    Subnodes are ``pci@N`` items:
 
-    Properties:
-      - ``mk,instance``: Target instance name (string)
+      - ``pci-id``: "DDDD:BB:SS.F" (string)
+      - ``driver``: driver to bind (string, optional, ``device-add`` to an
+        instance only)
+      - ``flags``: device flags (u32, optional)
 
-    Subnodes:
-      - ``cpu@N``: CPU definition
-          - ``reg``: Physical CPU ID (u32)
-          - ``numa-node``: NUMA node ID (u32, optional)
-          - ``flags``: CPU flags (u32, optional)
+Ordering
+--------
 
-    Example::
+Fragments are processed in ascending order of their unit address:
+``fragment@0``, ``fragment@1``, and so on. Within a fragment, operations run
+in this order so that a resource is released by its source before its
+destination acquires it:
 
-        cpu-add {
-            mk,instance = "database";
-            cpu@16 { reg = <16>; numa-node = <0>; };
-            cpu@17 { reg = <17>; numa-node = <0>; };
-        };
+1. ``instance-create``
+2. ``memory-remove``
+3. ``memory-add``
+4. ``cpu-remove``
+5. ``cpu-add``
+6. ``device-remove``
+7. ``device-add``
+8. ``instance-remove``
 
-**cpu-remove**
-    Removes CPUs from an instance.
+Rollback (``rmdir`` on the transaction directory) walks both orders in
+reverse and sends the inverse of each operation.
 
-    Properties:
-      - ``mk,instance``: Target instance name (string)
+Two cases cannot be undone exactly and are logged as warnings rather than
+failing the rollback:
 
-    Subnodes:
-      - ``cpu@N``: CPU to remove
-          - ``reg``: Physical CPU ID (u32)
+* ``instance-remove``: the destroyed instance's configuration is not kept.
+  Re-create it with a new ``instance-create`` overlay.
+* ``/resources memory-add``: the pool chose the chunk base at grow time and
+  the overlay never recorded it, so no chunk can be identified for a shrink.
 
-    Example::
+Rolling back ``/resources memory-remove`` regrows the pool by the same size.
+The new chunk has a different base, because the old range went back to the
+page allocator.
 
-        cpu-remove {
-            mk,instance = "database";
-            cpu@8 { reg = <8>; };
-        };
+Root Device Tree Read-back
+==========================
 
-Operation Ordering
-------------------
-
-Operations are executed in a specific order to ensure safe resource migration:
-
-1. **instance-create** - Create new instances first
-2. **memory-remove** - Remove memory from source
-3. **memory-add** - Add memory to destination
-4. **cpu-remove** - Remove CPUs from source
-5. **cpu-add** - Add CPUs to destination
-
-When an overlay is rolled back (via ``rmdir``), operations are reversed:
-
-1. **cpu-add** → cpu-remove
-2. **cpu-remove** → cpu-add
-3. **memory-add** → memory-remove
-4. **memory-remove** → memory-add
-5. **instance-create** → destroy instance
-
-Usage
-=====
-
-Creating a New Instance
------------------------
-
-To create a new instance with resources using an overlay:
-
-1. Create the overlay file::
-
-    /multikernel-v1/;
+``/sys/fs/multikernel/device_tree`` is generated from live kernel state. In a
+kernel that manages a pool, its ``/resources`` node describes the pool::
 
     / {
-        fragment@0 {
-            target-path = "/";
-            __overlay__ {
-                instance-create {
-                    instance-name = "webserver";
-                    id = <2>;
-                    resources {
-                        memory-bytes = <0x40000000>;  /* 1GB */
-                        cpus = <4 5>;
-                    };
-                };
+        compatible = "multikernel-v1";
+        id = <0>;
+        resources {
+            cpus = <...>;                       /* every pool member */
+            cpus-available = <...>;             /* the free subset */
+
+            memory@100000000 {
+                device_type = "memory";
+                reg = <0x1 0x00000000  0x0 0x40000000>;
+                numa-node-id = <0>;
             };
+
+            devices { ... };
         };
     };
 
-2. Compile and apply::
+``cpus`` lists every CPU the pool owns, including CPUs currently lent to
+instances; ``cpus-available`` lists only the free ones. There is one
+``memory@<base>`` node per pool chunk, in the standard memory node form, and
+its ``reg`` is what a ``/resources memory-remove`` item must name.
 
-    dtc -O dtb -o create_webserver.dtbo -@ create_webserver.dts
-    cat create_webserver.dtbo > /sys/fs/multikernel/overlays/new
+Examples
+========
 
-3. Verify the instance was created::
+Growing the Pool and Moving a Host CPU Into It
+----------------------------------------------
 
-    ls /sys/fs/multikernel/instances/
-    # Output shows: webserver
+::
 
-    cat /sys/fs/multikernel/instances/webserver/id
-    # Output: 2
-
-Adding Resources to an Instance
---------------------------------
-
-To add memory and CPUs to an existing instance:
-
-1. Create the overlay::
-
-    /multikernel-v1/;
+    /dts-v1/;
+    /plugin/;
 
     / {
         fragment@0 {
-            target-path = "/";
+            target-path = "/resources";
             __overlay__ {
                 memory-add {
-                    mk,instance = "database";
-                    region@0 {
-                        reg = <0x0 0x100000000  0x0 0x80000000>;  /* 2GB */
-                        numa-node = <0>;
+                    memory@0 {
+                        size = <0x0 0x40000000>;        /* 1GB */
+                        numa-node-id = <0>;
                     };
                 };
 
                 cpu-add {
-                    mk,instance = "database";
-                    cpu@16 { reg = <16>; numa-node = <0>; };
-                    cpu@17 { reg = <17>; numa-node = <0>; };
-                    cpu@18 { reg = <18>; numa-node = <0>; };
-                    cpu@19 { reg = <19>; numa-node = <0>; };
+                    cpu@20 { reg = <0x0 0x14>; };
+                    cpu@21 { reg = <0x0 0x15>; };
                 };
             };
         };
     };
 
-2. Compile and apply::
+Apply it::
 
-    dtc -O dtb -o add_resources.dtbo -@ add_resources.dts
-    cat add_resources.dtbo > /sys/fs/multikernel/overlays/new
+    dtc -O dtb -o grow_pool.dtbo -@ grow_pool.dts
+    cat grow_pool.dtbo > /sys/fs/multikernel/overlays/new
 
-Migrating Resources Between Instances
---------------------------------------
+    cat /sys/fs/multikernel/overlays/tx_101/status
+    # applied
 
-To move memory from one instance to another:
+Handing Pool Resources to an Instance
+-------------------------------------
 
-1. Create the overlay::
+::
 
-    /multikernel-v1/;
+    /dts-v1/;
+    /plugin/;
 
     / {
         fragment@0 {
-            target-path = "/";
+            target-path = "/instances/database";
             __overlay__ {
-                memory-remove {
-                    mk,instance = "database";
-                    region@0 {
-                        reg = <0x0 0x80000000  0x0 0x40000000>;
+                memory-add {
+                    memory@0 {
+                        reg = <0x1 0x00000000  0x0 0x40000000>;
+                        numa-node-id = <0>;
                     };
                 };
 
-                memory-add {
-                    mk,instance = "analytics";
-                    region@0 {
-                        reg = <0x0 0x80000000  0x0 0x40000000>;
-                        numa-node = <0>;
+                cpu-add {
+                    cpu@20 { reg = <0x0 0x14>; numa-node-id = <0>; };
+                    cpu@21 { reg = <0x0 0x15>; numa-node-id = <0>; };
+                };
+
+                device-add {
+                    pci@0 {
+                        pci-id = "0000:65:00.0";
+                        driver = "vfio-pci";
                     };
                 };
             };
         };
     };
 
-2. Apply the overlay - the memory will be atomically moved.
+The CPUs and the device must be free in the pool, and the memory range must
+lie inside a pool chunk. Roll the whole transaction back with::
 
-Creating Instance with Additional Resources
---------------------------------------------
+    rmdir /sys/fs/multikernel/overlays/tx_102
 
-You can create an instance with initial resources and add more in the same overlay:
+Creating an Instance and Feeding It in One Transaction
+------------------------------------------------------
 
-1. Create the overlay::
+Fragments run in unit-address order, so the instance exists by the time the
+second fragment refers to it::
 
-    /multikernel-v1/;
+    /dts-v1/;
+    /plugin/;
 
     / {
         fragment@0 {
-            target-path = "/";
+            target-path = "/instances";
             __overlay__ {
                 instance-create {
                     instance-name = "compute";
                     id = <3>;
                     resources {
-                        memory-bytes = <0x10000000>;  /* Initial: 256MB */
-                        cpus = <8>;                    /* Initial: CPU 8 */
+                        memory-bytes = <0x10000000>;    /* 256MB */
+                        cpus = <8>;
                     };
                 };
+            };
+        };
 
-                /* Add more resources beyond initial allocation */
-                memory-add {
-                    mk,instance = "compute";
-                    region@0 {
-                        reg = <0x0 0x200000000  0x0 0xF0000000>;  /* +3.75GB */
-                        numa-node = <1>;
-                    };
-                };
-
+        fragment@1 {
+            target-path = "/instances/compute";
+            __overlay__ {
                 cpu-add {
-                    mk,instance = "compute";
-                    cpu@9  { reg = <9>;  numa-node = <1>; };
-                    cpu@10 { reg = <10>; numa-node = <1>; };
-                    cpu@11 { reg = <11>; numa-node = <1>; };
+                    cpu@9  { reg = <0x0 0x9>;  numa-node-id = <1>; };
+                    cpu@10 { reg = <0x0 0xa>;  numa-node-id = <1>; };
                 };
             };
         };
     };
 
-2. Result: Instance created with 256MB + 3.75GB = 4GB total, CPUs 8-11.
+Transaction Metadata
+====================
 
-Applying an Overlay
--------------------
-
-The basic workflow for applying any overlay:
-
-1. Compile the overlay to binary format::
-
-    dtc -O dtb -o myoverlay.dtbo -@ myoverlay.dts
-
-2. Apply the overlay::
-
-    cat myoverlay.dtbo > /sys/fs/multikernel/overlays/new
-
-    ls /sys/fs/multikernel/overlays/
-    # Output: new  tx_101
-
-    cat /sys/fs/multikernel/overlays/tx_101/status
-    # Output: applied
-
-Removing an Instance
---------------------
-
-To remove an instance created via overlay, simply roll back the transaction::
-
-    rmdir /sys/fs/multikernel/overlays/tx_101
-
-This will automatically destroy the instance if it was created by that overlay.
-
-**Note**: The instance must not be active or loading. Stop the instance first
-if needed.
-
-Viewing Overlay Information
----------------------------
-
-Each transaction provides metadata about the overlay:
-
-**Transaction ID**::
+::
 
     cat /sys/fs/multikernel/overlays/tx_101/id
-    # Output: 101
-
-**Status**::
+    # 101
 
     cat /sys/fs/multikernel/overlays/tx_101/status
-    # Possible values: applied, failed, removed, pending
-
-**Affected Instance**::
+    # applied | failed | removed | pending
 
     cat /sys/fs/multikernel/overlays/tx_101/instance
-    # Output: database
-
-**Resource Description**::
+    # /resources          (target path of the first fragment)
 
     cat /sys/fs/multikernel/overlays/tx_101/resources
-    # Output: cpu:16-19
+    # value of the optional mk,resources property at the overlay root
 
-**Original Overlay Blob**::
-
-    # Binary file containing the original DTBO
-    ls -lh /sys/fs/multikernel/overlays/tx_101/dtbo
-
-Rolling Back an Overlay
------------------------
-
-To undo an applied overlay, simply remove its transaction directory::
-
-    rmdir /sys/fs/multikernel/overlays/tx_101
-
-This will:
-
-* Reverse all operations in opposite order
-* Return memory to source instances
-* Restore CPUs to original instances
-* Destroy instances created by the overlay (if any)
-* Remove the transaction directory
-
-**Important**: Instances being removed must not be active or in loading state.
-Stop them first if necessary.
+The original blob stays readable at ``tx_101/dtbo``.
 
 Error Handling
 ==============
 
-Handling Failed Overlays
--------------------------
+A failed overlay still creates a transaction with ``status = failed``; check
+``dmesg`` for the reason and ``rmdir`` the directory to clear it.
 
-If an overlay fails to apply, a transaction is still created with
-``status = failed``::
+**Pool target on a kernel without a pool**
+    ``-EPERM``. Only a kernel that was given a baseline manages a pool.
 
-    cat broken.dtbo > /sys/fs/multikernel/overlays/new
-    # Check kernel log for error details: dmesg | tail
+**Unsupported target-path**
+    ``-EINVAL``. Use ``/resources``, ``/instances`` or ``/instances/<name>``.
 
-    cat /sys/fs/multikernel/overlays/tx_102/status
-    # Output: failed
+**Instance not found**
+    ``-ENOENT`` from a ``/instances/<name>`` fragment. Create it first or fix
+    the name.
 
-    # Remove the failed transaction
-    rmdir /sys/fs/multikernel/overlays/tx_102
+**Resource not free in the pool**
+    ``-EBUSY``. The CPU or device is lent to an instance; take it back first.
 
-Common Errors
--------------
+**Invalid resource specification**
+    ``-EINVAL``. ``size`` must be 8 bytes, non-zero and page aligned; ``reg``
+    must be 16 bytes; ``numa-node-id`` must be 4 bytes and a valid node.
 
-**Instance Already Exists**
-    Attempting to create an instance that already exists::
-
-        # Error: instance 'webserver' already exists
-        # Solution: Choose a different name or remove the existing instance
-
-**Instance Not Found**
-    Operations targeting a non-existent instance::
-
-        # Error: instance 'database' not found
-        # Solution: Create the instance first or check the name
-
-**Instance Active/Loading**
-    Attempting to remove an active or loading instance during rollback::
-
-        # Error: Cannot remove active instance
-        # Solution: Stop the instance before rolling back
-
-**Invalid Resource Specification**
-    Malformed memory addresses or CPU IDs::
-
-        # Error: Invalid reg property
-        # Solution: Check DTB format and address/size encoding
-
-Testing
-=======
-
-Basic Functionality Test
-------------------------
-
-Test creating and removing an instance:
-
-1. Create a test overlay::
-
-    /multikernel-v1/;
-
-    / {
-        fragment@0 {
-            target-path = "/";
-            __overlay__ {
-                instance-create {
-                    instance-name = "test-instance";
-                    id = <99>;
-                    resources {
-                        memory-bytes = <0x10000000>;  /* 256MB */
-                        cpus = <1>;
-                    };
-                };
-            };
-        };
-    };
-
-2. Compile and apply::
-
-    dtc -O dtb -o test_create.dtbo -@ test_create.dts
-    cat test_create.dtbo > /sys/fs/multikernel/overlays/new
-
-3. Verify::
-
-    ls /sys/fs/multikernel/instances/
-    # Should show: test-instance
-
-    cat /sys/fs/multikernel/instances/test-instance/id
-    # Should show: 99
-
-4. Remove::
-
-    ls /sys/fs/multikernel/overlays/tx_*
-    rmdir /sys/fs/multikernel/overlays/tx_*
-
-5. Verify removal::
-
-    ls /sys/fs/multikernel/instances/
-    # test-instance should be gone
-
-Resource Migration Test
-------------------------
-
-Test moving resources between instances:
-
-1. Create two instances (database and analytics)
-2. Apply an overlay to move memory from database to analytics
-3. Verify resources were transferred
-4. Roll back to restore original configuration
-
+**Instance active or loading**
+    Rollback cannot destroy a running instance. Stop it first.
 
 See Also
 ========
 
-* Linux Device Tree documentation: ``Documentation/devicetree/``
+* Linux device tree documentation: ``Documentation/devicetree/``
 * Overlay notes: ``Documentation/devicetree/overlay-notes.rst``
-* Device Tree compiler: ``dtc(1)``
+* Device tree compiler: ``dtc(1)``

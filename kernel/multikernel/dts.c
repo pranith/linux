@@ -975,6 +975,11 @@ static int mk_dt_emit_pool_members(void *fdt)
 	 */
 	lockdep_assert_not_held(&mk_instance_mutex);
 
+	/*
+	 * mk_cpu_pool is mutated under no lock at all by the pool move
+	 * primitives, so a concurrent move can make this snapshot stale.
+	 */
+
 	mutex_lock(&mk_instance_mutex);
 	ret = mk_cpu_set_copy(members, mk_cpu_pool);
 	list_for_each_entry(instance, &mk_instance_list, list) {
