@@ -924,6 +924,261 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 	pr_info("  DTB: %zu bytes\n", config->dtb_size);
 }
 
+#define MK_DT_FDT_MIN_SIZE	SZ_4K
+#define MK_DT_FDT_MAX_SIZE	SZ_64K
+
+static int mk_dt_emit_cpu_prop(void *fdt, const char *name,
+			       const struct mk_cpu_set *set)
+{
+	unsigned int idx, count = mk_cpu_set_count(set);
+	mk_phys_cpu_t phys_cpu_id;
+	fdt64_t *array;
+	int ret;
+
+	if (!count)
+		return 0;
+
+	array = kmalloc_array(count, sizeof(*array), GFP_KERNEL);
+	if (!array)
+		return -ENOMEM;
+
+	mk_cpu_set_for_each(idx, phys_cpu_id, set)
+		array[idx] = cpu_to_fdt64(phys_cpu_id);
+
+	ret = fdt_property(fdt, name, array, count * sizeof(*array));
+	kfree(array);
+	return ret;
+}
+
+/**
+ * mk_dt_emit_pool_members() - Emit every CPU the pool owns
+ *
+ * A CPU lent to an instance is still a pool member, so the set is the
+ * union of the free CPUs and the ones the instances hold.
+ */
+static int mk_dt_emit_pool_members(void *fdt)
+{
+	struct mk_instance *instance;
+	struct mk_cpu_set *members;
+	mk_phys_cpu_t phys_cpu_id;
+	unsigned int i;
+	int ret;
+
+	members = mk_cpu_set_alloc();
+	if (!members)
+		return -ENOMEM;
+
+	/*
+	 * The root device tree is only generated from kernfs reads, which
+	 * hold no instance lock; instance creation generates a device tree
+	 * for the new instance, never for the root.
+	 */
+	lockdep_assert_not_held(&mk_instance_mutex);
+
+	mutex_lock(&mk_instance_mutex);
+	ret = mk_cpu_set_copy(members, mk_cpu_pool);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		if (ret)
+			break;
+		if (instance == root_instance)
+			continue;
+		mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+			ret = mk_cpu_set_add(members, phys_cpu_id);
+			if (ret)
+				break;
+		}
+	}
+	mutex_unlock(&mk_instance_mutex);
+
+	if (!ret)
+		ret = mk_dt_emit_cpu_prop(fdt, "cpus", members);
+
+	mk_cpu_set_free(members);
+	return ret;
+}
+
+/* Runs under the pool mutex, so it only writes into the caller's buffer */
+static int mk_dt_emit_pool_chunk(struct mk_pool_chunk *chunk, void *data)
+{
+	u64 base = chunk->res.start;
+	u64 size = resource_size(&chunk->res);
+	void *fdt = data;
+	char name[32];
+	fdt64_t reg[2];
+	int ret;
+
+	snprintf(name, sizeof(name), "memory@%llx", base);
+	reg[0] = cpu_to_fdt64(base);
+	reg[1] = cpu_to_fdt64(size);
+
+	ret = fdt_begin_node(fdt, name);
+	if (!ret)
+		ret = fdt_property_string(fdt, "device_type", "memory");
+	if (!ret)
+		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
+	if (!ret)
+		ret = fdt_property_u32(fdt, "numa-node-id", chunk->node);
+	if (!ret)
+		ret = fdt_end_node(fdt);
+
+	return ret;
+}
+
+static int mk_dt_emit_instance_memory(struct mk_instance *instance, void *fdt)
+{
+	struct mk_memory_region *region;
+	u64 total_size = 0;
+	u64 base_addr = 0;
+	bool first = true;
+	int ret;
+
+	list_for_each_entry(region, &instance->memory_regions, list) {
+		if (first) {
+			base_addr = region->res.start;
+			first = false;
+		}
+		total_size += resource_size(&region->res);
+	}
+
+	if (!total_size)
+		return 0;
+
+	ret = fdt_property_u64(fdt, "memory-base", base_addr);
+	if (ret)
+		return ret;
+
+	return fdt_property_u64(fdt, "memory-bytes", total_size);
+}
+
+static int mk_dt_emit_devices(struct mk_instance *instance, void *fdt)
+{
+	struct mk_platform_device *plat_dev;
+	struct mk_pci_device *pci_dev;
+	bool has_pci, has_platform;
+	int ret;
+
+	has_pci = instance->pci_devices_valid && instance->pci_device_count > 0;
+	has_platform = instance->platform_devices_valid &&
+		       instance->platform_device_count > 0;
+	if (!has_pci && !has_platform)
+		return 0;
+
+	ret = fdt_begin_node(fdt, "devices");
+	if (ret)
+		return ret;
+
+	if (has_pci) {
+		list_for_each_entry(pci_dev, &instance->pci_devices, list) {
+			char pci_id_str[32];
+
+			snprintf(pci_id_str, sizeof(pci_id_str),
+				 "%04x:%02x:%02x.%x", pci_dev->domain,
+				 pci_dev->bus, pci_dev->slot, pci_dev->func);
+
+			ret = fdt_begin_node(fdt, pci_dev->name[0] ?
+					     pci_dev->name : "unnamed_pci");
+			if (!ret)
+				ret = fdt_property_string(fdt, "device-type",
+							  "pci");
+			if (!ret)
+				ret = fdt_property_string(fdt, "pci-id",
+							  pci_id_str);
+			if (!ret)
+				ret = fdt_property_u32(fdt, "vendor-id",
+						       pci_dev->vendor);
+			if (!ret)
+				ret = fdt_property_u32(fdt, "device-id",
+						       pci_dev->device);
+			if (!ret)
+				ret = fdt_end_node(fdt);
+			if (ret)
+				return ret;
+		}
+	}
+
+	if (has_platform) {
+		list_for_each_entry(plat_dev, &instance->platform_devices, list) {
+			ret = fdt_begin_node(fdt, plat_dev->name);
+			if (!ret)
+				ret = fdt_property_string(fdt, "device-type",
+							  "platform");
+			if (!ret && plat_dev->name[0])
+				ret = fdt_property_string(fdt, "device-name",
+							  plat_dev->name);
+			if (!ret)
+				ret = fdt_end_node(fdt);
+			if (ret)
+				return ret;
+		}
+	}
+
+	return fdt_end_node(fdt);
+}
+
+/**
+ * mk_dt_emit_instance() - Write one instance device tree into @fdt
+ * @instance: Instance to describe
+ * @fdt: Buffer to write the sequential-write FDT into
+ * @size: Size of @fdt
+ *
+ * The root device tree of a kernel that manages a pool describes the
+ * pool itself: its CPU members, the free subset, and one standard
+ * memory node per chunk. Sequential writes demand that every /resources
+ * property precede its first child node.
+ *
+ * Returns: 0 on success, a libfdt error (-FDT_ERR_NOSPACE for a buffer
+ * that is too small) or a negative error code on failure.
+ */
+static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
+			       size_t size)
+{
+	bool pool = instance == root_instance && mk_cpu_pool;
+	int ret;
+
+	ret = fdt_create(fdt, size);
+	if (!ret)
+		ret = fdt_finish_reservemap(fdt);
+	if (!ret)
+		ret = fdt_begin_node(fdt, instance->name);
+	if (!ret)
+		ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+	if (!ret)
+		ret = fdt_property_u32(fdt, "id", instance->id);
+	if (!ret)
+		ret = fdt_begin_node(fdt, "resources");
+	if (ret)
+		return ret;
+
+	if (pool) {
+		ret = mk_dt_emit_pool_members(fdt);
+		if (!ret)
+			ret = mk_dt_emit_cpu_prop(fdt, "cpus-available",
+						  mk_cpu_pool);
+	} else {
+		ret = mk_dt_emit_instance_memory(instance, fdt);
+		if (!ret)
+			ret = mk_dt_emit_cpu_prop(fdt, "cpus", instance->cpus);
+	}
+	if (ret)
+		return ret;
+
+	if (pool) {
+		ret = mk_pool_for_each_chunk(mk_dt_emit_pool_chunk, fdt);
+		if (ret)
+			return ret;
+	}
+
+	ret = mk_dt_emit_devices(instance, fdt);
+	if (!ret)
+		ret = fdt_end_node(fdt);	/* /resources */
+	if (!ret)
+		ret = fdt_end_node(fdt);	/* root */
+	if (!ret)
+		ret = fdt_finish(fdt);
+
+	return ret;
+}
+
 /**
  * mk_dt_generate_instance_dtb() - Generate instance DTB from kernel data structures
  * @instance: Instance with transferred resources (CPUs, memory, devices)
@@ -935,9 +1190,9 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size)
 {
+	size_t fdt_size = MK_DT_FDT_MIN_SIZE;
 	void *fdt;
 	int ret;
-	size_t fdt_size = 4096; /* Start with 4K, will grow if needed */
 
 	if (!instance || !out_dtb || !out_size)
 		return -EINVAL;
@@ -945,172 +1200,30 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 	if (!instance->name)
 		return -EINVAL;
 
-	fdt = kmalloc(fdt_size, GFP_KERNEL);
-	if (!fdt)
-		return -ENOMEM;
+	for (;;) {
+		fdt = kmalloc(fdt_size, GFP_KERNEL);
+		if (!fdt)
+			return -ENOMEM;
 
-	ret = fdt_create(fdt, fdt_size);
-	if (ret) {
-		pr_err("Failed to create FDT: %d\n", ret);
-		goto err_free;
-	}
+		ret = mk_dt_emit_instance(instance, fdt, fdt_size);
+		if (!ret)
+			break;
 
-	ret = fdt_finish_reservemap(fdt);
-	if (ret) {
-		pr_err("Failed to finish reservemap: %d\n", ret);
-		goto err_free;
-	}
+		kfree(fdt);
 
-	ret = fdt_begin_node(fdt, instance->name);
-	if (ret) goto err_free;
-
-	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
-	if (ret) goto err_free;
-
-	ret = fdt_property_u32(fdt, "id", instance->id);
-	if (ret) goto err_free;
-
-	ret = fdt_begin_node(fdt, "resources");
-	if (ret) goto err_free;
-
-	if (!list_empty(&instance->memory_regions)) {
-		struct mk_memory_region *region;
-		u64 total_size = 0;
-		u64 base_addr = 0;
-		bool first = true;
-
-		list_for_each_entry(region, &instance->memory_regions, list) {
-			if (first) {
-				base_addr = region->res.start;
-				first = false;
-			}
-			total_size += resource_size(&region->res);
+		if (ret != -FDT_ERR_NOSPACE || fdt_size >= MK_DT_FDT_MAX_SIZE) {
+			pr_err("Failed to generate DTB for '%s': %d\n",
+			       instance->name, ret);
+			return ret;
 		}
 
-		if (total_size > 0) {
-			ret = fdt_property_u64(fdt, "memory-base", base_addr);
-			if (ret) goto err_free;
-
-			ret = fdt_property_u64(fdt, "memory-bytes", total_size);
-			if (ret) goto err_free;
-		}
-	}
-
-	/*
-	 * CPU resources, as an array of 64-bit physical CPU IDs. The root
-	 * instance's device tree is the baseline: in the kernel that
-	 * manages a pool it describes the assignable pool, not the CPUs
-	 * the kernel itself runs on.
-	 */
-	const struct mk_cpu_set *cpus = instance->cpus;
-
-	if (instance == root_instance && mk_cpu_pool)
-		cpus = mk_cpu_pool;
-
-	if (!mk_cpu_set_empty(cpus)) {
-		unsigned int idx, cpu_count = mk_cpu_set_count(cpus);
-		mk_phys_cpu_t phys_cpu_id;
-		fdt64_t *cpu_array;
-
-		cpu_array = kmalloc_array(cpu_count, sizeof(*cpu_array), GFP_KERNEL);
-		if (!cpu_array) {
-			ret = -ENOMEM;
-			goto err_free;
-		}
-
-		mk_cpu_set_for_each(idx, phys_cpu_id, cpus)
-			cpu_array[idx] = cpu_to_fdt64(phys_cpu_id);
-
-		ret = fdt_property(fdt, "cpus", cpu_array,
-				   cpu_count * sizeof(*cpu_array));
-		kfree(cpu_array);
-		if (ret) goto err_free;
-	}
-
-	if ((instance->pci_devices_valid && instance->pci_device_count > 0) ||
-	    (instance->platform_devices_valid && instance->platform_device_count > 0)) {
-		ret = fdt_begin_node(fdt, "devices");
-		if (ret) goto err_free;
-
-		if (instance->pci_devices_valid && instance->pci_device_count > 0) {
-			struct mk_pci_device *pci_dev;
-
-			list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-				char node_name[64];
-				char pci_id_str[32];
-
-				snprintf(node_name, sizeof(node_name), "%s",
-					 pci_dev->name[0] ? pci_dev->name : "unnamed_pci");
-				snprintf(pci_id_str, sizeof(pci_id_str), "%04x:%02x:%02x.%x",
-					 pci_dev->domain, pci_dev->bus, pci_dev->slot, pci_dev->func);
-
-				ret = fdt_begin_node(fdt, node_name);
-				if (ret) goto err_free;
-
-				ret = fdt_property_string(fdt, "device-type", "pci");
-				if (ret) goto err_free;
-
-				ret = fdt_property_string(fdt, "pci-id", pci_id_str);
-				if (ret) goto err_free;
-
-				ret = fdt_property_u32(fdt, "vendor-id", pci_dev->vendor);
-				if (ret) goto err_free;
-
-				ret = fdt_property_u32(fdt, "device-id", pci_dev->device);
-				if (ret) goto err_free;
-
-				ret = fdt_end_node(fdt);
-				if (ret) goto err_free;
-			}
-		}
-
-		if (instance->platform_devices_valid && instance->platform_device_count > 0) {
-			struct mk_platform_device *plat_dev;
-
-			list_for_each_entry(plat_dev, &instance->platform_devices, list) {
-				ret = fdt_begin_node(fdt, plat_dev->name);
-				if (ret) goto err_free;
-
-				ret = fdt_property_string(fdt, "device-type", "platform");
-				if (ret) goto err_free;
-
-				if (plat_dev->name[0]) {
-					ret = fdt_property_string(fdt, "device-name", plat_dev->name);
-					if (ret) goto err_free;
-				}
-
-				ret = fdt_end_node(fdt);
-				if (ret) goto err_free;
-			}
-		}
-
-		ret = fdt_end_node(fdt); /* /resources/devices */
-		if (ret) goto err_free;
-	}
-
-	/* End resources node */
-	ret = fdt_end_node(fdt);
-	if (ret) goto err_free;
-
-	/* End root node */
-	ret = fdt_end_node(fdt);
-	if (ret) goto err_free;
-
-	/* Finish FDT */
-	ret = fdt_finish(fdt);
-	if (ret) {
-		pr_err("Failed to finish FDT: %d\n", ret);
-		goto err_free;
+		fdt_size *= 2;
 	}
 
 	*out_dtb = fdt;
 	*out_size = fdt_totalsize(fdt);
 
 	pr_info("Generated instance DTB for '%s' (ID %d): %zu bytes\n",
-			instance->name, instance->id, *out_size);
+		instance->name, instance->id, *out_size);
 	return 0;
-
-err_free:
-	kfree(fdt);
-	return ret;
 }

@@ -109,9 +109,9 @@ static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 			return -EINVAL;
 		}
 
-		nid = fdt_getprop(fdt, node, "numa-node", &len);
+		nid = fdt_getprop(fdt, node, "numa-node-id", &len);
 		if (nid && len != 4) {
-			pr_err("Baseline %s: invalid 'numa-node' length %d\n",
+			pr_err("Baseline %s: invalid 'numa-node-id' length %d\n",
 			       name, len);
 			return -EINVAL;
 		}
@@ -119,7 +119,7 @@ static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 		reqs[n].node = nid ? (int)fdt32_to_cpu(*nid) : NUMA_NO_NODE;
 		if (reqs[n].node != NUMA_NO_NODE &&
 		    (reqs[n].node < 0 || reqs[n].node >= MAX_NUMNODES)) {
-			pr_err("Baseline %s: numa-node %d out of range\n",
+			pr_err("Baseline %s: numa-node-id %d out of range\n",
 			       name, reqs[n].node);
 			return -EINVAL;
 		}
@@ -129,7 +129,7 @@ static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 
 	if (!n) {
 		if (fdt_getprop(fdt, resources_node, "memory-bytes", &len))
-			pr_err("Baseline: memory-base/memory-bytes are no longer accepted; use memory@N { size; numa-node; }\n");
+			pr_err("Baseline: memory-base/memory-bytes are no longer accepted; use memory@N { size; numa-node-id; }\n");
 		else
 			pr_err("Baseline has no memory@N node; the pool needs memory\n");
 		return -EINVAL;
@@ -357,7 +357,7 @@ static int mk_baseline_initialize_cpus(const struct mk_cpu_set *requested)
 		mk_cpu_set_count(requested));
 
 	mk_cpu_set_for_each(i, phys_cpu_id, requested) {
-		ret = mk_send_cpu_remove(root_instance->id, phys_cpu_id);
+		ret = mk_pool_cpu_add(phys_cpu_id);
 		if (ret) {
 			pr_err("Failed to move CPU %llu into the pool: %d\n",
 			       phys_cpu_id, ret);
@@ -390,9 +390,8 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 	}
 
 	list_for_each_entry(pci_dev, pci_list, list) {
-		ret = mk_send_device_remove(root_instance->id, pci_dev->domain,
-					    pci_dev->bus,
-					    PCI_DEVFN(pci_dev->slot, pci_dev->func));
+		ret = mk_pool_device_add(pci_dev->domain, pci_dev->bus,
+					 PCI_DEVFN(pci_dev->slot, pci_dev->func));
 		if (ret) {
 			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not moved into the pool: %d\n",
 				pci_dev->vendor, pci_dev->device, pci_dev->domain,
@@ -437,7 +436,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 
 	if (!mk_pool_empty() || (mk_cpu_pool && !mk_cpu_set_empty(mk_cpu_pool)) ||
 	    root_instance->pci_device_count) {
-		pr_err("Baseline already applied; change the pool with an overlay targeting \"host\"\n");
+		pr_err("Baseline already applied; change the pool with an overlay targeting /resources\n");
 		return -EBUSY;
 	}
 
