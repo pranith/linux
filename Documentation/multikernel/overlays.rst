@@ -193,8 +193,9 @@ memory, and the kernel can only release it once those CPUs have come back.
 Taking the CPUs first lets a single fragment return every CPU and remove
 every chunk, which empties the pool and allows a new baseline to be
 applied. A ``memory-remove`` that would strand parked CPUs fails with
-``-EBUSY``. The area is built again by whichever chunk next gives the pool
-memory, so a pool that has memory can always park a CPU.
+``-EBUSY``. The area is built again in whatever memory the pool has left,
+or by whichever chunk next gives it some, so a pool that has memory can
+always park a CPU.
 
 Rollback (``rmdir`` on the transaction directory) walks both orders in
 reverse and sends the inverse of each operation.

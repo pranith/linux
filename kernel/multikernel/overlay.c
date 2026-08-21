@@ -667,6 +667,51 @@ static int mk_overlay_op_memory_add(struct mk_overlay_tx *tx, const void *fdt,
 	return 0;
 }
 
+/*
+ * Take one chunk out of the pool. The host park area is pool memory, so
+ * the chunk holding it only comes out once every pool CPU is home, and
+ * whatever memory the pool has left has to host the area again: nothing
+ * else would rebuild it until the pool next grows.
+ */
+static int mk_overlay_pool_mem_remove(struct mk_overlay_tx *tx, u64 base,
+				      u64 size)
+{
+	int ret;
+
+	/*
+	 * Only a chunk the park area is pinning gets a teardown, so a range
+	 * that matches no chunk at all never costs the pool its park area.
+	 */
+	ret = mk_pool_mem_shrink(base, size);
+	if (ret != -EBUSY || !mk_host_park_uses(base, size)) {
+		if (ret)
+			pr_err("Failed to resize the pool: %d\n", ret);
+		return ret;
+	}
+
+	ret = mk_teardown_host_park();
+	if (ret) {
+		pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the host park area; return every pool CPU first (%d)\n",
+		       tx->id, base, size, ret);
+		return ret;
+	}
+
+	ret = mk_pool_mem_shrink(base, size);
+	if (ret) {
+		pr_err("Failed to resize the pool: %d\n", ret);
+		return ret;
+	}
+
+	ret = mk_setup_host_park();
+	if (ret == -ENODEV)		/* nothing left to park in */
+		return 0;
+	if (ret)
+		pr_err("Overlay tx%d: chunk removed but the host park area could not be rebuilt (%d); a memory-add will retry\n",
+		       tx->id, ret);
+
+	return ret;
+}
+
 /**
  * mk_overlay_op_memory_remove - Apply or undo a memory-remove operation
  * @undo: Send the inverse operation instead of the operation itself
@@ -712,34 +757,21 @@ static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt
 				pr_info("Rollback tx%d: regrowing the pool by %llu MB\n",
 					tx->id, size >> 20);
 				ret = mk_pool_mem_grow(size, node, NULL);
-			} else {
-				pr_info("Overlay tx%d: -memory 0x%llx-0x%llx (%llu MB) from %s\n",
-					tx->id, base, base + size - 1,
-					size >> 20, target->path);
-
-				/*
-				 * Only a chunk the park area is pinning gets
-				 * a teardown, so a range that matches no
-				 * chunk at all never costs the pool its park
-				 * area.
-				 */
-				ret = mk_pool_mem_shrink(base, size);
-				if (ret == -EBUSY &&
-				    mk_host_park_uses(base, size)) {
-					ret = mk_teardown_host_park();
-					if (ret) {
-						pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the host park area; return every pool CPU first (%d)\n",
-						       tx->id, base, size, ret);
-						return ret;
-					}
-					ret = mk_pool_mem_shrink(base, size);
+				if (ret) {
+					pr_err("Failed to resize the pool: %d\n",
+					       ret);
+					return ret;
 				}
+				continue;
 			}
 
-			if (ret) {
-				pr_err("Failed to resize the pool: %d\n", ret);
+			pr_info("Overlay tx%d: -memory 0x%llx-0x%llx (%llu MB) from %s\n",
+				tx->id, base, base + size - 1, size >> 20,
+				target->path);
+
+			ret = mk_overlay_pool_mem_remove(tx, base, size);
+			if (ret)
 				return ret;
-			}
 			continue;
 		}
 
