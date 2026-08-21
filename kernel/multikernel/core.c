@@ -867,6 +867,7 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
 	struct gen_pool_chunk *chunk;
 	struct mk_memory_region *region;
 	struct resource *parent;
+	size_t available;
 	int ret = 0;
 	int region_num = 0;
 
@@ -881,15 +882,10 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
 		return -EINVAL;
 	}
 
-	/* Calculate available memory from root_instance regions */
-	u64 available = 0;
-	struct mk_memory_region *root_region;
-	list_for_each_entry(root_region, &root_instance->memory_regions, list) {
-		available += resource_size(&root_region->res);
-	}
+	available = mk_pool_avail_bytes();
 
 	if (size > available) {
-		pr_err("Requested memory (0x%llx) exceeds available pool (0x%llx)\n",
+		pr_err("Requested memory (0x%llx) exceeds available pool (0x%zx)\n",
 		       size, available);
 		return -ENOMEM;
 	}

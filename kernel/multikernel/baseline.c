@@ -110,12 +110,30 @@ static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 		}
 
 		nid = fdt_getprop(fdt, node, "numa-node", &len);
-		reqs[n].node = (nid && len == 4) ? (int)fdt32_to_cpu(*nid) : NUMA_NO_NODE;
+		if (nid && len != 4) {
+			pr_err("Baseline %s: invalid 'numa-node' length %d\n",
+			       name, len);
+			return -EINVAL;
+		}
+
+		reqs[n].node = nid ? (int)fdt32_to_cpu(*nid) : NUMA_NO_NODE;
+		if (reqs[n].node != NUMA_NO_NODE &&
+		    (reqs[n].node < 0 || reqs[n].node >= MAX_NUMNODES)) {
+			pr_err("Baseline %s: numa-node %d out of range\n",
+			       name, reqs[n].node);
+			return -EINVAL;
+		}
+
 		n++;
 	}
 
-	if (!n && fdt_getprop(fdt, resources_node, "memory-bytes", &len))
-		pr_err("Baseline: memory-base/memory-bytes are no longer accepted; use memory@N { size; numa-node; }\n");
+	if (!n) {
+		if (fdt_getprop(fdt, resources_node, "memory-bytes", &len))
+			pr_err("Baseline: memory-base/memory-bytes are no longer accepted; use memory@N { size; numa-node; }\n");
+		else
+			pr_err("Baseline has no memory@N node; the pool needs memory\n");
+		return -EINVAL;
+	}
 
 	return n;
 }
@@ -396,7 +414,7 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 {
-	struct mk_baseline_mem_req reqs[MK_BASELINE_MAX_MEM_REQS];
+	struct mk_baseline_mem_req *reqs;
 	struct mk_cpu_set *requested;
 	LIST_HEAD(pci_list);
 	int resources_node, nr_reqs;
@@ -441,9 +459,15 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -EINVAL;
 	}
 
-	requested = mk_cpu_set_alloc();
-	if (!requested)
+	reqs = kcalloc(MK_BASELINE_MAX_MEM_REQS, sizeof(*reqs), GFP_KERNEL);
+	if (!reqs)
 		return -ENOMEM;
+
+	requested = mk_cpu_set_alloc();
+	if (!requested) {
+		kfree(reqs);
+		return -ENOMEM;
+	}
 
 	mk_baseline_clear_resources(root_instance);
 
@@ -457,13 +481,6 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 					   MK_BASELINE_MAX_MEM_REQS);
 	if (nr_reqs < 0) {
 		ret = nr_reqs;
-		pr_err("Failed to parse baseline memory: %d\n", ret);
-		goto out;
-	}
-
-	if (nr_reqs == 0) {
-		pr_err("Baseline has no memory@N node; the pool needs memory\n");
-		ret = -EINVAL;
 		goto out;
 	}
 
@@ -525,6 +542,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 	root_instance->dtb_data = kmalloc(fdt_size, GFP_KERNEL);
 	if (!root_instance->dtb_data) {
 		pr_err("Failed to allocate memory for baseline DTB\n");
+		root_instance->dtb_size = 0;
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -537,5 +555,6 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 out:
 	mk_baseline_free_pci_list(&pci_list);
 	mk_cpu_set_free(requested);
+	kfree(reqs);
 	return ret;
 }
