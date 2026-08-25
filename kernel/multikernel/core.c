@@ -290,10 +290,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 	unsigned int i;
 	int ret, failed = 0;
 
-	/* Never started, so nothing of it is running */
-	if (!instance->spawn_ctx)
-		return 0;
-
+	/* Empty until the instance first ran, so nothing of it is executing */
 	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
@@ -442,6 +439,21 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 
 	return 0;
 }
+
+static DEFINE_PER_CPU(bool, mk_pool_cpu);
+
+/* Mark/query a CPU as parked in the multikernel pool */
+void mk_set_pool_cpu(int cpu, bool is_pool)
+{
+	per_cpu(mk_pool_cpu, cpu) = is_pool;
+}
+EXPORT_SYMBOL_GPL(mk_set_pool_cpu);
+
+bool cpu_is_multikernel_pool(unsigned int cpu)
+{
+	return per_cpu(mk_pool_cpu, cpu);
+}
+EXPORT_SYMBOL_GPL(cpu_is_multikernel_pool);
 
 /**
  * mk_pool_cpus_returned() - Is every pool CPU back in this kernel?
@@ -1045,13 +1057,13 @@ void mk_instance_free_memory(struct mk_instance *instance)
 			total_freed, instance->id, instance->name);
 
 		/*
-		 * The spawn context, trampoline, park page and identity page
-		 * tables are all carved from the control block, so they are
-		 * returned to the pool as one allocation rather than
-		 * individually. Freeing them piecemeal would punch holes in
-		 * the block's bitmap and leave the rest of it allocated.
-		 * The arch reparks CPUs still watching this instance's
-		 * context back to the host slot before the block goes away.
+		 * The arch's boot structures are all carved from the control
+		 * block, so they are returned to the pool as one allocation
+		 * rather than individually. Freeing them piecemeal would punch
+		 * holes in the block's bitmap and leave the rest of it
+		 * allocated. The arch moves CPUs still parked in this
+		 * instance's memory back to the host pool before the block
+		 * goes away.
 		 */
 		if (mk_arch_release_instance(instance)) {
 			/*
@@ -1167,10 +1179,10 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  * @size: Allocation size
  * @align: Required alignment
  *
- * Control structures (spawn context, trampoline, park page, identity page
- * tables) live in instance memory, which the spawn kernel sees as RAM. They
- * are carved from one contiguous block so it can be reserved in the spawn
- * kernel's e820; otherwise the spawn kernel's page allocator recycles them
+ * The arch's boot structures (spawn context, trampolines, park area) live
+ * in instance memory, which the spawn kernel sees as RAM. They are carved
+ * from one contiguous block so the spawn kernel can reserve it from its
+ * allocator with a single entry; otherwise its page allocator recycles them
  * while it runs, and the CPUs have nothing valid left to park on when it
  * shuts down.
  *
@@ -1338,10 +1350,8 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 	pr_info("Multikernel instance %d shutting down\n", root_instance->id);
 
 	/*
-	 * Enter pool state: CPUs wait in HLT with APIC enabled, checking
-	 * for spawn signals. This allows CPUs to be re-spawned later.
-	 *
-	 * Use wait=0 since mk_enter_pool_state() never returns.
+	 * Enter pool state: every CPU parks where the host can re-spawn
+	 * it later. Use wait=0 since mk_enter_pool_state() never returns.
 	 */
 	smp_call_function(mk_enter_pool_state, NULL, 0);
 	mk_enter_pool_state(NULL);
@@ -1614,10 +1624,9 @@ static int __init multikernel_init(void)
 {
 	int ret;
 
-	/* Register NMI handler for forcible shutdown */
-	ret = mk_register_stop_nmi_handler();
+	ret = mk_arch_register_force_stop();
 	if (ret < 0) {
-		pr_warn("Failed to register NMI stop handler: %d (force halt unavailable)\n", ret);
+		pr_warn("No force stop handler: %d (force halt unavailable)\n", ret);
 		/* Continue anyway - graceful shutdown still works */
 	}
 

@@ -6,6 +6,10 @@
 config ARCH_SUPPORTS_MULTIKERNEL
 	bool
 
+# The arch parks pool CPUs in a host-owned area inside pool memory
+config ARCH_HAS_MK_HOST_PARK
+	bool
+
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL

@@ -20,6 +20,17 @@
 #include <asm/smp.h>
 
 struct mk_instance;
+struct mk_spawn_context;
+struct mk_ident_pgtable;
+
+/* Per-instance spawn state, carved from the control block on first spawn */
+struct mk_instance_arch {
+	struct mk_spawn_context *spawn_ctx;
+	phys_addr_t spawn_ctx_phys;
+	struct mk_ident_pgtable *ident_pgt;
+	void *trampoline_va;
+	void *park_va;			/* Pool park page, written once by the host */
+};
 
 /*
  * Physical CPU IDs are APIC IDs, widened to the generic u64 type. The
@@ -136,6 +147,7 @@ void mk_pool_park_cpu(void);
 /* Park a pool CPU leaving this kernel (play_dead path) */
 void __noreturn multikernel_play_dead(void);
 
+
 /*
  * Control block: spawn context, trampoline page, park page and identity
  * page tables, plus slack for alignment. Sized once so the whole thing is
@@ -185,6 +197,15 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
 			   unsigned long gs_base, unsigned long stack,
 			   unsigned long entry);
+
+/* NMI on an offline pool CPU: honor a pending force halt */
+#ifdef CONFIG_MULTIKERNEL
+void mk_nmi_offline_park(void);
+#else
+static inline void mk_nmi_offline_park(void)
+{
+}
+#endif
 
 #endif /* __ASSEMBLY__ */
 

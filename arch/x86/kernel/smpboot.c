@@ -122,22 +122,6 @@ struct mwait_cpu_dead {
  */
 static DEFINE_PER_CPU_ALIGNED(struct mwait_cpu_dead, mwait_cpu_dead);
 
-#ifdef CONFIG_MULTIKERNEL
-static DEFINE_PER_CPU(bool, mk_pool_cpu);
-
-void mk_set_pool_cpu(int cpu, bool is_pool)
-{
-	per_cpu(mk_pool_cpu, cpu) = is_pool;
-}
-EXPORT_SYMBOL_GPL(mk_set_pool_cpu);
-
-bool cpu_is_multikernel_pool(unsigned int cpu)
-{
-	return per_cpu(mk_pool_cpu, cpu);
-}
-EXPORT_SYMBOL_GPL(cpu_is_multikernel_pool);
-#endif
-
 /* Maximum number of SMT threads on any online core */
 int __read_mostly __max_smt_threads = 1;
 
@@ -1400,10 +1384,8 @@ int native_cpu_disable(void)
 
 	cpu_disable_common();
 
-#ifdef CONFIG_MULTIKERNEL
-	if (__this_cpu_read(mk_pool_cpu))
+	if (cpu_is_multikernel_pool(smp_processor_id()))
 		return 0;
-#endif
 
         /*
          * Disable the local APIC. Otherwise IPI broadcasts will reach
@@ -1555,11 +1537,8 @@ void __noreturn native_play_dead(void)
 	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
 		__update_spec_ctrl(0);
 
-#ifdef CONFIG_MULTIKERNEL
-	if (__this_cpu_read(mk_pool_cpu)) {
+	if (cpu_is_multikernel_pool(smp_processor_id()))
 		multikernel_play_dead();
-	}
-#endif
 
 	play_dead_common();
 	tboot_shutdown(TB_SHUTDOWN_WFS);

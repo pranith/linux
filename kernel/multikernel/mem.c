@@ -272,7 +272,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
 			/*
 			 * Fragmented pool: halve until a piece fits. Dropping
 			 * straight to tiny chunks would splinter the grant
-			 * into more regions than an E820 table can carry.
+			 * into more regions than the spawn's memory map can carry.
 			 */
 			while (!chunk_base &&
 			       chunk_size > (1UL << min_alloc_order)) {

@@ -408,14 +408,14 @@ void noinstr mk_nmi_offline_park(void)
 static bool mk_nmi_handler_registered;
 
 /**
- * mk_register_stop_nmi_handler - Register the multikernel NMI stop handler
+ * mk_arch_register_force_stop - Register the multikernel NMI stop handler
  *
  * Called during multikernel initialization to register the NMI handler
  * that enables forcible shutdown of spawn kernels.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_register_stop_nmi_handler(void)
+int mk_arch_register_force_stop(void)
 {
 	int ret;
 
@@ -433,7 +433,7 @@ int mk_register_stop_nmi_handler(void)
 	pr_info("Multikernel NMI stop handler registered\n");
 	return 0;
 }
-EXPORT_SYMBOL_GPL(mk_register_stop_nmi_handler);
+EXPORT_SYMBOL_GPL(mk_arch_register_force_stop);
 
 /**
  * mk_force_stop_cpu - Send NMI to a specific CPU to force it to stop

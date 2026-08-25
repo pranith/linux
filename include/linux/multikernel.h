@@ -15,6 +15,13 @@
 #include <linux/genalloc.h>
 #include <linux/sizes.h>
 
+#ifdef CONFIG_MULTIKERNEL
+#include <asm/multikernel.h>
+#else
+struct mk_instance_arch {
+};
+#endif
+
 /**
  * Physical CPU identifiers
  *
@@ -402,11 +409,23 @@ struct mk_pool_chunk_range {
 
 int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
 
-#ifdef CONFIG_X86
+/*
+ * Host park area: on architectures that park pool CPUs in software, the
+ * park loop and its page tables live in pool memory and pin the chunks
+ * they occupy. Architectures whose firmware holds parked CPUs (PSCI, SBI
+ * HSM) have no such area and use the stubs.
+ */
+#ifdef CONFIG_ARCH_HAS_MK_HOST_PARK
+int mk_setup_host_park(void);
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
 bool mk_host_park_uses(phys_addr_t start, size_t size);
 int mk_teardown_host_park(void);
 #else
+static inline int mk_setup_host_park(void)
+{
+	return 0;
+}
+
 static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 {
 	return 0;
@@ -577,29 +596,26 @@ struct mk_instance {
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */
 
-	/* Spawn resources - reused across re-spawns, freed on pool destroy */
-	struct mk_spawn_context *spawn_ctx;
-	phys_addr_t spawn_ctx_phys;
-	struct mk_ident_pgtable *ident_pgt;
-	void *trampoline_va;
-	void *park_va;			/* Pool park page, written once by the host */
+	/* Arch spawn state, reused across re-spawns, freed on pool destroy */
+	struct mk_instance_arch arch;
 
 	/*
-	 * Control block: host-owned structures the spawn kernel must never
-	 * allocate over (spawn context, trampoline, park page, identity
-	 * page tables). Carved from one contiguous range so it can be
-	 * reserved in the spawn kernel's e820 with a single entry.
+	 * Control block: host-owned boot structures the spawn kernel must
+	 * never allocate over. Carved from one contiguous range so the spawn
+	 * kernel can reserve it from its allocator with a single entry.
 	 */
 	void *ctrl_va;
 	phys_addr_t ctrl_phys;
 	size_t ctrl_used;
 
 	/*
-	 * CPUs currently parked on this instance's context rather than the
-	 * host pool slot. Membership is per CPU because it changes one CPU
-	 * at a time: hotplug moves CPUs in and out while the instance runs,
-	 * and a stopped instance can gain CPUs that are still parked on the
-	 * host slot while the ones it already ran on watch its context.
+	 * CPUs parked inside this instance's memory (its arch park area)
+	 * rather than in the host pool. They must be confirmed parked before
+	 * the image is rewritten and they pin the pool until they leave.
+	 * Membership is per CPU because it changes one CPU at a time:
+	 * hotplug moves CPUs in and out while the instance runs, and a
+	 * stopped instance can gain CPUs that still sit in the host pool.
+	 * Always empty where firmware holds parked CPUs.
 	 */
 	struct mk_cpu_set *cpus_on_slot;
 
@@ -819,8 +835,8 @@ bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
+void mk_set_pool_cpu(int cpu, bool is_pool);
 bool mk_has_pending_shutdown(void);
-void mk_nmi_offline_park(void);
 
 /* Instance lookup and reference counting */
 struct mk_instance *mk_instance_find(int mk_id);
@@ -860,9 +876,6 @@ static inline int multikernel_force_halt_by_id(int mk_id)
 static inline bool cpu_is_multikernel_pool(unsigned int cpu)
 {
 	return false;
-}
-static inline void mk_nmi_offline_park(void)
-{
 }
 static inline struct mk_instance *mk_instance_find(int mk_id)
 {
@@ -1011,14 +1024,12 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
  *    holds the arch's boot structures (spawn context, trampolines, page
  *    tables), carved from instance memory and reserved from the spawn
  *    kernel's allocator.
- *  - The spawn mechanics themselves (context setup, trampolines, CPU
- *    wakeup), which generic code currently drives from the kexec path;
- *    their declarations live in the arch header until that path is
- *    extracted behind a single arch hook.
+ *  - struct mk_instance_arch: the arch's per-instance spawn state
+ *    (boot context, trampolines, park area), opaque to the core.
+ *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the host park functions declared
+ *    with the pool chunk API above, for architectures that park CPUs in
+ *    software rather than in firmware.
  */
-#ifdef CONFIG_MULTIKERNEL
-#include <asm/multikernel.h>
-#endif
 
 /* Doorbell for the message ring: IPI a CPU owned by another kernel */
 void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu);
@@ -1026,22 +1037,16 @@ void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu);
 /* Enumerate a pool CPU in this kernel's topology during early boot */
 void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
 
-/* Mark/query a CPU as parked in the multikernel pool */
-void mk_set_pool_cpu(int cpu, bool is_pool);
-
 /* Park the calling CPU in the pool wait loop; never returns */
 void __noreturn mk_enter_pool_state(void *info);
 
 /*
- * Forcible stop of another instance's CPUs (NMI on x86). Registration
- * may fail where the architecture has nothing suitable; graceful
- * shutdown must keep working without it.
+ * Forcible stop of another instance's CPUs (NMI on x86, SDEI or
+ * pseudo-NMI on arm64). Registration may fail where the architecture
+ * has nothing suitable; graceful shutdown must keep working without it.
  */
-int mk_register_stop_nmi_handler(void);
+int mk_arch_register_force_stop(void);
 void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
-
-/* Host pool park area, set up when the baseline is applied */
-int mk_setup_host_park(void);
 
 /*
  * Build the boot state for @instance from the loaded @image and start

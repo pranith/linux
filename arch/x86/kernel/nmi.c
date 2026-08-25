@@ -38,6 +38,7 @@
 #include <asm/microcode.h>
 #include <asm/sev.h>
 #include <asm/fred.h>
+#include <asm/multikernel.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/nmi.h>

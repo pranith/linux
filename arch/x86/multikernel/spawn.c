@@ -374,7 +374,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	void *park_va;
 	int ret;
 
-	if (!instance->ident_pgt) {
+	if (!instance->arch.ident_pgt) {
 		struct mk_ident_pgtable *pgt;
 		struct mk_memory_region *region;
 
@@ -393,20 +393,20 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 				return ret;
 			}
 		}
-		instance->ident_pgt = pgt;
+		instance->arch.ident_pgt = pgt;
 	}
 
-	if (!instance->trampoline_va) {
+	if (!instance->arch.trampoline_va) {
 		unsigned long phys;
 		void *va;
 
-		va = mk_setup_trampoline(instance, instance->ident_pgt, &phys);
+		va = mk_setup_trampoline(instance, instance->arch.ident_pgt, &phys);
 		if (IS_ERR(va)) {
 			pr_err("Failed to set up trampoline: %ld\n",
 			       PTR_ERR(va));
 			return PTR_ERR(va);
 		}
-		instance->trampoline_va = va;
+		instance->arch.trampoline_va = va;
 	}
 
 	/*
@@ -417,7 +417,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	 * CR0.WP), and a fault there lands in the park page's handler and
 	 * halts the CPU. Restore our copy on every exec.
 	 */
-	memcpy(instance->trampoline_va, multikernel_relocate_kernel_start,
+	memcpy(instance->arch.trampoline_va, multikernel_relocate_kernel_start,
 	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
 
 	/*
@@ -430,9 +430,9 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 		       PTR_ERR(park_va));
 		return PTR_ERR(park_va);
 	}
-	instance->park_va = park_va;
+	instance->arch.park_va = park_va;
 
-	if (!instance->spawn_ctx) {
+	if (!instance->arch.spawn_ctx) {
 		struct mk_spawn_context *ctx;
 		phys_addr_t phys;
 
@@ -441,8 +441,8 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			pr_err("Failed to allocate spawn context\n");
 			return -ENOMEM;
 		}
-		instance->spawn_ctx = ctx;
-		instance->spawn_ctx_phys = phys;
+		instance->arch.spawn_ctx = ctx;
+		instance->arch.spawn_ctx_phys = phys;
 	}
 
 	/* Copy the boot_params the loader prepared into the spawn context */
@@ -453,7 +453,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 		       image->arch.mk_boot_params);
 		return -ENOMEM;
 	}
-	memcpy(mk_spawn_context_boot_params(instance->spawn_ctx), src_bp,
+	memcpy(mk_spawn_context_boot_params(instance->arch.spawn_ctx), src_bp,
 	       sizeof(struct boot_params));
 	memunmap(src_bp);
 
@@ -465,26 +465,26 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	 * difference silently vanishes.
 	 */
 	ret = mk_e820_fill(instance,
-			   mk_spawn_context_boot_params(instance->spawn_ctx));
+			   mk_spawn_context_boot_params(instance->arch.spawn_ctx));
 	if (ret)
 		return ret;
 
-	mk_set_spawn_context(instance->spawn_ctx,
-			     mk_get_identity_cr3(instance->ident_pgt),
+	mk_set_spawn_context(instance->arch.spawn_ctx,
+			     mk_get_identity_cr3(instance->arch.ident_pgt),
 			     image->arch.mk_kernel_entry,
-			     (unsigned long)instance->trampoline_va,
-			     virt_to_phys(instance->trampoline_va),
+			     (unsigned long)instance->arch.trampoline_va,
+			     virt_to_phys(instance->arch.trampoline_va),
 			     park_phys);
-	instance->spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
-	if (!instance->spawn_ctx->boot_lps)
-		instance->spawn_ctx->boot_lps = loops_per_jiffy;
-	instance->spawn_ctx->boot_lps *= HZ;
-	instance->spawn_ctx->boot_cpu_khz = cpu_khz;
-	instance->spawn_ctx->boot_tsc_khz = tsc_khz;
-	instance->spawn_ctx->boot_apic_hz =
+	instance->arch.spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
+	if (!instance->arch.spawn_ctx->boot_lps)
+		instance->arch.spawn_ctx->boot_lps = loops_per_jiffy;
+	instance->arch.spawn_ctx->boot_lps *= HZ;
+	instance->arch.spawn_ctx->boot_cpu_khz = cpu_khz;
+	instance->arch.spawn_ctx->boot_tsc_khz = tsc_khz;
+	instance->arch.spawn_ctx->boot_apic_hz =
 		(unsigned long)lapic_timer_period * HZ;
 
-	return mk_spawn_cpu(instance, cpu, instance->spawn_ctx);
+	return mk_spawn_cpu(instance, cpu, instance->arch.spawn_ctx);
 }
 
 /**
@@ -517,12 +517,12 @@ int mk_arch_release_instance(struct mk_instance *instance)
 	mk_cpu_set_free(instance->cpus_on_slot);
 	instance->cpus_on_slot = NULL;
 
-	mk_free_identity_pgtable(instance->ident_pgt);
-	instance->ident_pgt = NULL;
-	instance->trampoline_va = NULL;
-	instance->park_va = NULL;
-	instance->spawn_ctx = NULL;
-	instance->spawn_ctx_phys = 0;
+	mk_free_identity_pgtable(instance->arch.ident_pgt);
+	instance->arch.ident_pgt = NULL;
+	instance->arch.trampoline_va = NULL;
+	instance->arch.park_va = NULL;
+	instance->arch.spawn_ctx = NULL;
+	instance->arch.spawn_ctx_phys = 0;
 	return 0;
 }
 
@@ -539,7 +539,7 @@ int mk_arch_release_instance(struct mk_instance *instance)
  */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	struct mk_spawn_context *slot = mk_host_park.slot;
 	struct mk_cpu_set *on_slot = mk_slot_set(instance);
 	int ret;
@@ -558,7 +558,7 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 		return 0;
 
 	ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
-				ctx->park_cr3, instance->spawn_ctx_phys,
+				ctx->park_cr3, instance->arch.spawn_ctx_phys,
 				"repark hot-added cpu");
 	if (!ret)
 		mk_cpu_set_add(on_slot, phys_cpu);
@@ -576,7 +576,7 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
  */
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
 	guard(mutex)(&mk_park_mutex);
@@ -610,7 +610,7 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
  */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
 	if (!ctx || !ctx->park_phys)
@@ -619,7 +619,7 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	guard(mutex)(&mk_park_mutex);
 
 	ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
-				ctx->park_cr3, instance->spawn_ctx_phys,
+				ctx->park_cr3, instance->arch.spawn_ctx_phys,
 				"confirm parked");
 	if (!ret || !mk_host_park.slot)
 		return ret;
@@ -642,7 +642,7 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	}
 
 	pr_err("mk_spawn: CPU %llu is parked nowhere: not on instance %d context %pa, not on host slot %pa\n",
-		 phys_cpu, instance->id, &instance->spawn_ctx_phys,
+		 phys_cpu, instance->id, &instance->arch.spawn_ctx_phys,
 		 &mk_host_park.slot_phys);
 	return ret;
 }
@@ -662,7 +662,7 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 int mk_repark_instance_to_host(struct mk_instance *instance)
 {
 	struct mk_cpu_set *on_slot = instance->cpus_on_slot;
-	struct mk_spawn_context *ctx = instance->spawn_ctx;
+	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	unsigned int i;
 	int failed = 0;
 
@@ -1327,7 +1327,7 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 	if (!mk_host_park.pgt)
 		return ERR_PTR(-ENODEV);
 
-	park_va = instance->park_va;
+	park_va = instance->arch.park_va;
 	if (!park_va) {
 		park_va = mk_instance_ctrl_alloc(instance, PAGE_SIZE, PAGE_SIZE);
 		if (!park_va)
