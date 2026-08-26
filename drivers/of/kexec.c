@@ -14,6 +14,7 @@
 #include <linux/kexec.h>
 #include <linux/memblock.h>
 #include <linux/libfdt.h>
+#include <linux/multikernel.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/random.h>
@@ -300,6 +301,8 @@ static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node
  */
 static int mk_add_chosen(const struct kimage *image, void *fdt, int chosen_node)
 {
+	void *ranges;
+	int address_cells, size_cells;
 	int ret;
 
 	ret = fdt_delprop(fdt, chosen_node, "linux,multikernel-fdt");
@@ -310,9 +313,26 @@ static int mk_add_chosen(const struct kimage *image, void *fdt, int chosen_node)
 	    image->type != KEXEC_TYPE_MULTIKERNEL || !image->mk_manifest)
 		return 0;
 
-	return fdt_appendprop_addrrange(fdt, 0, chosen_node,
-					"linux,multikernel-fdt",
-					image->mk_manifest, PAGE_SIZE);
+	ret = fdt_appendprop_addrrange(fdt, 0, chosen_node,
+				       "linux,multikernel-fdt",
+				       image->mk_manifest, PAGE_SIZE);
+	if (ret)
+		return ret;
+
+	address_cells = fdt_address_cells(fdt, 0);
+	size_cells = fdt_size_cells(fdt, 0);
+	if (address_cells <= 0 || size_cells <= 0)
+		return -FDT_ERR_BADNCELLS;
+
+	ret = fdt_setprop_placeholder(fdt, chosen_node,
+				      "linux,usable-memory-range",
+				      MK_FDT_MAX_MEMORY_RANGES *
+				      (address_cells + size_cells) *
+				      sizeof(fdt32_t), &ranges);
+	if (ret)
+		return ret;
+
+	return mk_fdt_update_memory_ranges(image, fdt);
 }
 
 /*

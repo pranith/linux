@@ -615,7 +615,9 @@ struct mk_instance {
 	 * Membership is per CPU because it changes one CPU at a time:
 	 * hotplug moves CPUs in and out while the instance runs, and a
 	 * stopped instance can gain CPUs that still sit in the host pool.
-	 * Always empty where firmware holds parked CPUs.
+	 * On firmware-parked architectures, membership instead records CPUs
+	 * that may have executed the image and whose firmware power state must
+	 * be checked before that image or its memory is reused.
 	 */
 	struct mk_cpu_set *cpus_on_slot;
 
@@ -837,6 +839,10 @@ int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
 void mk_set_pool_cpu(int cpu, bool is_pool);
 bool mk_has_pending_shutdown(void);
+static inline bool multikernel_is_spawn(void)
+{
+	return root_instance && root_instance->id != 0;
+}
 
 /* Instance lookup and reference counting */
 struct mk_instance *mk_instance_find(int mk_id);
@@ -854,12 +860,16 @@ bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
 void mk_register_cpus_from_manifest(void);
+bool __init mk_manifest_cpu_is_assigned(mk_phys_cpu_t phys_id);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+
+/* Refresh the fixed-size linux,usable-memory-range boot-DT property. */
+int mk_fdt_update_memory_ranges(const struct kimage *image, void *fdt);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -874,6 +884,16 @@ static inline int multikernel_force_halt_by_id(int mk_id)
 	return -ENODEV;
 }
 static inline bool cpu_is_multikernel_pool(unsigned int cpu)
+{
+	return false;
+}
+
+static inline bool mk_has_pending_shutdown(void)
+{
+	return false;
+}
+
+static inline bool multikernel_is_spawn(void)
 {
 	return false;
 }
@@ -908,8 +928,20 @@ static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 static inline void mk_register_cpus_from_manifest(void)
 {
 }
+
+static inline bool __init
+mk_manifest_cpu_is_assigned(mk_phys_cpu_t phys_id)
+{
+	return true;
+}
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
+}
+
+static inline int
+mk_fdt_update_memory_ranges(const struct kimage *image, void *fdt)
+{
+	return 0;
 }
 #endif
 
@@ -927,6 +959,9 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 #define MK_DT_RESOURCE_CPUS     "cpus"
 #define MK_DT_RESOURCE_DEVICES  "devices"
 #define MK_DT_RESOURCE_NUMA     "numa-nodes"
+
+/* Fixed boot-DT capacity, allowing ranges to be refreshed before re-spawn. */
+#define MK_FDT_MAX_MEMORY_RANGES	128
 
 /**
  * Manifest Integration Functions

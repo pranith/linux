@@ -34,6 +34,25 @@
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
 
+static mk_phys_cpu_t mk_boot_cpu_ids[NR_CPUS] __initdata;
+static unsigned int mk_boot_cpu_count __initdata;
+static bool mk_boot_cpu_ids_valid __initdata;
+
+bool __init mk_manifest_cpu_is_assigned(mk_phys_cpu_t phys_id)
+{
+	unsigned int i;
+
+	if (!mk_boot_cpu_ids_valid)
+		return true;
+
+	for (i = 0; i < mk_boot_cpu_count; i++) {
+		if (mk_boot_cpu_ids[i] == phys_id)
+			return true;
+	}
+
+	return false;
+}
+
 /*
  * Collect every CPU the instance might receive through hotplug later:
  * the unassigned pool plus every other kernel's CPUs (the host's and
@@ -282,6 +301,12 @@ void __init mk_register_cpus_from_manifest(void)
 	if (!cpus_prop || cpus_len < sizeof(fdt64_t) ||
 	    cpus_len % sizeof(fdt64_t))
 		goto out;
+
+	mk_boot_cpu_count = min_t(unsigned int,
+				  cpus_len / sizeof(fdt64_t), nr_cpu_ids);
+	for (i = 0; i < mk_boot_cpu_count; i++)
+		mk_boot_cpu_ids[i] = fdt64_to_cpu(cpus_prop[i]);
+	mk_boot_cpu_ids_valid = true;
 
 	/* Register each CPU from the DTB */
 	for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {

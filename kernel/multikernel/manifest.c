@@ -24,6 +24,81 @@
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
 
+static int mk_fdt_write_number(fdt32_t *cells, int count, u64 value)
+{
+	int i;
+
+	for (i = count - 1; i >= 0; i--) {
+		cells[i] = cpu_to_fdt32(value);
+		value >>= 32;
+	}
+
+	return value ? -ERANGE : 0;
+}
+
+/**
+ * mk_fdt_update_memory_ranges - Restrict a spawn DT to its live memory grant
+ * @image: multikernel image whose target instance owns the grant
+ * @fdt: writable kexec boot DT
+ *
+ * The loader reserves a fixed-size linux,usable-memory-range property. This
+ * function only changes its contents, so it can be called after the packed DT
+ * has already been copied to its final segment on every re-spawn.
+ */
+int mk_fdt_update_memory_ranges(const struct kimage *image, void *fdt)
+{
+	struct mk_memory_region *region;
+	struct mk_instance *instance;
+	fdt32_t *ranges, *entry;
+	int address_cells, size_cells, entry_cells;
+	int chosen, len, index = 0, ret;
+
+	if (!image || image->type != KEXEC_TYPE_MULTIKERNEL ||
+	    !image->mk_instance)
+		return -EINVAL;
+
+	instance = image->mk_instance;
+	if (instance->region_count <= 0 ||
+	    instance->region_count > MK_FDT_MAX_MEMORY_RANGES)
+		return -E2BIG;
+
+	chosen = fdt_path_offset(fdt, "/chosen");
+	if (chosen == -FDT_ERR_NOTFOUND)
+		chosen = fdt_path_offset(fdt, "/chosen@0");
+	if (chosen < 0)
+		return chosen;
+
+	address_cells = fdt_address_cells(fdt, 0);
+	size_cells = fdt_size_cells(fdt, 0);
+	if (address_cells <= 0 || size_cells <= 0)
+		return -EINVAL;
+
+	entry_cells = address_cells + size_cells;
+	ranges = fdt_getprop_w(fdt, chosen, "linux,usable-memory-range", &len);
+	if (!ranges || len != MK_FDT_MAX_MEMORY_RANGES * entry_cells *
+				 sizeof(*ranges))
+		return -EINVAL;
+
+	memset(ranges, 0, len);
+	list_for_each_entry(region, &instance->memory_regions, list) {
+		if (index >= MK_FDT_MAX_MEMORY_RANGES)
+			return -E2BIG;
+
+		entry = ranges + index * entry_cells;
+		ret = mk_fdt_write_number(entry, address_cells,
+					  region->res.start);
+		if (ret)
+			return ret;
+		ret = mk_fdt_write_number(entry + address_cells, size_cells,
+					  resource_size(&region->res));
+		if (ret)
+			return ret;
+		index++;
+	}
+
+	return index == instance->region_count ? 0 : -EINVAL;
+}
+
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;

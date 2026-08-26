@@ -872,19 +872,16 @@ static unsigned long chosen_node_offset = -FDT_ERR_NOTFOUND;
 /*
  * The main usage of linux,usable-memory-range is for crash dump kernel.
  * Originally, the number of usable-memory regions is one. Now there may
- * be two regions, low region and high region.
- * To make compatibility with existing user-space and older kdump, the low
- * region is always the last range of linux,usable-memory-range if exist.
+ * be two regions, low region and high region. Multikernel uses the same
+ * property for a potentially fragmented instance grant, so accept every
+ * range supplied by the boot loader. For kdump the low region remains last.
  */
-#define MAX_USABLE_RANGES		2
-
 /**
  * early_init_dt_check_for_usable_mem_range - Decode usable memory range
  * location from flat tree
  */
 void __init early_init_dt_check_for_usable_mem_range(void)
 {
-	struct memblock_region rgn[MAX_USABLE_RANGES] = {0};
 	const __be32 *prop;
 	int len, i;
 	u64 base, size;
@@ -900,20 +897,20 @@ void __init early_init_dt_check_for_usable_mem_range(void)
 	if (!prop)
 		return;
 
-	len = min(len, MAX_USABLE_RANGES);
+	of_flat_dt_read_addr_size(prop, 0, &base, &size);
+	if (!size)
+		return;
+	pr_debug("cap_mem_regions[0]: base=%pa, size=%pa\n", &base, &size);
+	memblock_cap_memory_range(base, size);
 
-	for (i = 0; i < len; i++) {
+	for (i = 1; i < len; i++) {
 		of_flat_dt_read_addr_size(prop, i, &base, &size);
-		rgn[i].base = base;
-		rgn[i].size = size;
-
+		if (!size)
+			continue;
 		pr_debug("cap_mem_regions[%d]: base=%pa, size=%pa\n",
-			 i, &rgn[i].base, &rgn[i].size);
+			 i, &base, &size);
+		memblock_add(base, size);
 	}
-
-	memblock_cap_memory_range(rgn[0].base, rgn[0].size);
-	for (i = 1; i < MAX_USABLE_RANGES && rgn[i].size; i++)
-		memblock_add(rgn[i].base, rgn[i].size);
 }
 
 /**
