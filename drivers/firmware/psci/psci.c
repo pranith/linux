@@ -214,22 +214,29 @@ static int psci_0_2_cpu_off(u32 state)
 	return __psci_cpu_off(PSCI_0_2_FN_CPU_OFF, state);
 }
 
-static int __psci_cpu_on(u32 fn, unsigned long cpuid, unsigned long entry_point)
+static int __psci_cpu_on(u32 fn, unsigned long cpuid,
+			 unsigned long entry_point, unsigned long context_id)
 {
 	int err;
 
-	err = invoke_psci_fn(fn, cpuid, entry_point, 0);
+	err = invoke_psci_fn(fn, cpuid, entry_point, context_id);
 	return psci_to_linux_errno(err);
 }
 
-static int psci_0_1_cpu_on(unsigned long cpuid, unsigned long entry_point)
+static int psci_0_1_cpu_on(unsigned long cpuid,
+			   unsigned long entry_point,
+			   unsigned long context_id)
 {
-	return __psci_cpu_on(psci_0_1_function_ids.cpu_on, cpuid, entry_point);
+	return __psci_cpu_on(psci_0_1_function_ids.cpu_on, cpuid, entry_point,
+			     context_id);
 }
 
-static int psci_0_2_cpu_on(unsigned long cpuid, unsigned long entry_point)
+static int psci_0_2_cpu_on(unsigned long cpuid,
+			   unsigned long entry_point,
+			   unsigned long context_id)
 {
-	return __psci_cpu_on(PSCI_FN_NATIVE(0_2, CPU_ON), cpuid, entry_point);
+	return __psci_cpu_on(PSCI_FN_NATIVE(0_2, CPU_ON), cpuid, entry_point,
+			     context_id);
 }
 
 static int __psci_migrate(u32 fn, unsigned long cpuid)
