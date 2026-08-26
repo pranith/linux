@@ -34,7 +34,9 @@
 #include <linux/kexec.h>
 #include <linux/kgdb.h>
 #include <linux/kvm_host.h>
+#include <linux/multikernel.h>
 #include <linux/nmi.h>
+#include <linux/psci.h>
 
 #include <asm/alternative.h>
 #include <asm/atomic.h>
@@ -745,6 +747,8 @@ void __init smp_init_cpus(void)
 	else
 		acpi_parse_and_init_cpus();
 
+	mk_register_cpus_from_manifest();
+
 	if (cpu_count > nr_cpu_ids)
 		pr_warn("Number of cores (%d) exceeds configured maximum of %u - clipping\n",
 			cpu_count, nr_cpu_ids);
@@ -798,6 +802,8 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	for_each_possible_cpu(cpu) {
 
 		if (cpu == smp_processor_id())
+			continue;
+		if (!mk_manifest_cpu_is_assigned(cpu_logical_map(cpu)))
 			continue;
 
 		ops = get_cpu_ops(cpu);
@@ -863,6 +869,9 @@ void arch_irq_work_raise(void)
 
 static void __noreturn local_cpu_stop(unsigned int cpu)
 {
+	if (multikernel_is_spawn())
+		mk_enter_pool_state(NULL);
+
 	set_cpu_online(cpu, false);
 
 	local_daif_mask();
@@ -971,8 +980,12 @@ static void do_handle_IPI(int ipinr)
 		generic_smp_call_function_interrupt();
 		break;
 
-	case IPI_CPU_STOP:
 	case IPI_CPU_STOP_NMI:
+		if (IS_ENABLED(CONFIG_MULTIKERNEL) &&
+		    mk_has_pending_shutdown())
+			mk_enter_pool_state(NULL);
+		fallthrough;
+	case IPI_CPU_STOP:
 		if (IS_ENABLED(CONFIG_KEXEC_CORE) && crash_stop) {
 			ipi_cpu_crash_stop(cpu, get_irq_regs());
 			unreachable();
@@ -987,11 +1000,15 @@ static void do_handle_IPI(int ipinr)
 		break;
 #endif
 
-#ifdef CONFIG_IRQ_WORK
 	case IPI_IRQ_WORK:
+#ifdef CONFIG_IRQ_WORK
 		irq_work_run();
-		break;
 #endif
+#ifdef CONFIG_MULTIKERNEL
+		/* The eight architectural SGIs are already fully allocated. */
+		generic_multikernel_interrupt();
+#endif
+		break;
 
 	case IPI_CPU_BACKTRACE:
 		/*
@@ -1028,6 +1045,35 @@ static void smp_cross_call(const struct cpumask *target, unsigned int ipinr)
 	arm64_send_ipi(target, ipinr);
 }
 
+#ifdef CONFIG_MULTIKERNEL
+void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
+{
+	int cpu = arch_cpu_from_physical_id(phys_cpu);
+
+	if (cpu < 0 || IPI_IRQ_WORK >= nr_ipi) {
+		pr_warn_ratelimited("multikernel: cannot IPI MPIDR 0x%llx\n",
+				    phys_cpu);
+		return;
+	}
+
+	/* Multiplex the doorbell on IRQ_WORK rather than consume a ninth SGI. */
+	smp_cross_call(cpumask_of(cpu), IPI_IRQ_WORK);
+}
+
+void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu)
+{
+	int cpu = arch_cpu_from_physical_id(phys_cpu);
+
+	if (cpu < 0 || IPI_CPU_STOP_NMI >= nr_ipi) {
+		pr_warn_ratelimited("multikernel: cannot stop MPIDR 0x%llx\n",
+				    phys_cpu);
+		return;
+	}
+
+	smp_cross_call(cpumask_of(cpu), IPI_CPU_STOP_NMI);
+}
+#endif
+
 static bool ipi_should_be_nmi(enum ipi_msg_type ipi)
 {
 	if (!system_uses_irq_prio_masking())
@@ -1042,6 +1088,17 @@ static bool ipi_should_be_nmi(enum ipi_msg_type ipi)
 		return false;
 	}
 }
+
+#ifdef CONFIG_MULTIKERNEL
+int mk_arch_register_force_stop(void)
+{
+	if (!psci_ops.cpu_off || IPI_CPU_STOP_NMI >= nr_ipi ||
+	    !ipi_should_be_nmi(IPI_CPU_STOP_NMI))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+#endif
 
 static void ipi_setup(int cpu)
 {

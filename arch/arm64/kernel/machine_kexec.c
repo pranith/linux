@@ -24,6 +24,7 @@
 #include <asm/page.h>
 #include <asm/sections.h>
 #include <asm/trans_pgd.h>
+#include <asm/virt.h>
 
 /**
  * kexec_image_info - For debugging output.
@@ -54,7 +55,15 @@ void machine_kexec_cleanup(struct kimage *kimage)
  */
 int machine_kexec_prepare(struct kimage *kimage)
 {
-	if (kimage->type != KEXEC_TYPE_CRASH && cpus_are_stuck_in_kernel()) {
+	if (kimage->type == KEXEC_TYPE_MULTIKERNEL &&
+	    is_protected_kvm_enabled()) {
+		pr_err("Can't spawn a multikernel instance with protected KVM enabled.\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (kimage->type != KEXEC_TYPE_CRASH &&
+	    kimage->type != KEXEC_TYPE_MULTIKERNEL &&
+	    cpus_are_stuck_in_kernel()) {
 		pr_err("Can't kexec: CPUs are stuck in the kernel.\n");
 		return -EBUSY;
 	}

@@ -7,8 +7,17 @@ Overview
 
 The multikernel kernfs interface provides a clean, user-friendly way to manage multikernel instances through the filesystem. The interface is located at ``/sys/fs/multikernel/`` and supports automatic instance creation from multikernel device trees.
 
-Architecture
-============
+Architecture support
+====================
+
+Multikernel supports x86-64 and arm64.  On arm64, the platform must provide
+PSCI ``CPU_ON``, ``CPU_OFF`` and ``AFFINITY_INFO`` operations.  Instance CPU
+IDs are 64-bit MPIDRs.  Forcible shutdown additionally requires GIC priority
+masking so the CPU-stop IPI can be delivered as a pseudo-NMI; graceful
+shutdown remains available without it.
+
+Interface layout
+================
 
 ::
 
@@ -112,13 +121,13 @@ Phase 2: Kernel Loading (Kexec Integration)
    - Finds pre-reserved resources for instance ID 1
    - Creates kimage using pre-allocated memory and CPU resources
    - Updates status to "loading" → "active"
-   - Preserves instance DTB for KHO (Kexec HandOver) restoration
+   - Preserves the instance DTB in the multikernel manifest
 
 2. **Instance DTB Preservation**
 
    The multikernel system automatically preserves each instance's device tree during kexec for restoration in the spawn kernel. The spawn kernel will:
 
-   - Detect multikernel KHO data during early boot
+   - Detect the multikernel manifest during early boot
    - Restore the instance's DTB and recreate the instance structure
    - Re-reserve the same memory and CPU resources
 

@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
+#include <linux/multikernel.h>
 #include <linux/nospec.h>
 #include <linux/stddef.h>
 #include <linux/sysctl.h>
@@ -98,6 +99,9 @@ void machine_shutdown(void)
  */
 void machine_halt(void)
 {
+	if (multikernel_is_spawn())
+		mk_halt_to_pool();
+
 	local_irq_disable();
 	smp_send_stop();
 	while (1);
@@ -111,6 +115,9 @@ void machine_halt(void)
  */
 void machine_power_off(void)
 {
+	if (multikernel_is_spawn())
+		mk_halt_to_pool();
+
 	local_irq_disable();
 	smp_send_stop();
 	do_kernel_power_off();
@@ -127,6 +134,9 @@ void machine_power_off(void)
  */
 void machine_restart(char *cmd)
 {
+	if (multikernel_is_spawn())
+		mk_halt_to_pool();
+
 	/* Disable interrupts first */
 	local_irq_disable();
 	smp_send_stop();
